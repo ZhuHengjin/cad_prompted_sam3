@@ -4,6 +4,7 @@
 import argparse
 import ast
 import json
+import math
 import os
 import random
 import re
@@ -814,18 +815,18 @@ def parse_args() -> argparse.Namespace:
         default="/home/kevin/sam3.pt",
         help="Path to SAMv3 checkpoint (.pt).",
     )
-    parser.add_argument(
-        "--dataset_root",
-        type=str,
-        default=["/sata1/data/kevin/realworld_datasets/persam_v2"],
-        help="Comma-separated dataset roots.",
-    )
-    parser.add_argument(
-        "--reference_dir",
-        type=str,
-        default="/sata1/data/kevin/realworld_datasets/persam_real_coco/stl_renders_blender_2442_0120",
-        help="Path to reference renders.",
-    )
+    # parser.add_argument(
+    #     "--dataset_root",
+    #     type=str,
+    #     default=["/sata1/data/kevin/realworld_datasets/persam_v2"],
+    #     help="Comma-separated dataset roots.",
+    # )
+    # parser.add_argument(
+    #     "--reference_dir",
+    #     type=str,
+    #     default="/sata1/data/kevin/realworld_datasets/persam_real_coco/stl_renders_blender_2442_0120",
+    #     help="Path to reference renders.",
+    # )
     # parser.add_argument(
     #     "--dataset_root",
     #     type=str,
@@ -838,21 +839,21 @@ def parse_args() -> argparse.Namespace:
     #     default="/sata1/data/kevin/lego_datasets/lego_structure_refs",
     #     help="Path to reference renders.",
     # )
-    # parser.add_argument(
-    #     "--dataset_root",
-    #     type=str,
-    #     nargs="+",
-    #     default=["/sata1/data/kevin/realworld_datasets/primesense_converted/000006", "/sata1/data/kevin/realworld_datasets/primesense_converted/000001", 
-    #     "/sata1/data/kevin/realworld_datasets/primesense_converted/000003",
-    #     "/sata1/data/kevin/realworld_datasets/primesense_converted/000004",
-    #     "/sata1/data/kevin/realworld_datasets/primesense_converted/000005",
-    #     "/sata1/data/kevin/realworld_datasets/primesense_converted/000006",
-    #     "/sata1/data/kevin/realworld_datasets/primesense_converted/000007",
-    #     "/sata1/data/kevin/realworld_datasets/primesense_converted/000008",
-    #     "/sata1/data/kevin/realworld_datasets/primesense_converted/000009",
-    #     "/sata1/data/kevin/realworld_datasets/primesense_converted/000010"],
-    #     help="Dataset roots (space-separated, and/or comma-separated).",
-    # )
+    parser.add_argument(
+        "--dataset_root",
+        type=str,
+        nargs="+",
+        default=["/sata1/data/kevin/realworld_datasets/primesense_converted/000006", "/sata1/data/kevin/realworld_datasets/primesense_converted/000001", 
+        "/sata1/data/kevin/realworld_datasets/primesense_converted/000003",
+        "/sata1/data/kevin/realworld_datasets/primesense_converted/000004",
+        "/sata1/data/kevin/realworld_datasets/primesense_converted/000005",
+        "/sata1/data/kevin/realworld_datasets/primesense_converted/000006",
+        "/sata1/data/kevin/realworld_datasets/primesense_converted/000007",
+        "/sata1/data/kevin/realworld_datasets/primesense_converted/000008",
+        "/sata1/data/kevin/realworld_datasets/primesense_converted/000009",
+        "/sata1/data/kevin/realworld_datasets/primesense_converted/000010"],
+        help="Dataset roots (space-separated, and/or comma-separated).",
+    )
 #     parser.add_argument(
 #         "--dataset_root",
 #         type=str,
@@ -871,19 +872,19 @@ def parse_args() -> argparse.Namespace:
 # ],
 #         help="Dataset roots (space-separated, and/or comma-separated).",
 #     )
-#     parser.add_argument(
-#         "--reference_dir",
-#         type=str,
-#         default="/sata1/data/kevin/realworld_datasets/primesense_converted/cad_renders",
-#         help="Path to reference renders.",
-#     )
+    parser.add_argument(
+        "--reference_dir",
+        type=str,
+        default="/sata1/data/kevin/realworld_datasets/primesense_converted/cad_renders",
+        help="Path to reference renders.",
+    )
     #"0,3,6,9"
     #"0,1,2,3,4,5,6,7,8,9,10,11"
     parser.add_argument("--ref_view_ids", type=str, default="0,1,2,3,4,5,6,7,8,9,10,11", help="Reference view ids to use.")
     parser.add_argument("--max_side_length", type=int, default=1008)
     parser.add_argument("--no_square", action="store_true", help="Disable square resizing in encoder.")
     parser.add_argument("--num_points_approx", type=int, default=24)
-    parser.add_argument("--batch_size", type=int, default=8)
+    parser.add_argument("--batch_size", type=int, default=12)
     parser.add_argument(
         "--sub_sample",
         type=int,
@@ -905,7 +906,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--vis_every",
         type=int,
-        default=1,
+        default=100,
         help="Save a debug collage every N batches (0 disables).",
     )
     parser.add_argument(
@@ -921,7 +922,7 @@ def parse_args() -> argparse.Namespace:
         default = False,
         help="Only evaluate samples with multiple GT instances for the target object.",
     )
-    parser.add_argument("--finetune_ckpt", type=str, default="finetune_exemplar/run_20260311_161555/finetune_epoch_014.pth", help="Optional finetuned detector checkpoint.")
+    parser.add_argument("--finetune_ckpt", type=str, default="finetune_exemplar/run_20260314_013918/finetune_epoch_018.pth", help="Optional finetuned detector checkpoint.")
     return parser.parse_args()
 
 #/home/kevin/muggled_sam/finetune_exemplar/multi_object_best/finetune_epoch_017.pth
@@ -990,6 +991,16 @@ def main() -> None:
     if args.shuffle:
         random.shuffle(all_entries)
 
+    total_entries = len(all_entries)
+    total_batches_est = max(1, math.ceil(total_entries / args.batch_size))
+    if args.max_batches > 0:
+        total_batches_est = min(total_batches_est, args.max_batches)
+    print(
+        "Estimated batches:",
+        total_batches_est,
+        f"(entries={total_entries}, batch_size={args.batch_size})",
+    )
+
     reference_dir = Path(args.reference_dir).expanduser().resolve()
     if not reference_dir.is_dir():
         raise FileNotFoundError(reference_dir)
@@ -1005,7 +1016,7 @@ def main() -> None:
     object_iou_sum: Dict[str, float] = defaultdict(float)
     object_iou_count: Dict[str, int] = defaultdict(int)
     pq_iou_threshold = 0.5
-    pq_score_thresholds = [round(0.21 + 0.01 * idx, 2) for idx in range(20)]
+    pq_score_thresholds = [round(0.10 + 0.01 * idx, 2) for idx in range(30)]
     pq_stats: Dict[float, Dict[str, float]] = {
         thresh: {"sum_iou": 0.0, "tp": 0, "fp": 0, "fn": 0} for thresh in pq_score_thresholds
     }
@@ -1107,7 +1118,15 @@ def main() -> None:
                         exemplar_padding_mask_bn=padding_mask,
                     )
                     t2 = time.time()
-                    print("Batch encoding time: {:.3f}s, detection time: {:.3f}s".format(t1 - t0, t2 - t1))
+                    display_step = batch_step + 1
+                    print(
+                        "step {}/{} Batch encoding time: {:.3f}s, detection time: {:.3f}s".format(
+                            display_step,
+                            total_batches_est,
+                            t1 - t0,
+                            t2 - t1,
+                        )
+                    )
                     if mask_preds.shape[1] == 0:
                         for data_idx in idxs:
                             preencode_hw = prepared[data_idx]["preencode_hw"]
@@ -1208,8 +1227,9 @@ def main() -> None:
                 if batch_ious:
                     avg_iou = sum(batch_ious) / max(1, len(batch_ious))
                     correct_rate = batch_correct / max(1, len(batch_ious))
+                    display_step = batch_step + 1
                     print(
-                        f"step={batch_step} avg_iou={avg_iou:.4f} "
+                        f"step {display_step}/{total_batches_est} avg_iou={avg_iou:.4f} "
                         f"correct_rate={correct_rate:.3f} samples={len(batch_ious)}"
                     )
                 batch_step += 1

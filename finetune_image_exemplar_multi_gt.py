@@ -18,6 +18,12 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
+from loss_fns import (
+    compute_bbox_l1_loss_from_matches,
+    compute_matched_mask_losses,
+    compute_presence_loss_logits,
+    compute_score_weighted_mask_loss_from_matches,
+)
 from muggled_sam.make_sam import make_sam_from_state_dict
 
 
@@ -34,6 +40,7 @@ class EvalConfig:
     num_points_approx: int = 25
     batch_size: int = 8
     det_filter: float = 0.0
+    nms_iou: float = 0.5
     matches_per_gt: int = 1
     shuffle: bool = False
     max_batches: int = 0
@@ -42,12 +49,13 @@ class EvalConfig:
 EVAL_CONFIG = EvalConfig(
     dataset_root="/sata1/data/kevin/realworld_datasets/persam_v2",
     reference_dir="/sata1/data/kevin/realworld_datasets/persam_real_coco/stl_renders_blender_2442_0120",
-    ref_view_ids="0,3,6,9",
+    ref_view_ids="0,1,2,3,4,5,6,7,8,9,10,11",
     max_side_length=1008,
     use_square_sizing=True,
-    num_points_approx=25,
+    num_points_approx=24,
     batch_size=8,
     det_filter=0.0,
+    nms_iou=0.5,
     matches_per_gt=1,
     shuffle=False,
     max_batches=0,
@@ -191,10 +199,10 @@ def select_object_with_most_instances(
             mapping_cache[mapping_key] = color_map
     if not color_map:
         return None
-    max_count = max(len(colors) for colors in color_map.values())
-    best_ids = [obj_id for obj_id, colors in color_map.items() if len(colors) == max_count]
-    best_ids.sort()
-    return best_ids[0] if best_ids else None
+    obj_ids = list(color_map.keys())
+    if not obj_ids:
+        return None
+    return random.choice(obj_ids)
 
 
 def select_target_object_and_masks(
@@ -326,6 +334,15 @@ def unique_frame_entries(entries: Sequence[Dict[str, str]]) -> List[Dict[str, st
     unique_entries: Dict[Tuple[str, str, str], Dict[str, str]] = {}
     for entry in entries:
         key = (entry["frame_id"], entry["rgb_path"], entry["inst_path"])
+        if key not in unique_entries:
+            unique_entries[key] = entry
+    return list(unique_entries.values())
+
+
+def unique_object_entries(entries: Sequence[Dict[str, str]]) -> List[Dict[str, str]]:
+    unique_entries: Dict[Tuple[str, str, str, str], Dict[str, str]] = {}
+    for entry in entries:
+        key = (entry["frame_id"], entry["object_id"], entry["rgb_path"], entry["inst_path"])
         if key not in unique_entries:
             unique_entries[key] = entry
     return list(unique_entries.values())
@@ -484,6 +501,21 @@ def resize_mask(mask: np.ndarray, size_hw: Tuple[int, int]) -> np.ndarray:
     return cv2.resize(mask.astype(np.float32), (w, h), interpolation=cv2.INTER_NEAREST)
 
 
+def build_gt_down_list(
+    gt_masks: Sequence[np.ndarray],
+    preencode_hw: Tuple[int, int],
+    target_hw: Tuple[int, int],
+    device: torch.device,
+) -> List[torch.Tensor]:
+    gt_down_list: List[torch.Tensor] = []
+    for gt_mask in gt_masks:
+        gt_preenc = resize_mask(gt_mask, preencode_hw)
+        gt_tensor = torch.from_numpy(gt_preenc).to(device).unsqueeze(0).unsqueeze(0)
+        gt_down = F.interpolate(gt_tensor, size=target_hw, mode="nearest").squeeze(0).squeeze(0)
+        gt_down_list.append(gt_down > 0.5)
+    return gt_down_list
+
+
 def parse_ref_view_ids(value: str) -> List[str]:
     if not value:
         return []
@@ -599,14 +631,91 @@ def encode_exemplars_no_infer(
     return torch.cat((encoded_sampling_bnc, encoded_text_bnc), dim=1)
 
 
-def select_best_mask(mask_preds_nhw: torch.Tensor, gt_mask_hw: torch.Tensor) -> Tuple[int, torch.Tensor]:
-    pred_bin = mask_preds_nhw > 0
+def compute_mask_iou(pred_mask_hw: torch.Tensor, gt_mask_hw: torch.Tensor) -> torch.Tensor:
+    pred_bin = pred_mask_hw > 0
     gt_bin = gt_mask_hw > 0.5
-    intersection = (pred_bin & gt_bin).sum(dim=(1, 2))
-    union = (pred_bin | gt_bin).sum(dim=(1, 2)).clamp_min(1)
-    iou = intersection.float() / union.float()
-    best_idx = int(torch.argmax(iou).item())
-    return best_idx, iou[best_idx]
+    intersection = (pred_bin & gt_bin).sum()
+    union = (pred_bin | gt_bin).sum().clamp_min(1)
+    return intersection.float() / union.float()
+
+
+def match_masks_to_gts(
+    pred_masks: List[torch.Tensor],
+    gt_masks: List[torch.Tensor],
+    iou_threshold: float = 0.5,
+) -> List[Tuple[int, int, float]]:
+    if not pred_masks or not gt_masks:
+        return []
+    pairs: List[Tuple[float, int, int]] = []
+    for p_idx, pred in enumerate(pred_masks):
+        for g_idx, gt in enumerate(gt_masks):
+            iou = compute_mask_iou(pred, gt)
+            iou_val = float(iou.item())
+            if iou_val >= iou_threshold:
+                pairs.append((iou_val, p_idx, g_idx))
+    pairs.sort(key=lambda x: x[0], reverse=True)
+
+    matched_pred = [False] * len(pred_masks)
+    matched_gt = [False] * len(gt_masks)
+    matches: List[Tuple[int, int, float]] = []
+    for iou_val, p_idx, g_idx in pairs:
+        if matched_pred[p_idx] or matched_gt[g_idx]:
+            continue
+        matched_pred[p_idx] = True
+        matched_gt[g_idx] = True
+        matches.append((p_idx, g_idx, iou_val))
+    return matches
+
+
+def compute_pq_stats(
+    pred_masks: List[torch.Tensor],
+    gt_masks: List[torch.Tensor],
+    pred_scores: Optional[torch.Tensor] = None,
+    iou_threshold: float = 0.5,
+    score_threshold: float = 0.25,
+) -> Tuple[float, int, int, int]:
+    if pred_scores is not None and pred_masks:
+        filtered_masks: List[torch.Tensor] = []
+        for idx, mask in enumerate(pred_masks):
+            if float(pred_scores[idx].item()) >= score_threshold:
+                filtered_masks.append(mask)
+        pred_masks = filtered_masks
+
+    if not pred_masks and not gt_masks:
+        return 0.0, 0, 0, 0
+    if not pred_masks:
+        return 0.0, 0, 0, len(gt_masks)
+    if not gt_masks:
+        return 0.0, 0, len(pred_masks), 0
+
+    matches = match_masks_to_gts(pred_masks, gt_masks, iou_threshold=iou_threshold)
+    sum_iou = sum(match[2] for match in matches)
+    tp = len(matches)
+
+    fp = len(pred_masks) - tp
+    fn = len(gt_masks) - tp
+    return sum_iou, tp, fp, fn
+
+
+def update_pq_accumulators(
+    pq_stats: Dict[float, Dict[str, float]],
+    pred_masks: List[torch.Tensor],
+    gt_masks: List[torch.Tensor],
+    pred_scores: Optional[torch.Tensor],
+    iou_threshold: float,
+) -> None:
+    for score_threshold, stats in pq_stats.items():
+        sum_iou, tp, fp, fn = compute_pq_stats(
+            pred_masks,
+            gt_masks,
+            pred_scores=pred_scores,
+            iou_threshold=iou_threshold,
+            score_threshold=score_threshold,
+        )
+        stats["sum_iou"] += sum_iou
+        stats["tp"] += tp
+        stats["fp"] += fp
+        stats["fn"] += fn
 
 
 def apply_mask_nms(
@@ -654,56 +763,6 @@ def apply_mask_nms(
         return box_preds_n22[:0], mask_preds_nhw[:0], empty
     keep_tensor = torch.as_tensor(keep, device=det_scores_n.device, dtype=torch.long)
     return box_preds_n22[keep_tensor], mask_preds_nhw[keep_tensor], det_scores_n[keep_tensor]
-
-
-def dice_loss_from_logits(logits_hw: torch.Tensor, target_hw: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
-    probs = torch.sigmoid(logits_hw)
-    num = 2 * (probs * target_hw).sum() + eps
-    den = probs.sum() + target_hw.sum() + eps
-    return 1.0 - num / den
-
-
-def compute_mask_loss_best(
-    logits_mhw: torch.Tensor,
-    gt_target_hw: torch.Tensor,
-    bce_weight: float,
-    dice_weight: float,
-) -> Tuple[torch.Tensor, int]:
-    gt_broadcast = gt_target_hw.unsqueeze(0).expand_as(logits_mhw)
-    loss_bce_per = F.binary_cross_entropy_with_logits(
-        logits_mhw,
-        gt_broadcast,
-        reduction="none",
-    ).mean(dim=(1, 2))
-    probs_mhw = torch.sigmoid(logits_mhw)
-    eps = 1e-6
-    dice_num = 2 * (probs_mhw * gt_broadcast).sum(dim=(1, 2)) + eps
-    dice_den = probs_mhw.sum(dim=(1, 2)) + gt_broadcast.sum(dim=(1, 2)) + eps
-    loss_dice_per = 1.0 - dice_num / dice_den
-    loss_per_mask = bce_weight * loss_bce_per + dice_weight * loss_dice_per
-    best_idx, _ = select_best_mask(logits_mhw, gt_target_hw)
-    loss_mask = loss_per_mask[best_idx]
-    return loss_mask, best_idx
-
-
-def compute_mask_loss_per_pred(
-    logits_mhw: torch.Tensor,
-    gt_target_hw: torch.Tensor,
-    bce_weight: float,
-    dice_weight: float,
-) -> torch.Tensor:
-    gt_broadcast = gt_target_hw.unsqueeze(0).expand_as(logits_mhw)
-    loss_bce_per = F.binary_cross_entropy_with_logits(
-        logits_mhw,
-        gt_broadcast,
-        reduction="none",
-    ).mean(dim=(1, 2))
-    probs_mhw = torch.sigmoid(logits_mhw)
-    eps = 1e-6
-    dice_num = 2 * (probs_mhw * gt_broadcast).sum(dim=(1, 2)) + eps
-    dice_den = probs_mhw.sum(dim=(1, 2)) + gt_broadcast.sum(dim=(1, 2)) + eps
-    loss_dice_per = 1.0 - dice_num / dice_den
-    return bce_weight * loss_bce_per + dice_weight * loss_dice_per
 
 
 def match_predictions_to_gts_hungarian(
@@ -852,181 +911,6 @@ def greedy_unique_k_assign(cost: np.ndarray, max_per_gt: int = 1) -> List[Tuple[
         if pred_used.all():
             break
     return matches
-
-
-def compute_matched_mask_losses(
-    logits_mhw: torch.Tensor,
-    gt_targets_hw: Sequence[torch.Tensor],
-    matches: Sequence[Tuple[int, int]],
-    bce_weight: float,
-    dice_weight: float,
-) -> List[torch.Tensor]:
-    losses: List[torch.Tensor] = []
-    for gt_idx, pred_idx in matches:
-        loss_per_mask = compute_mask_loss_per_pred(
-            logits_mhw,
-            gt_targets_hw[gt_idx],
-            bce_weight=bce_weight,
-            dice_weight=dice_weight,
-        )
-        losses.append(loss_per_mask[pred_idx])
-    return losses
-
-
-def compute_score_loss(scores_logits: torch.Tensor, best_idx: int) -> torch.Tensor:
-    scores_logits = scores_logits.float().unsqueeze(0)
-    target_idx = torch.tensor([best_idx], device=scores_logits.device)
-    return F.cross_entropy(scores_logits, target_idx)
-
-
-def compute_noobj_loss(scores_logits: torch.Tensor, best_idx: int) -> torch.Tensor:
-    scores_logits = scores_logits.float()
-    if scores_logits.numel() <= 1:
-        return torch.zeros((), device=scores_logits.device)
-    noobj_mask = torch.ones_like(scores_logits, dtype=torch.bool)
-    noobj_mask[best_idx] = False
-    return F.binary_cross_entropy_with_logits(
-        scores_logits[noobj_mask],
-        torch.zeros_like(scores_logits[noobj_mask]),
-    )
-
-
-def compute_presence_loss(
-    scores_logits: torch.Tensor,
-    positive_indices: Union[int, Sequence[int]],
-    pos_weight: float,
-    neg_weight: float,
-    use_focal: bool = False,
-    focal_alpha: float = 0.25,
-    focal_gamma: float = 2.0,
-    focal_weight: float = 1.0,
-) -> torch.Tensor:
-    scores_logits = scores_logits.float()
-    # scores_logits are already probabilities in [0, 1]
-    prob = scores_logits.clamp(1e-4, 1 - 1e-4)
-    target = torch.zeros_like(scores_logits)
-    if scores_logits.numel() > 0:
-        if isinstance(positive_indices, int):
-            pos_indices = [positive_indices]
-        else:
-            pos_indices = list(positive_indices)
-        for idx in pos_indices:
-            if 0 <= idx < target.numel():
-                target[idx] = 1.0
-    loss_per = F.binary_cross_entropy(prob, target, reduction="none")
-    pos_mask = target > 0.5
-    neg_mask = ~pos_mask
-    if pos_mask.any():
-        loss_pos = loss_per[pos_mask].mean()
-    else:
-        loss_pos = torch.zeros((), device=scores_logits.device)
-    if neg_mask.any():
-        loss_neg = loss_per[neg_mask].mean()
-    else:
-        loss_neg = torch.zeros((), device=scores_logits.device)
-    loss = pos_weight * loss_pos + neg_weight * loss_neg
-    if use_focal and scores_logits.numel() > 0:
-        p_t = prob * target + (1 - prob) * (1 - target)
-        focal = -((1 - p_t) ** focal_gamma) * torch.log(p_t)
-        if focal_alpha >= 0:
-            alpha_t = focal_alpha * target + (1 - focal_alpha) * (1 - target)
-            focal = alpha_t * focal
-        loss = loss + focal_weight * focal.mean()
-    return loss
-
-
-def compute_presence_loss_logits(
-    scores_logits: torch.Tensor,
-    matches: Sequence[Tuple[int, int]],
-    iou: Optional[torch.Tensor],
-    pos_weight: float,
-    neg_weight: float,
-    alpha: float = 0.2,
-    use_focal: bool = False,
-    focal_alpha: float = 0.25,
-    focal_gamma: float = 2.0,
-    focal_weight: float = 1.0,
-) -> torch.Tensor:
-    scores_logits = scores_logits.float()
-    target = torch.zeros_like(scores_logits)
-    if scores_logits.numel() > 0 and matches:
-        for gt_idx, pred_idx in matches:
-            if 0 <= pred_idx < target.numel():
-                soft_target = torch.tensor(1.0, device=target.device, dtype=target.dtype)
-                if iou is not None and 0 <= gt_idx < iou.shape[0] and 0 <= pred_idx < iou.shape[1]:
-                    prob = torch.sigmoid(scores_logits[pred_idx])
-                    iou_val = iou[gt_idx, pred_idx].clamp(0.0, 1.0)
-                    soft = (prob**alpha) * (iou_val ** (1.0 - alpha))
-                    soft_target = soft.clamp(min=0.11).detach()
-                target[pred_idx] = torch.maximum(target[pred_idx], soft_target)
-    loss_per = F.binary_cross_entropy_with_logits(scores_logits, target, reduction="none")
-    pos_mask = target > 0.1
-    neg_mask = ~pos_mask
-    if pos_mask.any():
-        loss_pos = loss_per[pos_mask].mean()
-    else:
-        loss_pos = torch.zeros((), device=scores_logits.device)
-    if neg_mask.any():
-        loss_neg = loss_per[neg_mask].mean()
-    else:
-        loss_neg = torch.zeros((), device=scores_logits.device)
-    loss = pos_weight * loss_pos + neg_weight * loss_neg
-    if use_focal and scores_logits.numel() > 0:
-        prob = torch.sigmoid(scores_logits)
-        p_t = prob * target + (1 - prob) * (1 - target)
-        focal = -((1 - p_t) ** focal_gamma) * torch.log(p_t.clamp_min(1e-6))
-        if focal_alpha >= 0:
-            alpha_t = focal_alpha * target + (1 - focal_alpha) * (1 - target)
-            focal = alpha_t * focal
-        loss = loss + focal_weight * focal.mean()
-    return loss
-
-
-def compute_score_weighted_mask_loss(
-    logits_mhw: torch.Tensor,
-    gt_target_hw: torch.Tensor,
-    scores_logits: torch.Tensor,
-    bce_weight: float,
-    dice_weight: float,
-    power: float,
-) -> torch.Tensor:
-    gt_broadcast = gt_target_hw.unsqueeze(0).expand_as(logits_mhw)
-    loss_bce_per = F.binary_cross_entropy_with_logits(
-        logits_mhw,
-        gt_broadcast,
-        reduction="none",
-    ).mean(dim=(1, 2))
-    probs_mhw = torch.sigmoid(logits_mhw)
-    eps = 1e-6
-    dice_num = 2 * (probs_mhw * gt_broadcast).sum(dim=(1, 2)) + eps
-    dice_den = probs_mhw.sum(dim=(1, 2)) + gt_broadcast.sum(dim=(1, 2)) + eps
-    loss_dice_per = 1.0 - dice_num / dice_den
-    loss_per_mask = bce_weight * loss_bce_per + dice_weight * loss_dice_per
-
-    # scores = torch.sigmoid(scores_logits.float())
-    # weights = torch.softmax(scores**power, dim=0)
-    # compute_score_weighted_mask_loss / _from_matches: remove sigmoid
-    scores = scores_probs.float()  # no torch.sigmoid(...)
-    weights = torch.softmax(scores**power, dim=0)
-
-    return (weights * loss_per_mask).sum()
-
-
-def compute_score_weighted_mask_loss_from_matches(
-    scores_logits: torch.Tensor,
-    matches: Sequence[Tuple[int, int]],
-    matched_losses: Sequence[torch.Tensor],
-    power: float,
-) -> torch.Tensor:
-    if not matches or not matched_losses:
-        return torch.zeros((), device=scores_logits.device)
-    scores = torch.sigmoid(scores_logits.float())
-    weights = torch.softmax(scores**power, dim=0)
-    pred_indices = [pred_idx for _, pred_idx in matches]
-    sel_weights = weights[pred_indices]
-    sel_weights = sel_weights / sel_weights.sum().clamp_min(1e-6)
-    weighted = [weight * loss for weight, loss in zip(sel_weights, matched_losses)]
-    return torch.stack(weighted).sum()
 
 
 def pad_exemplar_batch(
@@ -1378,8 +1262,9 @@ def parse_args() -> argparse.Namespace:
         "--dataset_root",
         type=str,
         default=[
-            ("/sata1/data/kevin/v2_dataset/v2_multi_gt/v2_sdg_output", 2, True),
+            ("/sata1/data/kevin/v2_dataset/v2_multi_gt/v2_sdg_output", 1, True),
             ("/sata1/data/kevin/v2_imgs/train_1", 1, True),
+            ("/sata1/data/kevin/v2_dataset/v2_multi_gt_merged_345", 1,True)
         ],
         help="Comma-separated dataset roots. Can also set a list of (path, multiplier, use_filter) in code defaults.",
     )
@@ -1394,18 +1279,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max_side_length", type=int, default=1008)
     parser.add_argument("--no_square", action="store_true", help="Disable square resizing in encoder.")
     parser.add_argument("--num_points_approx", type=int, default=25)
-    parser.add_argument("--epochs", type=int, default=23)
-    parser.add_argument("--batch_size", type=int, default=16)
+    parser.add_argument("--epochs", type=int, default=35)
+    parser.add_argument("--batch_size", type=int, default=13)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--weight_decay", type=float, default=1e-4)
     parser.add_argument("--bce_weight", type=float, default=2.0)
     parser.add_argument("--dice_weight", type=float, default=2.0)
+    parser.add_argument("--bbox_weight", type=float, default=1.0)
     parser.add_argument("--score_weight", type=float, default=0.3)
     parser.add_argument("--no_object_weight", type=float, default=0.45)
     parser.add_argument(
         "--matches_per_gt",
         type=int,
-        default=8,
+        default=1,
         help="Max number of predictions to assign per GT during greedy matching.",
     )
     parser.add_argument("--det_filter", type=float, default=0.0)
@@ -1415,22 +1301,22 @@ def parse_args() -> argparse.Namespace:
         default=0.5,
         help="IoU threshold for mask NMS used in metrics/debug (<=0 disables NMS).",
     )
-    parser.add_argument("--grad_accum", type=int, default=6)
+    parser.add_argument("--grad_accum", type=int, default=12)
     parser.add_argument("--log_every", type=int, default=4)
     parser.add_argument("--save_every", type=int, default=1)
     parser.add_argument(
         "--save_debug_every",
         type=int,
-        default=1,
+        default=20,
         help="Save debug collage every N batches (0 disables).",
     )
     parser.add_argument("--output_dir", type=str, default="finetune_exemplar")
-    parser.add_argument("--device", type=str, default="cuda:2")
+    parser.add_argument("--device", type=str, default="cuda:3")
     parser.add_argument("--dtype", type=str, choices=["fp32", "bf16"], default="")
     parser.add_argument(
         "--resume_path",
         type=str,
-        default="/home/kevin/muggled_sam/finetune_exemplar/multi_object_best/finetune_epoch_011.pth",
+        default="/home/kevin/muggled_sam/finetune_exemplar/run_20260312_012006/finetune_epoch_015.pth",
         help="Path to a finetune checkpoint (.pth) to resume from.",
     )
     parser.add_argument(
@@ -1512,7 +1398,7 @@ def run_exemplar_eval(
     all_entries: List[Dict[str, str]] = []
     for root, multiplier, use_filter in dataset_roots:
         _, cur_entries = collect_multi_object_samples(root)
-        cur_entries = unique_frame_entries(cur_entries)
+        cur_entries = unique_object_entries(cur_entries)
         if use_filter:
             filter_path = resolve_dataset_filter_path(root)
             if filter_path is not None:
@@ -1532,6 +1418,11 @@ def run_exemplar_eval(
     total_iou_count = 0
     total_correct = 0
     batch_step = 0
+    pq_iou_threshold = 0.5
+    pq_score_thresholds = [round(0.10 + 0.01 * idx, 2) for idx in range(30)]
+    pq_stats: Dict[float, Dict[str, float]] = {
+        thresh: {"sum_iou": 0.0, "tp": 0, "fp": 0, "fn": 0} for thresh in pq_score_thresholds
+    }
 
     training_state = _capture_training_state(detmodel)
     detmodel.eval()
@@ -1549,9 +1440,11 @@ def run_exemplar_eval(
                         mapping_path = Path(entry["inst_path"]).with_name(
                             f"instance_segmentation_mapping_{entry['frame_id']}.json"
                         )
-                        obj_id, gt_masks = select_target_object_and_masks(
+                        obj_id = entry["object_id"]
+                        gt_masks = load_instance_masks_for_object(
                             entry["inst_path"],
                             str(mapping_path),
+                            obj_id,
                             seg_cache=seg_cache,
                             mapping_cache=mapping_cache,
                         )
@@ -1583,6 +1476,7 @@ def run_exemplar_eval(
                     exemplar_ref = ref_cache[obj_id]
                     prepared.append(
                         {
+                            "object_id": obj_id,
                             "image_bgr": image_bgr,
                             "gt_masks": gt_masks,
                             "exemplar_ref": exemplar_ref,
@@ -1614,7 +1508,7 @@ def run_exemplar_eval(
                     exemplars_list = [prepared[i]["exemplar_ref"] for i in idxs]
                     exemplar_batch, padding_mask = pad_exemplar_batch(exemplars_list, device=device)
 
-                    mask_preds, _, det_scores, det_scores_logits, _ = generate_detections_train(
+                    mask_preds, box_preds, det_scores, det_scores_logits, _ = generate_detections_train(
                         detmodel,
                         encoded_image_features_list,
                         exemplar_batch,
@@ -1622,31 +1516,63 @@ def run_exemplar_eval(
                         exemplar_padding_mask_bn=padding_mask,
                     )
                     if mask_preds.shape[1] == 0:
+                        for data_idx in idxs:
+                            preencode_hw = prepared[data_idx]["preencode_hw"]
+                            gt_down_list = build_gt_down_list(
+                                prepared[data_idx]["gt_masks"],
+                                preencode_hw,
+                                mask_preds.shape[-2:],
+                                device,
+                            )
+                            update_pq_accumulators(pq_stats, [], gt_down_list, None, pq_iou_threshold)
                         continue
 
                     for local_idx, data_idx in enumerate(idxs):
                         preencode_hw = prepared[data_idx]["preencode_hw"]
                         scores = det_scores[local_idx]
                         if scores.numel() == 0:
+                            gt_down_list = build_gt_down_list(
+                                prepared[data_idx]["gt_masks"],
+                                preencode_hw,
+                                mask_preds.shape[-2:],
+                                device,
+                            )
+                            update_pq_accumulators(pq_stats, [], gt_down_list, None, pq_iou_threshold)
                             continue
 
-                        gt_targets: List[torch.Tensor] = []
-                        for gt_mask in prepared[data_idx]["gt_masks"]:
-                            gt_preenc = resize_mask(gt_mask, preencode_hw)
-                            gt_tensor = torch.from_numpy(gt_preenc).to(device).unsqueeze(0).unsqueeze(0)
-                            gt_down = F.interpolate(
-                                gt_tensor, size=mask_preds.shape[-2:], mode="nearest"
-                            ).squeeze(0)
-                            gt_targets.append(gt_down[0].float())
-                        if not gt_targets:
+                        gt_down_list = build_gt_down_list(
+                            prepared[data_idx]["gt_masks"],
+                            preencode_hw,
+                            mask_preds.shape[-2:],
+                            device,
+                        )
+                        if not gt_down_list:
                             continue
 
-                        topk = min(len(gt_targets) * max(1, config.matches_per_gt), scores.numel())
+                        boxes_nms, masks_nms, scores_nms = apply_mask_nms(
+                            box_preds[local_idx],
+                            mask_preds[local_idx],
+                            scores,
+                            iou_threshold=config.nms_iou,
+                        )
+                        if scores_nms.numel() == 0:
+                            update_pq_accumulators(pq_stats, [], gt_down_list, None, pq_iou_threshold)
+                        else:
+                            pred_masks_list = [(masks_nms[k] > 0) for k in range(masks_nms.shape[0])]
+                            update_pq_accumulators(
+                                pq_stats,
+                                pred_masks_list,
+                                gt_down_list,
+                                pred_scores=scores_nms,
+                                iou_threshold=pq_iou_threshold,
+                            )
+
+                        topk = min(len(gt_down_list) * max(1, config.matches_per_gt), scores.numel())
                         top_idx = torch.topk(scores, k=topk).indices
                         logits_sel = mask_preds[local_idx, top_idx].float()
                         matches, iou = match_predictions_to_gts_greedy_k(
                             logits_sel,
-                            gt_targets,
+                            gt_down_list,
                             max_matches=None,
                             max_per_gt=config.matches_per_gt,
                         )
@@ -1678,7 +1604,29 @@ def run_exemplar_eval(
     if total_iou_count > 0:
         overall_avg = total_iou_sum / total_iou_count
         overall_correct = total_correct / total_iou_count
+        for score_threshold in sorted(pq_stats.keys()):
+            stats = pq_stats[score_threshold]
+            denom = stats["tp"] + 0.5 * stats["fp"] + 0.5 * stats["fn"]
+            if denom > 0:
+                pq = stats["sum_iou"] / denom
+            else:
+                pq = 0.0
+            print(
+                f"[eval] PQ@score>={score_threshold:.2f}={pq:.4f} "
+                f"tp={int(stats['tp'])} fp={int(stats['fp'])} fn={int(stats['fn'])}"
+            )
         return overall_avg, total_iou_count, overall_correct
+    for score_threshold in sorted(pq_stats.keys()):
+        stats = pq_stats[score_threshold]
+        denom = stats["tp"] + 0.5 * stats["fp"] + 0.5 * stats["fn"]
+        if denom > 0:
+            pq = stats["sum_iou"] / denom
+        else:
+            pq = 0.0
+        print(
+            f"[eval] PQ@score>={score_threshold:.2f}={pq:.4f} "
+            f"tp={int(stats['tp'])} fp={int(stats['fp'])} fn={int(stats['fn'])}"
+        )
     return 0.0, 0, 0.0
 
 
@@ -1799,6 +1747,8 @@ def main() -> None:
         random.shuffle(all_entries)
         epoch_loss = 0.0
         epoch_count = 0
+        epoch_iou_sum = 0.0
+        epoch_iou_count = 0
 
         for start in range(0, len(all_entries), args.batch_size):
             subset = all_entries[start : start + args.batch_size]
@@ -1921,7 +1871,7 @@ def main() -> None:
                         logits_mhw,
                         gt_targets,
                         max_matches=None,
-                        max_per_gt=8,
+                        max_per_gt=12,
                     )
                     matched_losses = compute_matched_mask_losses(
                         logits_mhw,
@@ -1931,6 +1881,11 @@ def main() -> None:
                         dice_weight=args.dice_weight,
                     )
                     loss_mask = torch.stack(matched_losses).mean()
+                    loss_bbox = compute_bbox_l1_loss_from_matches(
+                        box_preds[local_idx],
+                        gt_targets,
+                        o2m_matches,
+                    )
                     loss_presence = compute_presence_loss_logits(
                         det_scores_logits[local_idx],
                         o2m_matches,
@@ -1949,7 +1904,7 @@ def main() -> None:
                         matched_losses,
                         power=2.0,
                     )
-                    loss = loss_mask * 2.0 + loss_presence
+                    loss = loss_mask * 2.0 + loss_presence + args.bbox_weight * loss_bbox
                     batch_losses.append(loss)
 
                     scores = det_scores[local_idx]
@@ -2009,6 +1964,8 @@ def main() -> None:
             running_losses.append(float(batch_loss.item()))
             batch_top_iou = float(np.mean(batch_top_ious)) if batch_top_ious else 0.0
             running_top_ious.append(batch_top_iou)
+            epoch_iou_sum += batch_top_iou
+            epoch_iou_count += 1
             batch_loss.backward()
             batch_step += 1
             global_step += 1
@@ -2021,11 +1978,13 @@ def main() -> None:
 
             if args.log_every > 0 and global_step % args.log_every == 0:
                 avg_loss = epoch_loss / max(1, epoch_count)
+                avg_epoch_iou = epoch_iou_sum / max(1, epoch_iou_count)
                 running_avg = sum(running_losses) / max(1, len(running_losses))
                 running_iou = sum(running_top_ious) / max(1, len(running_top_ious))
                 print(
                     f"epoch={epoch} step={global_step} "
                     f"loss={batch_loss.item():.4f} avg_loss={avg_loss:.4f} "
+                    f"avg_iou={avg_epoch_iou:.4f} "
                     f"run5_loss={running_avg:.4f} run5_iou={running_iou:.4f}"
                 )
                 save_path = os.path.join(args.output_dir, f"finetune.pth")

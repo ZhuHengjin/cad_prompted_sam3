@@ -85,7 +85,7 @@ def parse_args() -> argparse.Namespace:
         "--dataset_root",
         type=str,
         nargs="+",
-        default=["/sata1/data/kevin/v2_dataset/v2_multi_gt/v2_sdg_output", "/sata1/data/kevin/v2_imgs/train_1"],
+        default=["/sata1/data/kevin/v2_dataset/v2_multi_gt_merged_345"],
         help="Dataset roots (space or comma separated).",
     )
     parser.add_argument(
