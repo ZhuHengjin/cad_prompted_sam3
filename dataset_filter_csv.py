@@ -62,7 +62,7 @@ def iter_frames(dataset_root: str) -> Iterable[Tuple[str, Path, Path, Path]]:
     dataset_path = Path(dataset_root).expanduser().resolve()
     if not dataset_path.is_dir():
         raise FileNotFoundError(dataset_root)
-    pattern = re.compile(r"instance_segmentation_(\d{4})\.png$")
+    pattern = re.compile(r"instance_segmentation_(\d+)\.png$")
     for inst_path in sorted(dataset_path.glob("instance_segmentation_*.png")):
         match = pattern.match(inst_path.name)
         if not match:
@@ -85,7 +85,7 @@ def parse_args() -> argparse.Namespace:
         "--dataset_root",
         type=str,
         nargs="+",
-        default=["/sata1/data/kevin/v2_dataset/v2_multi_gt_merged_345"],
+        default=["/sata1/data/kevin/v2_imgs/train_2"],
         help="Dataset roots (space or comma separated).",
     )
     parser.add_argument(

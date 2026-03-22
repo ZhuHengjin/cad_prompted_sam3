@@ -1,7 +1,7 @@
 import re
 
 # ===== CHANGE THIS =====
-LOG_PATH = "/home/kevin/muggled_sam/train_logs/0315_finetune_new_multi_gt_dataset_k15_b154_from_e21.log"
+LOG_PATH = "/home/zhenrant/rendering_prompted_muggled_sam/train_logs/0321_multi_gt_k12_bbox_b156_resume_from_preprinte18_s0.log"
 # LOG_PATH = "/home/kevin/muggled_sam/train_logs/0315_finetune_new_multi_gt_dataset_k15_b154_from_e21.log"
 
 # =======================
@@ -57,7 +57,7 @@ with open(LOG_PATH, "r", encoding="utf-8", errors="replace") as f:
 
 # sort high → low by PQ
 results.sort(key=lambda x: x["best_pq"] if x["best_pq"] is not None else -1, reverse=True)
-
+print("evaluating log:", LOG_PATH)
 
 print("Ranked epochs by best PQ score")
 print("-------------------------------------------------------")

@@ -2,6 +2,7 @@
 # -*- coding: utf-8 -*-
 
 import argparse
+import csv
 import json
 import os
 import random
@@ -75,7 +76,7 @@ def collect_multi_object_samples(
     dataset_path = Path(dataset_root).expanduser().resolve()
     if not dataset_path.is_dir():
         raise FileNotFoundError(dataset_root)
-    pattern = re.compile(r"instance_segmentation_(\d{4})\.png$")
+    pattern = re.compile(r"instance_segmentation_(\d+)\.png$")
     object_map: Dict[str, List[Dict[str, str]]] = defaultdict(list)
     all_entries: List[Dict[str, str]] = []
     for inst_path in sorted(dataset_path.glob("instance_segmentation_*.png")):
@@ -199,7 +200,7 @@ def _coerce_multiplier(value: object) -> float:
     return multiplier
 
 
-def normalize_dataset_roots(dataset_root: object) -> List[Tuple[str, float]]:
+def normalize_dataset_roots(dataset_root: object) -> List[Tuple[str, float, bool]]:
     if dataset_root is None:
         return []
     items: List[object]
@@ -207,18 +208,78 @@ def normalize_dataset_roots(dataset_root: object) -> List[Tuple[str, float]]:
         items = list(dataset_root)
     else:
         items = [dataset_root]
-    roots: List[Tuple[str, float]] = []
+    roots: List[Tuple[str, float, bool]] = []
     for item in items:
-        if isinstance(item, (list, tuple)) and len(item) == 2:
+        if isinstance(item, (list, tuple)) and len(item) in (2, 3):
             path = str(item[0]).strip()
             if path:
-                roots.append((path, _coerce_multiplier(item[1])))
+                multiplier = _coerce_multiplier(item[1])
+                use_filter = bool(item[2]) if len(item) == 3 else False
+                roots.append((path, multiplier, use_filter))
             continue
         for part in str(item).split(","):
             part = part.strip()
             if part:
-                roots.append((part, 1.0))
+                roots.append((part, 1.0, False))
     return roots
+
+
+def load_dataset_filter_set(csv_path: Path) -> Tuple[Optional[set], Optional[set]]:
+    if not csv_path.is_file():
+        return None, None
+    try:
+        with open(csv_path, "r", newline="") as handle:
+            reader = csv.DictReader(handle)
+            if not reader.fieldnames:
+                return None, None
+            frame_ids: set = set()
+            tuple_keys: set = set()
+            for row in reader:
+                frame_id = (row.get("frame_id") or "").strip()
+                rgb_path = (row.get("rgb_path") or "").strip()
+                inst_path = (row.get("inst_path") or "").strip()
+                if frame_id:
+                    frame_ids.add(frame_id)
+                if frame_id and rgb_path and inst_path:
+                    tuple_keys.add((frame_id, rgb_path, inst_path))
+            return (tuple_keys if tuple_keys else None), (frame_ids if frame_ids else None)
+    except FileNotFoundError:
+        return None, None
+
+
+def _slugify(path: str) -> str:
+    cleaned = re.sub(r"[^A-Za-z0-9._-]+", "_", path.strip().strip("/"))
+    return cleaned or "dataset"
+
+
+def resolve_dataset_filter_path(root: str) -> Optional[Path]:
+    root_path = Path(root).expanduser().resolve()
+    slug = _slugify(str(root_path))
+    candidate = Path.cwd() / f"dataset_filter_{slug}.csv"
+    if candidate.is_file():
+        return candidate
+    return None
+
+
+def apply_dataset_filter_entries(
+    entries: Sequence[Dict[str, str]],
+    filter_path: Optional[Path],
+) -> List[Dict[str, str]]:
+    if not filter_path:
+        return list(entries)
+    tuple_keys, frame_ids = load_dataset_filter_set(filter_path)
+    if tuple_keys is None and frame_ids is None:
+        return list(entries)
+    filtered: List[Dict[str, str]] = []
+    for entry in entries:
+        key = (entry["frame_id"], entry["rgb_path"], entry["inst_path"])
+        if tuple_keys is not None:
+            if key in tuple_keys:
+                filtered.append(entry)
+            continue
+        if frame_ids is not None and entry["frame_id"] in frame_ids:
+            filtered.append(entry)
+    return filtered
 
 
 def unique_object_entries(entries: Sequence[Dict[str, str]]) -> List[Dict[str, str]]:
@@ -295,6 +356,58 @@ def data_augmentation(
             break
     image_bgr = apply_random_color_distortion(image_bgr)
     return image_bgr, gt_mask
+
+
+def data_augmentation_multi(
+    image_bgr: np.ndarray,
+    gt_masks: Sequence[np.ndarray],
+    min_crop_scale: float = 0.6,
+    max_crop_scale: float = 1.0,
+) -> Tuple[np.ndarray, List[np.ndarray]]:
+    if not gt_masks:
+        aug_image = apply_random_color_distortion(image_bgr)
+        return aug_image, []
+
+    orig_h, orig_w = image_bgr.shape[:2]
+    union_mask = np.zeros((orig_h, orig_w), dtype=np.float32)
+    for gt_mask in gt_masks:
+        union_mask = np.maximum(union_mask, gt_mask.astype(np.float32))
+
+    mask_bin = union_mask > 0.5
+    out_masks = [gt_mask.astype(np.float32) for gt_mask in gt_masks]
+    if mask_bin.any():
+        ys, xs = np.where(mask_bin)
+        y1, y2 = int(ys.min()), int(ys.max())
+        x1, x2 = int(xs.min()), int(xs.max())
+        bbox_h = y2 - y1 + 1
+        bbox_w = x2 - x1 + 1
+        for _ in range(50):
+            scale = random.uniform(min_crop_scale, max_crop_scale)
+            crop_h = max(1, int(round(orig_h * scale)))
+            crop_w = max(1, int(round(orig_w * scale)))
+            if crop_h < bbox_h or crop_w < bbox_w:
+                continue
+            max_y0 = orig_h - crop_h
+            max_x0 = orig_w - crop_w
+            y0_min = max(0, y2 - crop_h + 1)
+            y0_max = min(y1, max_y0)
+            x0_min = max(0, x2 - crop_w + 1)
+            x0_max = min(x1, max_x0)
+            if y0_min > y0_max or x0_min > x0_max:
+                continue
+            y0 = random.randint(y0_min, y0_max)
+            x0 = random.randint(x0_min, x0_max)
+            image_bgr = image_bgr[y0 : y0 + crop_h, x0 : x0 + crop_w]
+            out_masks = [gt_mask[y0 : y0 + crop_h, x0 : x0 + crop_w] for gt_mask in out_masks]
+            image_bgr = cv2.resize(image_bgr, (orig_w, orig_h), interpolation=cv2.INTER_LINEAR)
+            out_masks = [
+                cv2.resize(gt_mask.astype(np.float32), (orig_w, orig_h), interpolation=cv2.INTER_NEAREST)
+                for gt_mask in out_masks
+            ]
+            break
+
+    image_bgr = apply_random_color_distortion(image_bgr)
+    return image_bgr, out_masks
 
 
 def sample_points_from_mask(mask_image: np.ndarray, num_points_approx: int = 25) -> List[Tuple[float, float]]:
@@ -569,6 +682,52 @@ def compute_score_weighted_mask_loss(
     scores = torch.sigmoid(scores_logits.float())
     weights = torch.softmax(scores**power, dim=0)
     return (weights * loss_per_mask).sum()
+
+
+def compute_mask_ious_per_gt(
+    logits_mhw: torch.Tensor,
+    gt_targets_hw: Sequence[torch.Tensor],
+) -> torch.Tensor:
+    pred_bin = logits_mhw > 0
+    iou_rows: List[torch.Tensor] = []
+    for gt_target_hw in gt_targets_hw:
+        gt_bin = gt_target_hw > 0.5
+        intersection = (pred_bin & gt_bin.unsqueeze(0)).sum(dim=(1, 2))
+        union = (pred_bin | gt_bin.unsqueeze(0)).sum(dim=(1, 2)).clamp_min(1)
+        iou_rows.append(intersection.float() / union.float())
+    return torch.stack(iou_rows, dim=0)
+
+
+def compute_score_weighted_mask_loss_best_gt_per_pred(
+    logits_mhw: torch.Tensor,
+    gt_targets_hw: Sequence[torch.Tensor],
+    scores_logits: torch.Tensor,
+    bce_weight: float,
+    dice_weight: float,
+    power: float,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    if not gt_targets_hw:
+        zero = torch.zeros((), device=logits_mhw.device)
+        return zero, torch.empty((0, logits_mhw.shape[0]), device=logits_mhw.device)
+
+    iou_gm = compute_mask_ious_per_gt(logits_mhw, gt_targets_hw)
+    best_gt_idx_per_pred = torch.argmax(iou_gm, dim=0)
+
+    matched_loss_per_pred: List[torch.Tensor] = []
+    for pred_idx, gt_idx in enumerate(best_gt_idx_per_pred.tolist()):
+        gt_target_hw = gt_targets_hw[gt_idx]
+        loss_per_mask = compute_mask_loss_best(
+            logits_mhw[pred_idx : pred_idx + 1],
+            gt_target_hw,
+            bce_weight=bce_weight,
+            dice_weight=dice_weight,
+        )[0]
+        matched_loss_per_pred.append(loss_per_mask)
+
+    loss_per_pred = torch.stack(matched_loss_per_pred)
+    scores = torch.sigmoid(scores_logits.float())
+    weights = torch.softmax(scores**power, dim=0)
+    return (weights * loss_per_pred).sum(), iou_gm
 
 
 def pad_exemplar_batch(
@@ -876,7 +1035,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--model_path",
         type=str,
-        default="/home/kevin/sam3.pt",
+        default="/home/zhenrant/rendering_prompted_muggled_sam/sam3.pt",
         help="Path to SAMv3 checkpoint (.pt).",
     )
     # parser.add_argument(
@@ -913,8 +1072,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--dataset_root",
         type=str,
-        default=["/sata1/data/kevin/v2_imgs/_out_v2_merged"],
-        help="Comma-separated dataset roots. Can also set a list of (path, multiplier) in code defaults.",
+        default=[
+            ("/sata1/data/kevin/v2_dataset/v2_multi_gt/v2_sdg_output", 1, True),
+            ("/sata1/data/kevin/v2_imgs/train_1", 1, True),
+            ("/sata1/data/kevin/v2_imgs/train_2", 1, True),
+            ("/sata1/data/kevin/v2_dataset/v2_multi_gt_merged_345", 1,True)
+        ],
+        help="Comma-separated dataset roots. Can also set a list of (path, multiplier, use_filter) in code defaults.",
     )
     parser.add_argument(
         "--reference_dir",
@@ -922,12 +1086,12 @@ def parse_args() -> argparse.Namespace:
         default="/sata1/data/kevin/v2_3d/v2_usds/v2_stl_render_0212",
         help="Path to reference renders.",
     )
-    parser.add_argument("--ref_view_ids", type=str, default="0,3,6,9", help="Reference view ids to use.")
+    parser.add_argument("--ref_view_ids", type=str, default="0,1,2,3,4,5,6,7,8,9,10,11,12", help="Reference view ids to use.")
     parser.add_argument("--max_side_length", type=int, default=1008)
     parser.add_argument("--no_square", action="store_true", help="Disable square resizing in encoder.")
     parser.add_argument("--num_points_approx", type=int, default=25)
-    parser.add_argument("--epochs", type=int, default=30)
-    parser.add_argument("--batch_size", type=int, default=4)
+    parser.add_argument("--epochs", type=int, default=20)
+    parser.add_argument("--batch_size", type=int, default=12)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--weight_decay", type=float, default=1e-4)
     parser.add_argument("--bce_weight", type=float, default=2.0)
@@ -936,12 +1100,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no_object_weight", type=float, default=0.3)
     parser.add_argument("--det_filter", type=float, default=0.0)
     parser.add_argument("--grad_accum", type=int, default=4)
-    parser.add_argument("--log_every", type=int, default=2)
+    parser.add_argument("--log_every", type=int, default=4)
     parser.add_argument("--save_every", type=int, default=1)
     parser.add_argument(
         "--save_debug_every",
         type=int,
-        default=5,
+        default=50,
         help="Save debug collage every N batches (0 disables).",
     )
     parser.add_argument("--output_dir", type=str, default="finetune_exemplar")
@@ -1030,8 +1194,11 @@ def run_exemplar_eval(
         raise FileNotFoundError(reference_dir)
 
     all_entries: List[Dict[str, str]] = []
-    for root, multiplier in dataset_roots:
+    for root, multiplier, use_filter in dataset_roots:
         _, cur_entries = collect_multi_object_samples(root)
+        if use_filter:
+            filter_path = resolve_dataset_filter_path(root)
+            cur_entries = apply_dataset_filter_entries(cur_entries, filter_path)
         cur_entries = unique_object_entries(cur_entries)
         cur_entries = apply_dataset_multiplier(cur_entries, multiplier)
         all_entries.extend(cur_entries)
@@ -1259,8 +1426,11 @@ def main() -> None:
 
     object_samples: Dict[str, List[Dict[str, str]]] = {}
     all_entries: List[Dict[str, str]] = []
-    for root, multiplier in dataset_roots:
+    for root, multiplier, use_filter in dataset_roots:
         cur_samples, cur_entries = collect_multi_object_samples(root)
+        if use_filter:
+            filter_path = resolve_dataset_filter_path(root)
+            cur_entries = apply_dataset_filter_entries(cur_entries, filter_path)
         for obj_id, entries in cur_samples.items():
             object_samples.setdefault(obj_id, []).extend(entries)
         cur_entries = apply_dataset_multiplier(cur_entries, multiplier)
@@ -1300,15 +1470,22 @@ def main() -> None:
             prepared: List[Dict[str, object]] = []
             for entry in subset:
                 obj_id = entry["object_id"]
+                mapping_path = Path(entry["inst_path"]).with_name(f"instance_segmentation_mapping_{entry['frame_id']}.json")
                 try:
                     image_bgr = load_bgr(entry["rgb_path"])
                 except FileNotFoundError:
                     continue
                 try:
-                    gt_mask = load_instance_mask(entry["inst_path"], entry["color"])
+                    gt_masks = load_instance_masks_for_object(
+                        entry["inst_path"],
+                        str(mapping_path),
+                        obj_id,
+                    )
                 except FileNotFoundError:
                     continue
-                gt_pixels = int(gt_mask.sum())
+                if not gt_masks:
+                    continue
+                gt_pixels = max(int(gt_mask.sum()) for gt_mask in gt_masks)
                 if gt_pixels < 100:
                     print(
                         f"Skipping object {obj_id} (frame={entry['frame_id']}) "
@@ -1316,7 +1493,7 @@ def main() -> None:
                     )
                     continue
 
-                image_bgr, gt_mask = data_augmentation(image_bgr, gt_mask)
+                image_bgr, gt_masks = data_augmentation_multi(image_bgr, gt_masks)
 
                 if obj_id not in ref_cache:
                     exemplar_ref = build_exemplar_tokens_for_object(
@@ -1338,7 +1515,7 @@ def main() -> None:
                     {
                         "object_id": obj_id,
                         "image_bgr": image_bgr,
-                        "gt_mask": gt_mask,
+                        "gt_masks": gt_masks,
                         "exemplar_ref": exemplar_ref,
                     }
                 )
@@ -1385,15 +1562,23 @@ def main() -> None:
 
                 for local_idx, data_idx in enumerate(idxs):
                     preencode_hw = prepared[data_idx]["preencode_hw"]
-                    gt_preenc = resize_mask(prepared[data_idx]["gt_mask"], preencode_hw)
-                    gt_tensor = torch.from_numpy(gt_preenc).to(device).unsqueeze(0).unsqueeze(0)
-                    gt_down = F.interpolate(gt_tensor, size=mask_preds.shape[-2:], mode="nearest").squeeze(0)
+                    gt_targets: List[torch.Tensor] = []
+                    for gt_mask in prepared[data_idx]["gt_masks"]:
+                        gt_preenc = resize_mask(gt_mask, preencode_hw)
+                        gt_tensor = torch.from_numpy(gt_preenc).to(device).unsqueeze(0).unsqueeze(0)
+                        gt_down = F.interpolate(gt_tensor, size=mask_preds.shape[-2:], mode="nearest").squeeze(0)
+                        gt_targets.append(gt_down[0].float())
+                    if not gt_targets:
+                        continue
 
-                    gt_target = gt_down[0].float()
                     logits_mhw = mask_preds[local_idx].float()
-                    loss_mask, best_idx = compute_mask_loss_best(
+                    iou_gm = compute_mask_ious_per_gt(logits_mhw, gt_targets)
+                    flat_best_idx = int(torch.argmax(iou_gm).item())
+                    best_gt_idx = flat_best_idx // max(1, logits_mhw.shape[0])
+                    best_idx = flat_best_idx % max(1, logits_mhw.shape[0])
+                    loss_mask, _ = compute_mask_loss_best(
                         logits_mhw,
-                        gt_target,
+                        gt_targets[best_gt_idx],
                         bce_weight=args.bce_weight,
                         dice_weight=args.dice_weight,
                     )
@@ -1403,9 +1588,9 @@ def main() -> None:
                         pos_weight=args.score_weight,
                         neg_weight=args.no_object_weight,
                     )
-                    loss_weighted_mask = compute_score_weighted_mask_loss(
+                    loss_weighted_mask, _ = compute_score_weighted_mask_loss_best_gt_per_pred(
                         logits_mhw,
-                        gt_target,
+                        gt_targets,
                         det_scores[local_idx],
                         bce_weight=args.bce_weight,
                         dice_weight=args.dice_weight,
@@ -1417,7 +1602,8 @@ def main() -> None:
                     top_idx = int(torch.argmax(det_scores[local_idx]).item())
                     top_pred = mask_preds[local_idx, top_idx]
                     pred_mask = torch.sigmoid(top_pred) > 0.5
-                    gt_mask = gt_down[0] > 0.5
+                    top_gt_idx = int(torch.argmax(iou_gm[:, top_idx]).item())
+                    gt_mask = gt_targets[top_gt_idx] > 0.5
                     intersection = torch.logical_and(pred_mask, gt_mask).sum().float()
                     union = torch.logical_or(pred_mask, gt_mask).sum().float()
                     if union.item() > 0:
@@ -1436,7 +1622,7 @@ def main() -> None:
                             object_id=prepared[data_idx]["object_id"],
                             reference_dir=reference_dir,
                             ref_view_ids=ref_view_ids,
-                            gt_masks=prepared[data_idx]["gt_mask"],
+                            gt_masks=prepared[data_idx]["gt_masks"],
                             ref_image_cache=ref_image_cache,
                         )
                         debug_saved = True

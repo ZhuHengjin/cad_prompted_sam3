@@ -812,7 +812,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--model_path",
         type=str,
-        default="/home/kevin/sam3.pt",
+        default="/home/zhenrant/rendering_prompted_muggled_sam/sam3.pt",
         help="Path to SAMv3 checkpoint (.pt).",
     )
     # parser.add_argument(
@@ -821,6 +821,18 @@ def parse_args() -> argparse.Namespace:
     #     default=["/sata1/data/kevin/realworld_datasets/persam_v2"],
     #     help="Comma-separated dataset roots.",
     # )
+    parser.add_argument(
+        "--reference_dir",
+        type=str,
+        default="/sata1/data/kevin/realworld_datasets/3d_printing_meshes/renders_2442_0316",
+        help="Path to reference renders.",
+    )
+    parser.add_argument(
+        "--dataset_root",
+        type=str,
+        default=["/sata1/data/kevin/realworld_datasets/3d_printing_dataset"],
+        help="Comma-separated dataset roots.",
+    )
     # parser.add_argument(
     #     "--reference_dir",
     #     type=str,
@@ -839,21 +851,21 @@ def parse_args() -> argparse.Namespace:
     #     default="/sata1/data/kevin/lego_datasets/lego_structure_refs",
     #     help="Path to reference renders.",
     # )
-    parser.add_argument(
-        "--dataset_root",
-        type=str,
-        nargs="+",
-        default=["/sata1/data/kevin/realworld_datasets/primesense_converted/000006", "/sata1/data/kevin/realworld_datasets/primesense_converted/000001", 
-        "/sata1/data/kevin/realworld_datasets/primesense_converted/000003",
-        "/sata1/data/kevin/realworld_datasets/primesense_converted/000004",
-        "/sata1/data/kevin/realworld_datasets/primesense_converted/000005",
-        "/sata1/data/kevin/realworld_datasets/primesense_converted/000006",
-        "/sata1/data/kevin/realworld_datasets/primesense_converted/000007",
-        "/sata1/data/kevin/realworld_datasets/primesense_converted/000008",
-        "/sata1/data/kevin/realworld_datasets/primesense_converted/000009",
-        "/sata1/data/kevin/realworld_datasets/primesense_converted/000010"],
-        help="Dataset roots (space-separated, and/or comma-separated).",
-    )
+    # parser.add_argument(
+    #     "--dataset_root",
+    #     type=str,
+    #     nargs="+",
+    #     default=["/sata1/data/kevin/realworld_datasets/primesense_converted/000006", "/sata1/data/kevin/realworld_datasets/primesense_converted/000001", 
+    #     "/sata1/data/kevin/realworld_datasets/primesense_converted/000003",
+    #     "/sata1/data/kevin/realworld_datasets/primesense_converted/000004",
+    #     "/sata1/data/kevin/realworld_datasets/primesense_converted/000005",
+    #     "/sata1/data/kevin/realworld_datasets/primesense_converted/000006",
+    #     "/sata1/data/kevin/realworld_datasets/primesense_converted/000007",
+    #     "/sata1/data/kevin/realworld_datasets/primesense_converted/000008",
+    #     "/sata1/data/kevin/realworld_datasets/primesense_converted/000009",
+    #     "/sata1/data/kevin/realworld_datasets/primesense_converted/000010"],
+    #     help="Dataset roots (space-separated, and/or comma-separated).",
+    # )
 #     parser.add_argument(
 #         "--dataset_root",
 #         type=str,
@@ -872,12 +884,12 @@ def parse_args() -> argparse.Namespace:
 # ],
 #         help="Dataset roots (space-separated, and/or comma-separated).",
 #     )
-    parser.add_argument(
-        "--reference_dir",
-        type=str,
-        default="/sata1/data/kevin/realworld_datasets/primesense_converted/cad_renders",
-        help="Path to reference renders.",
-    )
+    # parser.add_argument(
+    #     "--reference_dir",
+    #     type=str,
+    #     default="/sata1/data/kevin/realworld_datasets/primesense_converted/cad_renders",
+    #     help="Path to reference renders.",
+    # )
     #"0,3,6,9"
     #"0,1,2,3,4,5,6,7,8,9,10,11"
     parser.add_argument("--ref_view_ids", type=str, default="0,1,2,3,4,5,6,7,8,9,10,11", help="Reference view ids to use.")
@@ -899,7 +911,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--det_filter", type=float, default=0.0)
     parser.add_argument("--output_dir", type=str, default="outputs_eval_exemplar")
-    parser.add_argument("--device", type=str, default="cuda:1")
+    parser.add_argument("--device", type=str, default="cuda:0")
     parser.add_argument("--dtype", type=str, choices=["fp32", "bf16"], default="")
     parser.add_argument("--shuffle", action="store_true")
     parser.add_argument("--max_batches", type=int, default=0)

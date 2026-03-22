@@ -47,8 +47,8 @@ class EvalConfig:
 
 
 EVAL_CONFIG = EvalConfig(
-    dataset_root="/sata1/data/kevin/realworld_datasets/persam_v2",
-    reference_dir="/sata1/data/kevin/realworld_datasets/persam_real_coco/stl_renders_blender_2442_0120",
+    dataset_root="/sata1/data/kevin/realworld_datasets/3d_printing_dataset",
+    reference_dir="/sata1/data/kevin/realworld_datasets/3d_printing_meshes/renders_2442_0316",
     ref_view_ids="0,1,2,3,4,5,6,7,8,9,10,11",
     max_side_length=1008,
     use_square_sizing=True,
@@ -86,7 +86,7 @@ def collect_multi_object_samples(
     dataset_path = Path(dataset_root).expanduser().resolve()
     if not dataset_path.is_dir():
         raise FileNotFoundError(dataset_root)
-    pattern = re.compile(r"instance_segmentation_(\d{4})\.png$")
+    pattern = re.compile(r"instance_segmentation_(\d+)\.png$")
     object_map: Dict[str, List[Dict[str, str]]] = defaultdict(list)
     all_entries: List[Dict[str, str]] = []
     for inst_path in sorted(dataset_path.glob("instance_segmentation_*.png")):
@@ -1224,7 +1224,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--model_path",
         type=str,
-        default="/home/kevin/sam3.pt",
+        default="/home/zhenrant/rendering_prompted_muggled_sam/sam3.pt",
         help="Path to SAMv3 checkpoint (.pt).",
     )
     # parser.add_argument(
@@ -1311,12 +1311,18 @@ def parse_args() -> argparse.Namespace:
         help="Save debug collage every N batches (0 disables).",
     )
     parser.add_argument("--output_dir", type=str, default="finetune_exemplar")
-    parser.add_argument("--device", type=str, default="cuda:3")
+    parser.add_argument("--device", type=str, default="cuda:1")
     parser.add_argument("--dtype", type=str, choices=["fp32", "bf16"], default="")
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=1,
+        help="Random seed for Python, NumPy, and PyTorch.",
+    )
     parser.add_argument(
         "--resume_path",
         type=str,
-        default="/home/kevin/muggled_sam/finetune_exemplar/run_20260312_012006/finetune_epoch_015.pth",
+        default="/home/zhenrant/rendering_prompted_muggled_sam/model_weights/finetune_epoch_018.pth",
         help="Path to a finetune checkpoint (.pth) to resume from.",
     )
     parser.add_argument(
@@ -1633,6 +1639,13 @@ def run_exemplar_eval(
 def main() -> None:
     print("Starting fine-tuning with SAMv3 exemplar detection modules.")
     args = parse_args()
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(args.seed)
+    print(f"Using random seed {args.seed}")
+
     dataset_roots = normalize_dataset_roots(args.dataset_root)
     if not dataset_roots:
         raise ValueError("No dataset roots provided.")
