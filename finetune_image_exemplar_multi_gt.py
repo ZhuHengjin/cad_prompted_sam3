@@ -1279,7 +1279,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max_side_length", type=int, default=1008)
     parser.add_argument("--no_square", action="store_true", help="Disable square resizing in encoder.")
     parser.add_argument("--num_points_approx", type=int, default=25)
-    parser.add_argument("--epochs", type=int, default=35)
+    parser.add_argument("--epochs", type=int, default=45)
     parser.add_argument("--batch_size", type=int, default=13)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--weight_decay", type=float, default=1e-4)
@@ -1316,13 +1316,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--seed",
         type=int,
-        default=1,
+        default=0,
         help="Random seed for Python, NumPy, and PyTorch.",
     )
     parser.add_argument(
         "--resume_path",
         type=str,
-        default="/home/zhenrant/rendering_prompted_muggled_sam/model_weights/finetune_epoch_018.pth",
+        default="/home/zhenrant/rendering_prompted_muggled_sam/finetune_exemplar/run_20260321_202813/finetune_epoch_008.pth",
         help="Path to a finetune checkpoint (.pth) to resume from.",
     )
     parser.add_argument(

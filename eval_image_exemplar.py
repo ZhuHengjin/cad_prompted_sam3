@@ -1028,7 +1028,7 @@ def main() -> None:
     object_iou_sum: Dict[str, float] = defaultdict(float)
     object_iou_count: Dict[str, int] = defaultdict(int)
     pq_iou_threshold = 0.5
-    pq_score_thresholds = [round(0.10 + 0.01 * idx, 2) for idx in range(30)]
+    pq_score_thresholds = [round(0.10 + 0.01 * idx, 2) for idx in range(89)]
     pq_stats: Dict[float, Dict[str, float]] = {
         thresh: {"sum_iou": 0.0, "tp": 0, "fp": 0, "fn": 0} for thresh in pq_score_thresholds
     }
