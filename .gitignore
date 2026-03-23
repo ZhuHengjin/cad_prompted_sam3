@@ -31,3 +31,4 @@ outputs_finetune_exemplar/
 dataset_debug
 dataset_filter.csv
 *.csv
+assets/
