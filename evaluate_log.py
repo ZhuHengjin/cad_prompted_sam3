@@ -1,7 +1,7 @@
 import re
 
 # ===== CHANGE THIS =====
-LOG_PATH = "/home/zhenrant/rendering_prompted_muggled_sam/train_logs/0321_multi_gt_k12_bbox_b156_resume_from_singlegte8_s0.log"
+LOG_PATH = "/home/zhenrant/rendering_prompted_muggled_sam/train_logs/0321_single_gt_single_data_b48.log"
 # LOG_PATH = "/home/kevin/muggled_sam/train_logs/0315_finetune_new_multi_gt_dataset_k15_b154_from_e21.log"
 
 # =======================

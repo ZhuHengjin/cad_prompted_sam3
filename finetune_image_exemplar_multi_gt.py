@@ -1275,11 +1275,11 @@ def parse_args() -> argparse.Namespace:
         help="Path to reference renders.",
     )
     #"0,3,6,9"
-    parser.add_argument("--ref_view_ids", type=str, default="0,1,2,3,4,5,6,7,8,9,10,11,12", help="Reference view ids to use.")
+    parser.add_argument("--ref_view_ids", type=str, default="0,1,2,3,4,5,6,7,8,9,10,11", help="Reference view ids to use.")
     parser.add_argument("--max_side_length", type=int, default=1008)
     parser.add_argument("--no_square", action="store_true", help="Disable square resizing in encoder.")
     parser.add_argument("--num_points_approx", type=int, default=25)
-    parser.add_argument("--epochs", type=int, default=45)
+    parser.add_argument("--epochs", type=int, default=60)
     parser.add_argument("--batch_size", type=int, default=13)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--weight_decay", type=float, default=1e-4)
@@ -1322,7 +1322,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--resume_path",
         type=str,
-        default="/home/zhenrant/rendering_prompted_muggled_sam/finetune_exemplar/run_20260321_202813/finetune_epoch_008.pth",
+        default="finetune_exemplar/run_20260321_202844/finetune_epoch_006.pth",
         help="Path to a finetune checkpoint (.pth) to resume from.",
     )
     parser.add_argument(

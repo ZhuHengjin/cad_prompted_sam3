@@ -7,7 +7,6 @@ import json
 import math
 import os
 import random
-import re
 from collections import defaultdict
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -19,18 +18,86 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import torch.nn.functional as F
-import time
+
 from matplotlib.patches import Rectangle
 from muggled_sam.make_sam import make_sam_from_state_dict
 
 
-IGNORED_LABELS = {"BACKGROUND", "UNLABELLED"}
+def collect_lmo_object_samples(
+    dataset_root: str,
+    sub_sample: int = 1,
+) -> Tuple[Dict[str, List[Dict[str, str]]], List[Dict[str, str]]]:
+    dataset_path = Path(dataset_root).expanduser().resolve()
+    if sub_sample < 1:
+        raise ValueError("sub_sample must be >= 1")
+
+    object_map: Dict[str, List[Dict[str, str]]] = defaultdict(list)
+    all_entries: List[Dict[str, str]] = []
+    sample_idx = 0
+    for scene_dir in sorted((dataset_path / "test").glob("*")):
+        if not scene_dir.is_dir():
+            continue
+        try:
+            scene_id = int(scene_dir.name)
+        except ValueError:
+            continue
+        scene_gt_path = scene_dir / "scene_gt.json"
+        if not scene_gt_path.is_file():
+            continue
+        with open(scene_gt_path, "r", encoding="utf-8") as handle:
+            scene_gt = json.load(handle)
+
+        rgb_dir = scene_dir / "rgb"
+        mask_dir = scene_dir / "mask_visib"
+        if not (rgb_dir.is_dir() and mask_dir.is_dir()):
+            continue
+
+        for im_id_str in sorted(scene_gt.keys(), key=lambda value: int(value)):
+            if sub_sample > 1 and (sample_idx % sub_sample) != 0:
+                sample_idx += 1
+                continue
+            sample_idx += 1
+
+            im_id = int(im_id_str)
+            rgb_path = rgb_dir / f"{im_id:06d}.png"
+            if not rgb_path.is_file():
+                jpg_fallback = rgb_dir / f"{im_id:06d}.jpg"
+                if jpg_fallback.is_file():
+                    rgb_path = jpg_fallback
+            if not rgb_path.is_file():
+                continue
+
+            obj_to_indices: Dict[int, List[int]] = defaultdict(list)
+            for inst_idx, target in enumerate(scene_gt[im_id_str]):
+                obj_id = int(target["obj_id"])
+                mask_path = mask_dir / f"{im_id:06d}_{inst_idx:06d}.png"
+                if mask_path.is_file():
+                    obj_to_indices[obj_id].append(inst_idx)
+
+            for obj_id, inst_indices in sorted(obj_to_indices.items()):
+                object_id = f"obj_{obj_id:06d}"
+                frame_id = f"{scene_id:06d}_{im_id:06d}"
+                entry = {
+                    "object_id": object_id,
+                    "frame_id": frame_id,
+                    "rgb_path": str(rgb_path),
+                    "inst_path": str(mask_dir),
+                    "scene_id": scene_id,
+                    "im_id": im_id,
+                    "inst_indices": inst_indices,
+                }
+                object_map[object_id].append(entry)
+                all_entries.append(entry)
+    if not all_entries:
+        raise RuntimeError(f"No LMO samples found under {dataset_root}")
+    return dict(object_map), all_entries
 
 
-def parse_color_key(key: str) -> Tuple[int, ...]:
-    stripped = key.strip().strip("()")
-    parts = [part.strip() for part in stripped.split(",") if part.strip()]
-    return tuple(int(part) for part in parts)
+def load_bgr(path: str) -> np.ndarray:
+    image = cv2.imread(path, cv2.IMREAD_COLOR)
+    if image is None:
+        raise FileNotFoundError(path)
+    return image
 
 
 def parse_image_list(raw: str) -> Optional[set]:
@@ -55,149 +122,38 @@ def parse_image_list(raw: str) -> Optional[set]:
     return set(items) if items else None
 
 
-def load_color_mapping(json_path: Path) -> Dict[str, List[Tuple[int, ...]]]:
-    with open(json_path, "r") as handle:
-        raw = json.load(handle)
-    object_colors: Dict[str, List[Tuple[int, ...]]] = defaultdict(list)
-    for color_key, label in raw.items():
-        clean_label = label.strip()
-        if not clean_label or clean_label.upper() in IGNORED_LABELS:
-            continue
-        object_colors[clean_label].append(parse_color_key(color_key))
-    return dict(object_colors)
-
-
-def collect_multi_object_samples(
-    dataset_root: str,
-    sub_sample: int = 5,
-) -> Tuple[Dict[str, List[Dict[str, str]]], List[Dict[str, str]]]:
-    dataset_path = Path(dataset_root).expanduser().resolve()
-    if not dataset_path.is_dir():
-        raise FileNotFoundError(dataset_root)
-    pattern = re.compile(r"instance_segmentation_(\d{4})\.png$")
-    object_map: Dict[str, List[Dict[str, str]]] = defaultdict(list)
-    all_entries: List[Dict[str, str]] = []
-    if sub_sample < 1:
-        raise ValueError("sub_sample must be >= 1")
-    for idx, inst_path in enumerate(sorted(dataset_path.glob("instance_segmentation_*.png"))):
-        if sub_sample > 1 and (idx % sub_sample) != 0:
-            continue
-        match = pattern.match(inst_path.name)
-        if not match:
-            continue
-        frame_id = match.group(1)
-        rgb_path = dataset_path / f"rgb_{frame_id}.png"
-        if not rgb_path.is_file():
-            jpg_fallback = dataset_path / f"rgb_{frame_id}.jpg"
-            if jpg_fallback.is_file():
-                rgb_path = jpg_fallback
-        mapping_path = dataset_path / f"instance_segmentation_mapping_{frame_id}.json"
-        if not (rgb_path.is_file() and mapping_path.is_file()):
-            continue
-        color_map = load_color_mapping(mapping_path)
-        if not color_map:
-            continue
-        for object_id, colors in color_map.items():
-            for color in colors:
-                entry = {
-                    "object_id": object_id,
-                    "frame_id": frame_id,
-                    "rgb_path": str(rgb_path),
-                    "inst_path": str(inst_path),
-                    "color": color,
-                }
-                object_map[object_id].append(entry)
-                all_entries.append(entry)
-    if not all_entries:
-        raise RuntimeError(f"No multi-object samples found under {dataset_root}")
-    return object_map, all_entries
-
-
-def load_instance_mask(inst_path: str, color: Tuple[int, ...]) -> np.ndarray:
-    seg = load_instance_segmentation(inst_path)
-    return mask_for_color(seg, color)
-
-
-def load_instance_segmentation(inst_path: str) -> np.ndarray:
-    seg = cv2.imread(inst_path, cv2.IMREAD_UNCHANGED)
-    if seg is None:
-        raise FileNotFoundError(inst_path)
-    if seg.ndim == 2:
-        seg = seg[..., None]
-    elif seg.shape[2] == 4:
-        seg = cv2.cvtColor(seg, cv2.COLOR_BGRA2RGBA)
-    elif seg.shape[2] == 3:
-        seg = cv2.cvtColor(seg, cv2.COLOR_BGR2RGB)
-    return seg.astype(np.uint8)
-
-
-def mask_for_color(seg: np.ndarray, color: Tuple[int, ...]) -> np.ndarray:
-    target = np.array(color, dtype=np.uint8)
-    channels = seg.shape[2]
-    if target.shape[0] > channels:
-        target = target[:channels]
-    elif target.shape[0] < channels:
-        pad = np.zeros(channels - target.shape[0], dtype=np.uint8)
-        target = np.concatenate([target, pad], axis=0)
-    target = target.reshape(1, 1, -1)
-    mask = np.all(seg == target, axis=-1)
-    return mask.astype(np.float32)
-
-
-def load_instance_masks_for_object(
-    inst_path: str,
-    mapping_path: str,
-    object_id: str,
-    seg_cache: Optional[Dict[str, np.ndarray]] = None,
-    mapping_cache: Optional[Dict[str, Dict[str, List[Tuple[int, ...]]]]] = None,
-) -> List[np.ndarray]:
-    mapping_key = str(mapping_path)
-    if mapping_cache is not None and mapping_key in mapping_cache:
-        color_map = mapping_cache[mapping_key]
-    else:
-        color_map = load_color_mapping(Path(mapping_path))
-        if mapping_cache is not None:
-            mapping_cache[mapping_key] = color_map
-    colors = color_map.get(object_id, [])
-    if not colors:
-        return []
-
-    inst_key = str(inst_path)
-    if seg_cache is not None and inst_key in seg_cache:
-        seg = seg_cache[inst_key]
-    else:
-        seg = load_instance_segmentation(inst_path)
-        if seg_cache is not None:
-            seg_cache[inst_key] = seg
-
-    masks: List[np.ndarray] = []
-    for color in colors:
-        mask = mask_for_color(seg, color)
-        if mask.sum() > 0:
-            masks.append(mask)
-    return masks
-
-
-def load_bgr(path: str) -> np.ndarray:
-    image = cv2.imread(path, cv2.IMREAD_COLOR)
-    if image is None:
-        raise FileNotFoundError(path)
-    return image
-
-
-def apply_grayscale(image_bgr: np.ndarray) -> np.ndarray:
-    if image_bgr.ndim == 2 or image_bgr.shape[2] == 1:
-        gray = image_bgr if image_bgr.ndim == 2 else image_bgr[:, :, 0]
-    else:
-        gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
-    return cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
-
-
 def load_mask_gray(path: str) -> np.ndarray:
     mask = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
     if mask is None:
         raise FileNotFoundError(path)
     return (mask > 0).astype(np.uint8)
+
+
+def load_lmo_masks(
+    mask_dir: str,
+    im_id: int,
+    inst_indices: List[int],
+) -> List[np.ndarray]:
+    mask_dir_path = Path(mask_dir)
+    masks: List[np.ndarray] = []
+    for inst_idx in inst_indices:
+        mask_path = mask_dir_path / f"{im_id:06d}_{int(inst_idx):06d}.png"
+        try:
+            mask = load_mask_gray(str(mask_path))
+        except FileNotFoundError:
+            continue
+        if mask.sum() > 0:
+            masks.append(mask)
+    return masks
+
+
+def _mask_bbox(mask_hw: np.ndarray) -> Optional[Tuple[int, int, int, int]]:
+    ys, xs = np.where(mask_hw > 0)
+    if ys.size == 0:
+        return None
+    x0, x1 = int(xs.min()), int(xs.max())
+    y0, y1 = int(ys.min()), int(ys.max())
+    return x0, y0, x1, y1
 
 
 def sample_points_from_mask(mask_image: np.ndarray, num_points_approx: int = 25) -> List[Tuple[float, float]]:
@@ -466,39 +422,6 @@ def update_pq_accumulators(
         stats["fn"] += fn
 
 
-def build_detection_record(
-    object_id: str,
-    frame_id: str,
-    pred_scores: Optional[torch.Tensor],
-    pred_masks: List[torch.Tensor],
-    gt_masks: List[torch.Tensor],
-    iou_threshold: float,
-    top_k: int = 5,
-) -> Dict[str, object]:
-    matches = match_masks_to_gts(pred_masks, gt_masks, iou_threshold=iou_threshold)
-    match_by_pred = {p_idx: (g_idx, iou_val) for p_idx, g_idx, iou_val in matches}
-    scores_cpu: Optional[torch.Tensor] = None
-    if pred_scores is not None:
-        scores_cpu = pred_scores.detach().float().cpu()
-
-    record: Dict[str, object] = {
-        "object_id": object_id,
-        "frame_id": frame_id,
-        "num_gt": len(gt_masks),
-        "num_pred": len(pred_masks),
-    }
-    for idx in range(top_k):
-        score_val: Optional[float] = None
-        if scores_cpu is not None and idx < scores_cpu.numel():
-            score_val = float(scores_cpu[idx].item())
-        record[f"mask{idx + 1}_score"] = score_val
-        if idx in match_by_pred:
-            record[f"mask{idx + 1}_matched_gt"] = int(match_by_pred[idx][0])
-        else:
-            record[f"mask{idx + 1}_matched_gt"] = None
-    return record
-
-
 def apply_mask_nms(
     box_preds_n22: torch.Tensor,
     mask_preds_nhw: torch.Tensor,
@@ -546,17 +469,6 @@ def apply_mask_nms(
     return box_preds_n22[keep_tensor], mask_preds_nhw[keep_tensor], det_scores_n[keep_tensor]
 
 
-def compute_ap(recalls: np.ndarray, precisions: np.ndarray) -> float:
-    if recalls.size == 0:
-        return 0.0
-    mrec = np.concatenate(([0.0], recalls, [1.0]))
-    mpre = np.concatenate(([0.0], precisions, [0.0]))
-    for i in range(mpre.size - 1, 0, -1):
-        mpre[i - 1] = max(mpre[i - 1], mpre[i])
-    idx = np.where(mrec[1:] != mrec[:-1])[0]
-    return float(np.sum((mrec[idx + 1] - mrec[idx]) * mpre[idx + 1]))
-
-
 def pad_exemplar_batch(
     exemplars_list: List[torch.Tensor],
     device: torch.device,
@@ -582,15 +494,6 @@ def pad_exemplar_batch(
     batch_bnc = torch.cat(batch, dim=0)
     padding_mask_bn = torch.stack(padding_masks, dim=0)
     return batch_bnc, padding_mask_bn
-
-
-def _mask_bbox(mask_hw: np.ndarray) -> Optional[Tuple[int, int, int, int]]:
-    ys, xs = np.where(mask_hw > 0)
-    if ys.size == 0:
-        return None
-    x0, x1 = int(xs.min()), int(xs.max())
-    y0, y1 = int(ys.min()), int(ys.max())
-    return x0, y0, x1, y1
 
 
 def load_reference_images(
@@ -676,7 +579,7 @@ def save_mask_triptych(
         for i, gt_mask in enumerate(gt_masks):
             if gt_mask is None:
                 continue
-            color = palette[(i + 1) % len(palette)]
+            color = palette[i % len(palette)]
             mask_resized = cv2.resize(gt_mask.astype(np.float32), (w, h), interpolation=cv2.INTER_NEAREST)
             if mask_resized.max() <= 0:
                 continue
@@ -707,17 +610,17 @@ def save_mask_triptych(
                 verticalalignment="bottom",
             )
 
-    if num_masks > 0:
-        topk = min(2, num_masks, int(scores_cpu.size))
-        if topk > 0:
-            top_idx = np.argsort(scores_cpu)[-topk:][::-1]
+    if num_masks > 0 and scores_cpu.size > 0:
+        keep_idx = np.where(scores_cpu > 0.18)[0]
+        if keep_idx.size > 0:
+            keep_idx = keep_idx[np.argsort(scores_cpu[keep_idx])[::-1]]
         else:
-            top_idx = []
+            keep_idx = np.array([], dtype=np.int64)
     else:
-        top_idx = []
+        keep_idx = np.array([], dtype=np.int64)
 
-    for rank, i in enumerate(top_idx):
-        color = palette[rank + 1% len(palette)]
+    for rank, i in enumerate(keep_idx):
+        color = palette[rank % len(palette)]
         mask = mask_preds_nhw[int(i)]
         mask_bin = (mask > 0).detach().float().cpu().numpy()
         if mask_bin.max() <= 0:
@@ -768,7 +671,6 @@ def build_exemplar_tokens_for_object(
     use_square_sizing: bool,
     num_points_approx: int,
     device: torch.device,
-    grayscale: bool,
 ) -> Optional[torch.Tensor]:
     lookup_id = object_id
     feats: List[torch.Tensor] = []
@@ -783,8 +685,6 @@ def build_exemplar_tokens_for_object(
             ref_mask = load_mask_gray(str(ref_mask_path))
         except FileNotFoundError:
             continue
-        if grayscale:
-            ref_image = apply_grayscale(ref_image)
         if ref_mask.shape[:2] != ref_image.shape[:2]:
             ref_mask = resize_mask(ref_mask, ref_image.shape[:2])
         pts = sample_points_from_mask(ref_mask, num_points_approx=num_points_approx)
@@ -808,99 +708,36 @@ def build_exemplar_tokens_for_object(
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Evaluate SAMv3 exemplar detection modules.")
+    parser = argparse.ArgumentParser(description="Evaluate SAMv3 exemplar detection modules on LMO.")
     parser.add_argument(
         "--model_path",
         type=str,
         default="/home/zhenrant/rendering_prompted_muggled_sam/sam3.pt",
         help="Path to SAMv3 checkpoint (.pt).",
     )
-    # parser.add_argument(
-    #     "--dataset_root",
-    #     type=str,
-    #     default=["/sata1/data/kevin/realworld_datasets/persam_v2"],
-    #     help="Comma-separated dataset roots.",
-    # )
-    parser.add_argument(
-        "--reference_dir",
-        type=str,
-        default="/sata1/data/kevin/realworld_datasets/3d_printing_meshes/renders_2442_0316",
-        help="Path to reference renders.",
-    )
     parser.add_argument(
         "--dataset_root",
         type=str,
-        default=["/sata1/data/kevin/realworld_datasets/3d_printing_dataset"],
-        help="Comma-separated dataset roots.",
+        default="/sata1/data/kevin/bop_datasets/LMO",
+        help="Path to the LMO dataset root.",
     )
-    # parser.add_argument(
-    #     "--reference_dir",
-    #     type=str,
-    #     default="/sata1/data/kevin/realworld_datasets/persam_real_coco/stl_renders_blender_2442_0120",
-    #     help="Path to reference renders.",
-    # )
-    # parser.add_argument(
-    #     "--dataset_root",
-    #     type=str,
-    #     default="/sata1/data/kevin/lego_datasets/named_lego_structure_converted",
-    #     help="Comma-separated dataset roots.",
-    # )
-    # parser.add_argument(
-    #     "--reference_dir",
-    #     type=str,
-    #     default="/sata1/data/kevin/lego_datasets/lego_structure_refs",
-    #     help="Path to reference renders.",
-    # )
-    # parser.add_argument(
-    #     "--dataset_root",
-    #     type=str,
-    #     nargs="+",
-    #     default=["/sata1/data/kevin/realworld_datasets/primesense_converted/000006", "/sata1/data/kevin/realworld_datasets/primesense_converted/000001", 
-    #     "/sata1/data/kevin/realworld_datasets/primesense_converted/000003",
-    #     "/sata1/data/kevin/realworld_datasets/primesense_converted/000004",
-    #     "/sata1/data/kevin/realworld_datasets/primesense_converted/000005",
-    #     "/sata1/data/kevin/realworld_datasets/primesense_converted/000006",
-    #     "/sata1/data/kevin/realworld_datasets/primesense_converted/000007",
-    #     "/sata1/data/kevin/realworld_datasets/primesense_converted/000008",
-    #     "/sata1/data/kevin/realworld_datasets/primesense_converted/000009",
-    #     "/sata1/data/kevin/realworld_datasets/primesense_converted/000010"],
-    #     help="Dataset roots (space-separated, and/or comma-separated).",
-    # )
-#     parser.add_argument(
-#         "--dataset_root",
-#         type=str,
-#         nargs="+",
-#         default=[
-#     "/sata1/data/kevin/realworld_datasets/primesense_converted/000011",
-#     "/sata1/data/kevin/realworld_datasets/primesense_converted/000012",
-#     "/sata1/data/kevin/realworld_datasets/primesense_converted/000013",
-#     "/sata1/data/kevin/realworld_datasets/primesense_converted/000014",
-#     "/sata1/data/kevin/realworld_datasets/primesense_converted/000015",
-#     "/sata1/data/kevin/realworld_datasets/primesense_converted/000016",
-#     "/sata1/data/kevin/realworld_datasets/primesense_converted/000017",
-#     "/sata1/data/kevin/realworld_datasets/primesense_converted/000018",
-#     "/sata1/data/kevin/realworld_datasets/primesense_converted/000019",
-#     "/sata1/data/kevin/realworld_datasets/primesense_converted/000020",
-# ],
-#         help="Dataset roots (space-separated, and/or comma-separated).",
-#     )
-#     parser.add_argument(
-#         "--reference_dir",
-#         type=str,
-#         default="/sata1/data/kevin/realworld_datasets/primesense_converted/cad_renders",
-#         help="Path to reference renders.",
-#     )
+    parser.add_argument(
+        "--reference_dir",
+        type=str,
+        default="/sata1/data/kevin/bop_datasets/LMO/renders_2442_0426",
+        help="Path to reference renders.",
+    )
     #"0,3,6,9"
     #"0,1,2,3,4,5,6,7,8,9,10,11"
-    parser.add_argument("--ref_view_ids", type=str, default="0", help="Reference view ids to use.")
+    parser.add_argument("--ref_view_ids", type=str, default="0,1,2,3,4,5,6,7,8,9,10,11", help="Reference view ids to use.")
     parser.add_argument("--max_side_length", type=int, default=1008)
     parser.add_argument("--no_square", action="store_true", help="Disable square resizing in encoder.")
-    parser.add_argument("--num_points_approx", type=int, default=24)
-    parser.add_argument("--batch_size", type=int, default=24)
+    parser.add_argument("--num_points_approx", type=int, default=25)
+    parser.add_argument("--batch_size", type=int, default=12)
     parser.add_argument(
         "--sub_sample",
         type=int,
-        default=1 ,
+        default=10 ,
         help="Evaluate every Nth image in the dataset (1 = use all images).",
     )
     parser.add_argument(
@@ -910,16 +747,15 @@ def parse_args() -> argparse.Namespace:
         help="IoU threshold for mask NMS (<=0 disables NMS).",
     )
     parser.add_argument("--det_filter", type=float, default=0.0)
-    parser.add_argument("--output_dir", type=str, default="outputs_eval_exemplar")
-    parser.add_argument("--device", type=str, default="cuda:0")
+    parser.add_argument("--output_dir", type=str, default="outputs_eval_exemplar_lmo")
+    parser.add_argument("--device", type=str, default="cuda:1")
     parser.add_argument("--dtype", type=str, choices=["fp32", "bf16"], default="")
     parser.add_argument("--shuffle", action="store_true")
     parser.add_argument("--max_batches", type=int, default=0)
     parser.add_argument(
-        "--vis_every",
-        type=int,
-        default=1,
-        help="Save a debug collage every N batches (0 disables).",
+        "--multi_gt_only",
+        default = False,
+        help="Only evaluate samples with multiple GT instances for the target object.",
     )
     parser.add_argument(
         "--image_list",
@@ -927,24 +763,14 @@ def parse_args() -> argparse.Namespace:
         default="",
         help="Comma-separated or Python list of full rgb image paths to evaluate.",
     )
-    #[/sata1/data/kevin/realworld_datasets/primesense_converted/000011/rgb_0009.png]
-    parser.add_argument("--grayscale", default = False, help="Convert all input images to grayscale.")
-    parser.add_argument(
-        "--multi_gt_only",
-        default = False,
-        help="Only evaluate samples with multiple GT instances for the target object.",
-    )
     parser.add_argument("--finetune_ckpt", type=str, default="", help="Optional finetuned detector checkpoint.")
     return parser.parse_args()
 
-#/home/kevin/muggled_sam/finetune_exemplar/multi_object_best/finetune_epoch_017.pth
+
 def main() -> None:
     args = parse_args()
-    dataset_roots: List[str] = []
-    for item in args.dataset_root:
-        dataset_roots.extend([part.strip() for part in item.split(",") if part.strip()])
-    if not dataset_roots:
-        raise ValueError("No dataset roots provided.")
+    dataset_root = Path(args.dataset_root).expanduser().resolve()
+    reference_dir = Path(args.reference_dir).expanduser().resolve()
 
     ref_view_ids = parse_ref_view_ids(args.ref_view_ids)
     if not ref_view_ids:
@@ -975,11 +801,10 @@ def main() -> None:
 
     object_samples: Dict[str, List[Dict[str, str]]] = {}
     all_entries: List[Dict[str, str]] = []
-    for root in dataset_roots:
-        cur_samples, cur_entries = collect_multi_object_samples(root, sub_sample=args.sub_sample)
-        for obj_id, entries in cur_samples.items():
-            object_samples.setdefault(obj_id, []).extend(entries)
-        all_entries.extend(cur_entries)
+    cur_samples, cur_entries = collect_lmo_object_samples(str(dataset_root), sub_sample=args.sub_sample)
+    for obj_id, entries in cur_samples.items():
+        object_samples.setdefault(obj_id, []).extend(entries)
+    all_entries.extend(cur_entries)
     if not all_entries:
         raise RuntimeError("No dataset entries found.")
 
@@ -990,36 +815,47 @@ def main() -> None:
             unique_entries[key] = entry
     all_entries = list(unique_entries.values())
 
+    frame_entries: Dict[Tuple[str, str, str], Dict[str, object]] = {}
+    for entry in all_entries:
+        frame_key = (entry["frame_id"], entry["rgb_path"], entry["inst_path"])
+        if frame_key not in frame_entries:
+            frame_entries[frame_key] = {
+                "frame_id": entry["frame_id"],
+                "rgb_path": entry["rgb_path"],
+                "inst_path": entry["inst_path"],
+            }
+            frame_entries[frame_key]["targets"] = []
+        frame_entries[frame_key]["targets"].append(entry)
+    frames = list(frame_entries.values())
+
     image_list = parse_image_list(args.image_list)
     if image_list:
-        all_entries = [
-            entry
-            for entry in all_entries
-            if os.path.abspath(entry["rgb_path"]) in image_list
+        frames = [
+            frame
+            for frame in frames
+            if os.path.abspath(frame["rgb_path"]) in image_list
         ]
-        if not all_entries:
+        if not frames:
             raise RuntimeError("No dataset entries matched --image_list.")
 
     if args.shuffle:
-        random.shuffle(all_entries)
+        random.shuffle(frames)
 
-    total_entries = len(all_entries)
-    total_batches_est = max(1, math.ceil(total_entries / args.batch_size))
+    total_images = len(frames)
+    total_targets = sum(len(frame.get("targets", [])) for frame in frames)
+    estimated_batches = max(1, math.ceil(total_targets / max(1, args.batch_size))) if total_targets else 0
     if args.max_batches > 0:
-        total_batches_est = min(total_batches_est, args.max_batches)
+        estimated_batches = min(estimated_batches, args.max_batches)
     print(
-        "Estimated batches:",
-        total_batches_est,
-        f"(entries={total_entries}, batch_size={args.batch_size})",
+        f"Dataset summary: images={total_images} targets={total_targets} "
+        f"batch_size={args.batch_size} estimated_batches={estimated_batches}",
+        flush=True,
     )
 
-    reference_dir = Path(args.reference_dir).expanduser().resolve()
     if not reference_dir.is_dir():
         raise FileNotFoundError(reference_dir)
 
     ref_cache: Dict[str, torch.Tensor] = {}
-    seg_cache: Dict[str, np.ndarray] = {}
-    mapping_cache: Dict[str, Dict[str, List[Tuple[int, ...]]]] = {}
     batch_step = 0
 
     total_iou_sum = 0.0
@@ -1028,226 +864,217 @@ def main() -> None:
     object_iou_sum: Dict[str, float] = defaultdict(float)
     object_iou_count: Dict[str, int] = defaultdict(int)
     pq_iou_threshold = 0.5
-    pq_score_thresholds = [round(0.10 + 0.01 * idx, 2) for idx in range(89)]
+    pq_score_thresholds = [round(0.10 + 0.01 * idx, 2) for idx in range(40)]
     pq_stats: Dict[float, Dict[str, float]] = {
         thresh: {"sum_iou": 0.0, "tp": 0, "fp": 0, "fn": 0} for thresh in pq_score_thresholds
     }
 
-    detection_log_path = os.path.join(args.output_dir, "detection_log_tless_p2.json")
-    with open(detection_log_path, "w", encoding="utf-8") as detection_log:
+    if object_samples:
+        all_object_ids = sorted(object_samples.keys())
         with torch.no_grad():
-            for start in range(0, len(all_entries), args.batch_size):
-                subset = all_entries[start : start + args.batch_size]
-                prepared: List[Dict[str, object]] = []
-                for entry in subset:
-                    obj_id = entry["object_id"]
-                    try:
-                        image_bgr = load_bgr(entry["rgb_path"])
-                    except FileNotFoundError:
-                        continue
-                    if args.grayscale:
-                        image_bgr = apply_grayscale(image_bgr)
-                    try:
-                        mapping_path = Path(entry["inst_path"]).with_name(
-                            f"instance_segmentation_mapping_{entry['frame_id']}.json"
-                        )
-                        gt_masks = load_instance_masks_for_object(
-                            entry["inst_path"],
-                            str(mapping_path),
-                            obj_id,
-                            seg_cache=seg_cache,
-                            mapping_cache=mapping_cache,
-                        )
-                    except FileNotFoundError:
-                        continue
-                    if not gt_masks:
-                        continue
-                    if args.multi_gt_only and len(gt_masks) < 2:
-                        continue
-
-                    if obj_id not in ref_cache:
-                        exemplar_ref = build_exemplar_tokens_for_object(
-                            detmodel=detmodel,
-                            object_id=obj_id,
-                            reference_dir=reference_dir,
-                            ref_view_ids=ref_view_ids,
-                            max_side_length=args.max_side_length,
-                            use_square_sizing=not args.no_square,
-                            num_points_approx=args.num_points_approx,
-                            device=device,
-                            grayscale=args.grayscale,
-                        )
-                        if exemplar_ref is None:
-                            continue
-                        ref_cache[obj_id] = exemplar_ref.detach().cpu()
-
-                    exemplar_ref = ref_cache[obj_id]
-                    prepared.append(
-                        {
-                            "object_id": obj_id,
-                            "frame_id": entry["frame_id"],
-                            "rgb_path": entry["rgb_path"],
-                            "image_bgr": image_bgr,
-                            "gt_masks": gt_masks,
-                            "exemplar_ref": exemplar_ref,
-                        }
-                    )
-
-                if not prepared:
+            for obj_id in all_object_ids:
+                exemplar_ref = build_exemplar_tokens_for_object(
+                    detmodel=detmodel,
+                    object_id=obj_id,
+                    reference_dir=reference_dir,
+                    ref_view_ids=ref_view_ids,
+                    max_side_length=args.max_side_length,
+                    use_square_sizing=not args.no_square,
+                    num_points_approx=args.num_points_approx,
+                    device=device,
+                )
+                if exemplar_ref is None:
                     continue
-                vis_target_idx = None
-                if args.vis_every > 0 and (batch_step % args.vis_every) == 0:
-                    vis_target_idx = random.randrange(len(prepared))
+                ref_cache[obj_id] = exemplar_ref.detach().cpu()
+    if not ref_cache:
+        raise RuntimeError("No reference exemplars found for any object.")
 
-                group_map: Dict[Tuple[int, int], List[int]] = defaultdict(list)
-                for idx, entry in enumerate(prepared):
-                    img_t = detmodel.image_encoder.prepare_image(
-                        entry["image_bgr"],
-                        max_side_length=args.max_side_length,
-                        use_square_sizing=not args.no_square,
+    def process_prepared_batch(prepared: List[Dict[str, object]]) -> bool:
+        nonlocal batch_step
+        nonlocal total_iou_sum, total_iou_count, total_correct_count
+        if not prepared:
+            return False
+
+        vis_target_idx = random.randrange(len(prepared))
+
+        group_map: Dict[Tuple[int, int], List[int]] = defaultdict(list)
+        for idx, entry in enumerate(prepared):
+            shape_key = entry["preencode_hw"]
+            group_map[shape_key].append(idx)
+
+        batch_ious: List[float] = []
+        batch_correct = 0
+        for _, idxs in group_map.items():
+            img_batch = torch.cat([prepared[i]["img_tensor"] for i in idxs], dim=0)
+            encoded_img = detmodel.image_encoder(img_batch)
+            encoded_image_features_list = detmodel.image_projection.v3_projection(encoded_img)
+
+            exemplars_list = [prepared[i]["exemplar_ref"] for i in idxs]
+            exemplar_batch, padding_mask = pad_exemplar_batch(exemplars_list, device=device)
+
+            mask_preds, box_preds, det_scores, _ = generate_detections_train(
+                detmodel,
+                encoded_image_features_list,
+                exemplar_batch,
+                detection_filter_threshold=args.det_filter,
+                exemplar_padding_mask_bn=padding_mask,
+            )
+            if mask_preds.shape[1] == 0:
+                for data_idx in idxs:
+                    preencode_hw = prepared[data_idx]["preencode_hw"]
+                    gt_down_list = build_gt_down_list(
+                        prepared[data_idx]["gt_masks"],
+                        preencode_hw,
+                        mask_preds.shape[-2:],
+                        device,
                     )
-                    entry["img_tensor"] = img_t
-                    entry["preencode_hw"] = img_t.shape[2:]
-                    shape_key = (img_t.shape[2], img_t.shape[3])
-                    group_map[shape_key].append(idx)
+                    update_pq_accumulators(pq_stats, [], gt_down_list, None, pq_iou_threshold)
+                continue
 
-                batch_ious: List[float] = []
-                batch_correct = 0
-                for _, idxs in group_map.items():
-                    img_batch = torch.cat([prepared[i]["img_tensor"] for i in idxs], dim=0)
-                    t0 = time.time()
-                    encoded_img = detmodel.image_encoder(img_batch)
-                    encoded_image_features_list = detmodel.image_projection.v3_projection(encoded_img)
-                    t1 = time.time()
-                    exemplars_list = [prepared[i]["exemplar_ref"] for i in idxs]
-                    exemplar_batch, padding_mask = pad_exemplar_batch(exemplars_list, device=device)
+            for local_idx, data_idx in enumerate(idxs):
+                preencode_hw = prepared[data_idx]["preencode_hw"]
+                has_gt = prepared[data_idx]["has_gt"]
 
-                    mask_preds, box_preds, det_scores, pres_scores = generate_detections_train(
-                        detmodel,
-                        encoded_image_features_list,
-                        exemplar_batch,
-                        detection_filter_threshold=args.det_filter,
-                        exemplar_padding_mask_bn=padding_mask,
+                scores = det_scores[local_idx]
+                if scores.numel() == 0:
+                    gt_down_list = build_gt_down_list(
+                        prepared[data_idx]["gt_masks"],
+                        preencode_hw,
+                        mask_preds.shape[-2:],
+                        device,
                     )
-                    t2 = time.time()
-                    display_step = batch_step + 1
-                    print(
-                        "step {}/{} Batch encoding time: {:.3f}s, detection time: {:.3f}s".format(
-                            display_step,
-                            total_batches_est,
-                            t1 - t0,
-                            t2 - t1,
-                        )
+                    update_pq_accumulators(pq_stats, [], gt_down_list, None, pq_iou_threshold)
+                    continue
+
+                boxes_nms, masks_nms, scores_nms = apply_mask_nms(
+                    box_preds[local_idx],
+                    mask_preds[local_idx],
+                    scores,
+                    iou_threshold=args.nms_iou,
+                )
+                if scores_nms.numel() == 0:
+                    gt_down_list = build_gt_down_list(
+                        prepared[data_idx]["gt_masks"],
+                        preencode_hw,
+                        mask_preds.shape[-2:],
+                        device,
                     )
-                    if mask_preds.shape[1] == 0:
-                        for data_idx in idxs:
-                            preencode_hw = prepared[data_idx]["preencode_hw"]
-                            gt_down_list = build_gt_down_list(
-                                prepared[data_idx]["gt_masks"],
-                                preencode_hw,
-                                mask_preds.shape[-2:],
-                                device,
-                            )
-                            update_pq_accumulators(pq_stats, [], gt_down_list, None, pq_iou_threshold)
-                        continue
+                    update_pq_accumulators(pq_stats, [], gt_down_list, None, pq_iou_threshold)
+                    continue
 
-                    for local_idx, data_idx in enumerate(idxs):
-                        preencode_hw = prepared[data_idx]["preencode_hw"]
+                gt_down_list = build_gt_down_list(
+                    prepared[data_idx]["gt_masks"],
+                    preencode_hw,
+                    mask_preds.shape[-2:],
+                    device,
+                )
 
-                        scores = det_scores[local_idx]
-                        if scores.numel() == 0:
-                            gt_down_list = build_gt_down_list(
-                                prepared[data_idx]["gt_masks"],
-                                preencode_hw,
-                                mask_preds.shape[-2:],
-                                device,
-                            )
-                            update_pq_accumulators(pq_stats, [], gt_down_list, None, pq_iou_threshold)
-                            continue
+                pred_masks_list = [(masks_nms[k] > 0) for k in range(masks_nms.shape[0])]
+                update_pq_accumulators(
+                    pq_stats,
+                    pred_masks_list,
+                    gt_down_list,
+                    pred_scores=scores_nms,
+                    iou_threshold=pq_iou_threshold,
+                )
 
-                        boxes_nms, masks_nms, scores_nms = apply_mask_nms(
-                            box_preds[local_idx],
-                            mask_preds[local_idx],
-                            scores,
-                            iou_threshold=args.nms_iou,
-                        )
-                        if scores_nms.numel() == 0:
-                            gt_down_list = build_gt_down_list(
-                                prepared[data_idx]["gt_masks"],
-                                preencode_hw,
-                                mask_preds.shape[-2:],
-                                device,
-                            )
-                            update_pq_accumulators(pq_stats, [], gt_down_list, None, pq_iou_threshold)
-                            continue
+                best_iou = 0.0
+                if has_gt:
+                    for gt_down in gt_down_list:
+                        iou = compute_mask_iou(masks_nms[0], gt_down)
+                        best_iou = max(best_iou, float(iou.item()))
+                    batch_ious.append(best_iou)
+                    total_iou_sum += best_iou
+                    total_iou_count += 1
+                    if best_iou > 0.5:
+                        batch_correct += 1
+                        total_correct_count += 1
+                    obj_id = prepared[data_idx]["object_id"]
+                    object_iou_sum[obj_id] += best_iou
+                    object_iou_count[obj_id] += 1
 
-                        gt_down_list = build_gt_down_list(
-                            prepared[data_idx]["gt_masks"],
-                            preencode_hw,
-                            mask_preds.shape[-2:],
-                            device,
-                        )
-
-                        pred_masks_list = [(masks_nms[k] > 0) for k in range(masks_nms.shape[0])]
-                        update_pq_accumulators(
-                            pq_stats,
-                            pred_masks_list,
-                            gt_down_list,
-                            pred_scores=scores_nms,
-                            iou_threshold=pq_iou_threshold,
-                        )
-
-                        record = build_detection_record(
-                            prepared[data_idx]["object_id"],
-                            prepared[data_idx]["frame_id"],
-                            scores_nms,
-                            pred_masks_list,
-                            gt_down_list,
-                            iou_threshold=pq_iou_threshold,
-                            top_k=5,
-                        )
-                        detection_log.write(json.dumps(record) + "\n")
-
-                        best_iou = 0.0
-                        for gt_down in gt_down_list:
-                            iou = compute_mask_iou(masks_nms[0], gt_down)
-                            best_iou = max(best_iou, float(iou.item()))
-                        batch_ious.append(best_iou)
-                        total_iou_sum += best_iou
-                        total_iou_count += 1
-                        if best_iou > 0.5:
-                            batch_correct += 1
-                            total_correct_count += 1
-                        obj_id = prepared[data_idx]["object_id"]
-                        object_iou_sum[obj_id] += best_iou
-                        object_iou_count[obj_id] += 1
-
-                        if vis_target_idx is not None and data_idx == vis_target_idx:
-                            out_path = os.path.join(vis_dir, f"step_{batch_step:06d}.png")
-                            save_mask_triptych(
-                                prepared[data_idx]["image_bgr"],
-                                masks_nms,
-                                scores_nms,
-                                prepared[data_idx]["gt_masks"],
-                                object_id=prepared[data_idx]["object_id"],
-                                reference_dir=reference_dir,
-                                ref_view_ids=ref_view_ids,
-                                image_name=prepared[data_idx]["rgb_path"],
-                                output_path=out_path,
-                            )
-
-                if batch_ious:
-                    avg_iou = sum(batch_ious) / max(1, len(batch_ious))
-                    correct_rate = batch_correct / max(1, len(batch_ious))
-                    display_step = batch_step + 1
-                    print(
-                        f"step {display_step}/{total_batches_est} avg_iou={avg_iou:.4f} "
-                        f"correct_rate={correct_rate:.3f} samples={len(batch_ious)}"
+                if data_idx == vis_target_idx:
+                    out_path = os.path.join(vis_dir, f"step_{batch_step:06d}.png")
+                    save_mask_triptych(
+                        prepared[data_idx]["image_bgr"],
+                        masks_nms,
+                        scores_nms,
+                        prepared[data_idx]["gt_masks"],
+                        object_id=prepared[data_idx]["object_id"],
+                        reference_dir=reference_dir,
+                        ref_view_ids=ref_view_ids,
+                        image_name=prepared[data_idx]["rgb_path"],
+                        output_path=out_path,
                     )
-                batch_step += 1
 
-                if args.max_batches > 0 and batch_step >= args.max_batches:
+        if batch_ious:
+            avg_iou = sum(batch_ious) / max(1, len(batch_ious))
+            correct_rate = batch_correct / max(1, len(batch_ious))
+            print(
+                f"step={batch_step} avg_iou={avg_iou:.4f} "
+                f"correct_rate={correct_rate:.3f} samples={len(batch_ious)} "
+                f"batch_entries={len(prepared)}"
+            )
+        batch_step += 1
+        return args.max_batches > 0 and batch_step >= args.max_batches
+
+    with torch.no_grad():
+        pending_prepared: List[Dict[str, object]] = []
+        stop = False
+        for frame in frames:
+            try:
+                image_bgr = load_bgr(frame["rgb_path"])
+            except FileNotFoundError:
+                continue
+            img_t = detmodel.image_encoder.prepare_image(
+                image_bgr,
+                max_side_length=args.max_side_length,
+                use_square_sizing=not args.no_square,
+            )
+            preencode_hw = img_t.shape[2:]
+
+            targets = frame.get("targets", [])
+            for target in targets:
+                obj_id = target["object_id"]
+                exemplar_ref = ref_cache.get(obj_id)
+                if exemplar_ref is None:
+                    continue
+                gt_masks = load_lmo_masks(
+                    frame["inst_path"],
+                    int(target["im_id"]),
+                    target["inst_indices"],
+                )
+                if not gt_masks:
+                    continue
+                if args.multi_gt_only and len(gt_masks) < 2:
+                    continue
+                pending_prepared.append(
+                    {
+                        "object_id": obj_id,
+                        "frame_id": frame["frame_id"],
+                        "rgb_path": frame["rgb_path"],
+                        "image_bgr": image_bgr,
+                        "gt_masks": gt_masks,
+                        "has_gt": True,
+                        "exemplar_ref": exemplar_ref,
+                        "img_tensor": img_t,
+                        "preencode_hw": preencode_hw,
+                    }
+                )
+
+                while len(pending_prepared) >= args.batch_size:
+                    prepared = pending_prepared[: args.batch_size]
+                    pending_prepared = pending_prepared[args.batch_size :]
+                    stop = process_prepared_batch(prepared)
+                    if stop:
+                        break
+                if stop:
                     break
+            if stop:
+                break
+
+        if not stop and pending_prepared:
+            process_prepared_batch(pending_prepared)
 
     if total_iou_count > 0:
         overall_avg = total_iou_sum / total_iou_count

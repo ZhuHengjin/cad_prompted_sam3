@@ -4,6 +4,7 @@
 import argparse
 import ast
 import json
+import math
 import os
 import random
 from collections import defaultdict
@@ -695,7 +696,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--model_path",
         type=str,
-        default="/home/kevin/sam3.pt",
+        default="/home/zhenrant/rendering_prompted_muggled_sam/sam3.pt",
         help="Path to SAMv3 checkpoint (.pt).",
     )
     parser.add_argument(
@@ -716,11 +717,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max_side_length", type=int, default=1008)
     parser.add_argument("--no_square", action="store_true", help="Disable square resizing in encoder.")
     parser.add_argument("--num_points_approx", type=int, default=25)
-    parser.add_argument("--batch_size", type=int, default=1)
+    parser.add_argument("--batch_size", type=int, default=12)
     parser.add_argument(
         "--sub_sample",
         type=int,
-        default=3 ,
+        default=1 ,
         help="Evaluate every Nth image in the dataset (1 = use all images).",
     )
     parser.add_argument(
@@ -743,10 +744,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--image_list",
         type=str,
-        default="[/sata1/data/kevin/bop_datasets/ITODD/test/000001/gray/000199.tif]",
+        default="",
         help="Comma-separated or Python list of full rgb image paths to evaluate.",
     )
-    parser.add_argument("--finetune_ckpt", type=str, default="", help="Optional finetuned detector checkpoint.")
+    parser.add_argument("--finetune_ckpt", type=str, default="finetune_exemplar/run_20260322_172059/finetune_epoch_034.pth", help="Optional finetuned detector checkpoint.")
     return parser.parse_args()
 
 
@@ -824,6 +825,17 @@ def main() -> None:
     if args.shuffle:
         random.shuffle(frames)
 
+    total_images = len(frames)
+    total_targets = sum(len(frame.get("targets", [])) for frame in frames)
+    estimated_batches = max(1, math.ceil(total_targets / max(1, args.batch_size))) if total_targets else 0
+    if args.max_batches > 0:
+        estimated_batches = min(estimated_batches, args.max_batches)
+    print(
+        f"Dataset summary: images={total_images} targets={total_targets} "
+        f"batch_size={args.batch_size} estimated_batches={estimated_batches}",
+        flush=True,
+    )
+
     if not reference_dir.is_dir():
         raise FileNotFoundError(reference_dir)
 
@@ -861,7 +873,138 @@ def main() -> None:
     if not ref_cache:
         raise RuntimeError("No reference exemplars found for any object.")
 
+    def process_prepared_batch(prepared: List[Dict[str, object]]) -> bool:
+        nonlocal batch_step
+        nonlocal total_iou_sum, total_iou_count, total_correct_count
+        if not prepared:
+            return False
+
+        vis_target_idx = random.randrange(len(prepared))
+
+        group_map: Dict[Tuple[int, int], List[int]] = defaultdict(list)
+        for idx, entry in enumerate(prepared):
+            shape_key = entry["preencode_hw"]
+            group_map[shape_key].append(idx)
+
+        batch_ious: List[float] = []
+        batch_correct = 0
+        for _, idxs in group_map.items():
+            img_batch = torch.cat([prepared[i]["img_tensor"] for i in idxs], dim=0)
+            encoded_img = detmodel.image_encoder(img_batch)
+            encoded_image_features_list = detmodel.image_projection.v3_projection(encoded_img)
+
+            exemplars_list = [prepared[i]["exemplar_ref"] for i in idxs]
+            exemplar_batch, padding_mask = pad_exemplar_batch(exemplars_list, device=device)
+
+            mask_preds, box_preds, det_scores, _ = generate_detections_train(
+                detmodel,
+                encoded_image_features_list,
+                exemplar_batch,
+                detection_filter_threshold=args.det_filter,
+                exemplar_padding_mask_bn=padding_mask,
+            )
+            if mask_preds.shape[1] == 0:
+                for data_idx in idxs:
+                    preencode_hw = prepared[data_idx]["preencode_hw"]
+                    gt_down_list = build_gt_down_list(
+                        prepared[data_idx]["gt_masks"],
+                        preencode_hw,
+                        mask_preds.shape[-2:],
+                        device,
+                    )
+                    update_pq_accumulators(pq_stats, [], gt_down_list, None, pq_iou_threshold)
+                continue
+
+            for local_idx, data_idx in enumerate(idxs):
+                preencode_hw = prepared[data_idx]["preencode_hw"]
+                has_gt = prepared[data_idx]["has_gt"]
+
+                scores = det_scores[local_idx]
+                if scores.numel() == 0:
+                    gt_down_list = build_gt_down_list(
+                        prepared[data_idx]["gt_masks"],
+                        preencode_hw,
+                        mask_preds.shape[-2:],
+                        device,
+                    )
+                    update_pq_accumulators(pq_stats, [], gt_down_list, None, pq_iou_threshold)
+                    continue
+
+                boxes_nms, masks_nms, scores_nms = apply_mask_nms(
+                    box_preds[local_idx],
+                    mask_preds[local_idx],
+                    scores,
+                    iou_threshold=args.nms_iou,
+                )
+                if scores_nms.numel() == 0:
+                    gt_down_list = build_gt_down_list(
+                        prepared[data_idx]["gt_masks"],
+                        preencode_hw,
+                        mask_preds.shape[-2:],
+                        device,
+                    )
+                    update_pq_accumulators(pq_stats, [], gt_down_list, None, pq_iou_threshold)
+                    continue
+
+                gt_down_list = build_gt_down_list(
+                    prepared[data_idx]["gt_masks"],
+                    preencode_hw,
+                    mask_preds.shape[-2:],
+                    device,
+                )
+
+                pred_masks_list = [(masks_nms[k] > 0) for k in range(masks_nms.shape[0])]
+                update_pq_accumulators(
+                    pq_stats,
+                    pred_masks_list,
+                    gt_down_list,
+                    pred_scores=scores_nms,
+                    iou_threshold=pq_iou_threshold,
+                )
+
+                best_iou = 0.0
+                if has_gt:
+                    for gt_down in gt_down_list:
+                        iou = compute_mask_iou(masks_nms[0], gt_down)
+                        best_iou = max(best_iou, float(iou.item()))
+                    batch_ious.append(best_iou)
+                    total_iou_sum += best_iou
+                    total_iou_count += 1
+                    if best_iou > 0.5:
+                        batch_correct += 1
+                        total_correct_count += 1
+                    obj_id = prepared[data_idx]["object_id"]
+                    object_iou_sum[obj_id] += best_iou
+                    object_iou_count[obj_id] += 1
+
+                if data_idx == vis_target_idx:
+                    out_path = os.path.join(vis_dir, f"step_{batch_step:06d}.png")
+                    save_mask_triptych(
+                        prepared[data_idx]["image_bgr"],
+                        masks_nms,
+                        scores_nms,
+                        prepared[data_idx]["gt_masks"],
+                        object_id=prepared[data_idx]["object_id"],
+                        reference_dir=reference_dir,
+                        ref_view_ids=ref_view_ids,
+                        image_name=prepared[data_idx]["rgb_path"],
+                        output_path=out_path,
+                    )
+
+        if batch_ious:
+            avg_iou = sum(batch_ious) / max(1, len(batch_ious))
+            correct_rate = batch_correct / max(1, len(batch_ious))
+            print(
+                f"step={batch_step} avg_iou={avg_iou:.4f} "
+                f"correct_rate={correct_rate:.3f} samples={len(batch_ious)} "
+                f"batch_entries={len(prepared)}"
+            )
+        batch_step += 1
+        return args.max_batches > 0 and batch_step >= args.max_batches
+
     with torch.no_grad():
+        pending_prepared: List[Dict[str, object]] = []
+        stop = False
         for frame in frames:
             try:
                 image_bgr = load_bgr(frame["rgb_path"])
@@ -874,7 +1017,6 @@ def main() -> None:
             )
             preencode_hw = img_t.shape[2:]
 
-            prepared_all: List[Dict[str, object]] = []
             targets = frame.get("targets", [])
             for target in targets:
                 obj_id = target["object_id"]
@@ -890,7 +1032,7 @@ def main() -> None:
                     continue
                 if args.multi_gt_only and len(gt_masks) < 2:
                     continue
-                prepared_all.append(
+                pending_prepared.append(
                     {
                         "object_id": obj_id,
                         "frame_id": frame["frame_id"],
@@ -904,138 +1046,19 @@ def main() -> None:
                     }
                 )
 
-            if not prepared_all:
-                continue
-
-            for start in range(0, len(prepared_all), args.batch_size):
-                prepared = prepared_all[start : start + args.batch_size]
-                if not prepared:
-                    continue
-                vis_target_idx = random.randrange(len(prepared))
-
-                group_map: Dict[Tuple[int, int], List[int]] = defaultdict(list)
-                for idx, entry in enumerate(prepared):
-                    shape_key = entry["preencode_hw"]
-                    group_map[shape_key].append(idx)
-
-                batch_ious: List[float] = []
-                batch_correct = 0
-                for _, idxs in group_map.items():
-                    img_batch = torch.cat([prepared[i]["img_tensor"] for i in idxs], dim=0)
-                    encoded_img = detmodel.image_encoder(img_batch)
-                    encoded_image_features_list = detmodel.image_projection.v3_projection(encoded_img)
-
-                    exemplars_list = [prepared[i]["exemplar_ref"] for i in idxs]
-                    exemplar_batch, padding_mask = pad_exemplar_batch(exemplars_list, device=device)
-
-                    mask_preds, box_preds, det_scores, _ = generate_detections_train(
-                        detmodel,
-                        encoded_image_features_list,
-                        exemplar_batch,
-                        detection_filter_threshold=args.det_filter,
-                        exemplar_padding_mask_bn=padding_mask,
-                    )
-                    if mask_preds.shape[1] == 0:
-                        for data_idx in idxs:
-                            preencode_hw = prepared[data_idx]["preencode_hw"]
-                            gt_down_list = build_gt_down_list(
-                                prepared[data_idx]["gt_masks"],
-                                preencode_hw,
-                                mask_preds.shape[-2:],
-                                device,
-                            )
-                            update_pq_accumulators(pq_stats, [], gt_down_list, None, pq_iou_threshold)
-                        continue
-
-                    for local_idx, data_idx in enumerate(idxs):
-                        preencode_hw = prepared[data_idx]["preencode_hw"]
-                        has_gt = prepared[data_idx]["has_gt"]
-
-                        scores = det_scores[local_idx]
-                        if scores.numel() == 0:
-                            gt_down_list = build_gt_down_list(
-                                prepared[data_idx]["gt_masks"],
-                                preencode_hw,
-                                mask_preds.shape[-2:],
-                                device,
-                            )
-                            update_pq_accumulators(pq_stats, [], gt_down_list, None, pq_iou_threshold)
-                            continue
-
-                        boxes_nms, masks_nms, scores_nms = apply_mask_nms(
-                            box_preds[local_idx],
-                            mask_preds[local_idx],
-                            scores,
-                            iou_threshold=args.nms_iou,
-                        )
-                        if scores_nms.numel() == 0:
-                            gt_down_list = build_gt_down_list(
-                                prepared[data_idx]["gt_masks"],
-                                preencode_hw,
-                                mask_preds.shape[-2:],
-                                device,
-                            )
-                            update_pq_accumulators(pq_stats, [], gt_down_list, None, pq_iou_threshold)
-                            continue
-
-                        gt_down_list = build_gt_down_list(
-                            prepared[data_idx]["gt_masks"],
-                            preencode_hw,
-                            mask_preds.shape[-2:],
-                            device,
-                        )
-
-                        pred_masks_list = [(masks_nms[k] > 0) for k in range(masks_nms.shape[0])]
-                        update_pq_accumulators(
-                            pq_stats,
-                            pred_masks_list,
-                            gt_down_list,
-                            pred_scores=scores_nms,
-                            iou_threshold=pq_iou_threshold,
-                        )
-
-                        best_iou = 0.0
-                        if has_gt:
-                            for gt_down in gt_down_list:
-                                iou = compute_mask_iou(masks_nms[0], gt_down)
-                                best_iou = max(best_iou, float(iou.item()))
-                            batch_ious.append(best_iou)
-                            total_iou_sum += best_iou
-                            total_iou_count += 1
-                            if best_iou > 0.5:
-                                batch_correct += 1
-                                total_correct_count += 1
-                            obj_id = prepared[data_idx]["object_id"]
-                            object_iou_sum[obj_id] += best_iou
-                            object_iou_count[obj_id] += 1
-
-                        if data_idx == vis_target_idx:
-                            out_path = os.path.join(vis_dir, f"step_{batch_step:06d}.png")
-                            save_mask_triptych(
-                                prepared[data_idx]["image_bgr"],
-                                masks_nms,
-                                scores_nms,
-                                prepared[data_idx]["gt_masks"],
-                                object_id=prepared[data_idx]["object_id"],
-                                reference_dir=reference_dir,
-                                ref_view_ids=ref_view_ids,
-                                image_name=prepared[data_idx]["rgb_path"],
-                                output_path=out_path,
-                            )
-
-                if batch_ious:
-                    avg_iou = sum(batch_ious) / max(1, len(batch_ious))
-                    correct_rate = batch_correct / max(1, len(batch_ious))
-                    print(
-                        f"step={batch_step} avg_iou={avg_iou:.4f} "
-                        f"correct_rate={correct_rate:.3f} samples={len(batch_ious)}"
-                    )
-                batch_step += 1
-
-                if args.max_batches > 0 and batch_step >= args.max_batches:
+                while len(pending_prepared) >= args.batch_size:
+                    prepared = pending_prepared[: args.batch_size]
+                    pending_prepared = pending_prepared[args.batch_size :]
+                    stop = process_prepared_batch(prepared)
+                    if stop:
+                        break
+                if stop:
                     break
-            if args.max_batches > 0 and batch_step >= args.max_batches:
+            if stop:
                 break
+
+        if not stop and pending_prepared:
+            process_prepared_batch(pending_prepared)
 
     if total_iou_count > 0:
         overall_avg = total_iou_sum / total_iou_count
