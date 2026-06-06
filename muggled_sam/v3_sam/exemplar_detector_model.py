@@ -10,7 +10,7 @@ import torch.nn as nn
 
 from .components.shared import MLPMultiLayer, imagelike_to_rows_of_tokens
 from .components.position_encoding import SinusoidalPE2D
-from .components.exemplar_detector_components import PresenceScoreMLP, DetectionScoring
+from .components.exemplar_detector_components_logits import PresenceScoreMLP, DetectionScoring
 from .components.exemplar_detector_attention import (
     SelfAttentionBlock,
     ExemplarCrossAttentionBlock,
@@ -94,16 +94,17 @@ class SAMV3ExemplarDetector(nn.Module):
         image_tokens_bchw: Tensor,
         exemplar_tokens_bnc: Tensor,
         exemplar_mask_bn: Tensor | None = None,
-    ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+    ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
         """
         Predicts bounding box detections along with a per-detection confidence score
         and a single 'presence' score (indicates if exemplars are present in image).
 
         Returns:
-            detection_tokens_bnc, box_xy1xy2_bn22, detection_scores_bn, presence_score
+            detection_tokens_bnc, box_xy1xy2_bn22, detection_scores_bn, detection_scores_logits_bn, presence_score
             -> Detection tokens are meant for internal use. They have shape: BxNxC (N is 200 by default)
             -> box_xy1xy2_bn22 are bounding box predictions in [(x1,y1), (x2,y2)] format
             -> detection_scores_bn holds a 0-to-1 'confidence score' for each box detection
+            -> detection_scores_logits_bn holds raw per-detection logits (pre-sigmoid, pre-presence scaling)
             -> presence_score holds a 0-to-1 score for whether at least 1 object is present in image
         """
 
@@ -152,15 +153,23 @@ class SAMV3ExemplarDetector(nn.Module):
 
         # Gather outputs
         out_detection_tokens_bnc = self.out_norm_detections(detection_tokens_bnc)
-        out_presence_score_b1 = self.mlp_presence_score(presence_token_b1c)
+        out_presence_logits_b1 = self.mlp_presence_score(presence_token_b1c)
+        out_presence_score_b1 = out_presence_logits_b1.sigmoid()
         out_box_xy1xy2_bn22 = box_pred_xyxy_bn4.view(img_b, num_detections, 2, 2)
 
         # Compute per-detection confidence scores
-        out_det_scores_bn = self.detection_scoring(out_detection_tokens_bnc, exemplar_tokens_bnc, exemplar_mask_bn)
-        out_det_scores_bn = out_det_scores_bn * out_presence_score_b1
+        out_det_logits_bn = self.detection_scoring(out_detection_tokens_bnc, exemplar_tokens_bnc, exemplar_mask_bn)
+        out_det_scores_bn = out_det_logits_bn.sigmoid() * out_presence_score_b1
+        out_det_scores_logits_bn = out_det_logits_bn
         out_presence_scores = out_presence_score_b1.squeeze(-1)
 
-        return out_detection_tokens_bnc, out_box_xy1xy2_bn22, out_det_scores_bn, out_presence_scores
+        return (
+            out_detection_tokens_bnc,
+            out_box_xy1xy2_bn22,
+            out_det_scores_bn,
+            out_det_scores_logits_bn,
+            out_presence_scores,
+        )
 
     # .................................................................................................................
 
@@ -238,14 +247,14 @@ class SAMV3ExemplarDetector(nn.Module):
 
     # .................................................................................................................
 
-    def create_blank_output(self, image_tokens_bchw: Tensor) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+    def create_blank_output(self, image_tokens_bchw: Tensor) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
         """
         Helper used to create 'blank' outputs. This is meant to be used
         as an alternative to running the .forward(...) function when
         no exemplars are provided.
 
         The outputs are the same as the forward function:
-            detection_tokens_bnc, box_xy1xy2_bn22, detection_scores_bn, presence_score
+            detection_tokens_bnc, box_xy1xy2_bn22, detection_scores_bn, detection_scores_logits_bn, presence_score
 
         Note that (mostly out of interest) the detection tokens are given directly
         as the learned tokens (without any processing) while the boxes are also
@@ -268,10 +277,17 @@ class SAMV3ExemplarDetector(nn.Module):
         out_box_xy1xy2_bn22 = box_pred_xyxy_bn4.view(img_b, num_tokens, 2, 2)
 
         # Use zeros for blank score predictions
-        out_det_scores_bn = torch.zeros((img_b, num_tokens), **data_dict)
+        out_det_scores_logits_bn = torch.zeros((img_b, num_tokens), **data_dict)
         out_presence_scores = torch.zeros(img_b, **data_dict)
+        out_det_scores_bn = torch.sigmoid(out_det_scores_logits_bn) * out_presence_scores.unsqueeze(-1)
 
-        return out_detection_tokens_bnc, out_box_xy1xy2_bn22, out_det_scores_bn, out_presence_scores
+        return (
+            out_detection_tokens_bnc,
+            out_box_xy1xy2_bn22,
+            out_det_scores_bn,
+            out_det_scores_logits_bn,
+            out_presence_scores,
+        )
 
     # .................................................................................................................
 

@@ -20,3 +20,15 @@ env/
 ignore/
 saved_images/
 
+
+*.log
+finetune_exemplar/
+mask_outputs/
+outputs_eval_exemplar/
+outputs_finetune_exemplar/
+*.png
+*.jpg
+dataset_debug
+dataset_filter.csv
+*.csv
+assets/

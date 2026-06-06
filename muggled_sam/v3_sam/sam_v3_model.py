@@ -709,7 +709,9 @@ class SAMV3DetectorModel(nn.Module):
             # -> Not required (model still works with no exemplars), but blanked results make more sense
             no_exemplars = encoded_exemplars_bnc.shape[1] == 0
             if no_exemplars and blank_no_exemplar_outputs:
-                blk_tok, blk_box, blk_score, blk_pres = self.exemplar_detector.create_blank_output(lowres_imgenc_bchw)
+                blk_tok, blk_box, blk_score, blk_score_logits, blk_pres = self.exemplar_detector.create_blank_output(
+                    lowres_imgenc_bchw
+                )
                 blk_masks, _ = self.exemplar_segmentation.create_blank_output(blk_tok, lowres_imgenc_bchw)
                 return blk_masks, blk_box, blk_score, blk_pres
 
@@ -721,7 +723,7 @@ class SAMV3DetectorModel(nn.Module):
             )
 
             # Compute detections
-            enc_det_tokens_bnc, boxes_xy1xy2_bn22, det_scores_bn, pres_scores = self.exemplar_detector(
+            enc_det_tokens_bnc, boxes_xy1xy2_bn22, det_scores_bn, det_scores_logits_bn, pres_scores = self.exemplar_detector(
                 fused_imgexm_tokens_bchw, encoded_exemplars_bnc, exemplar_padding_mask_bn
             )
 
