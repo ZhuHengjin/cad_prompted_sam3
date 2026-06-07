@@ -40,18 +40,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--model_path",
         type=str,
-        default="/home/kevin/ICL/rendering_prompted_muggled_sam/model_weights/sam3.pt",
+        default="sam3.pt",
         help="Path to SAMv3 checkpoint (.pt).",
     )
     parser.add_argument(
         "--finetune_ckpt",
         type=str,
-        default="/home/kevin/ICL/rendering_prompted_muggled_sam/model_weights/finetune_epoch_018.pth",
+        default="cad_prompted_sam3_assets/0321_k12_b156_resume_from_preprinte18_s1_e34.pth",
         help="Optional finetuned detector checkpoint.",
     )
     parser.add_argument(
         "--reference_dir",
-        default="/home/kevin/ICL/rendering_prompted_muggled_sam/assets/renders_2442_0316",
+        default="cad_prompted_sam3_assets/renders_2442_0316",
         type=str,
         help="Directory containing reference images and masks.",
     )

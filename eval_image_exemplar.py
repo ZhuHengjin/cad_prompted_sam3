@@ -812,87 +812,22 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--model_path",
         type=str,
-        default="/home/zhenrant/rendering_prompted_muggled_sam/sam3.pt",
+        default="sam3.pt",
         help="Path to SAMv3 checkpoint (.pt).",
     )
-    # parser.add_argument(
-    #     "--dataset_root",
-    #     type=str,
-    #     default=["/sata1/data/kevin/realworld_datasets/persam_v2"],
-    #     help="Comma-separated dataset roots.",
-    # )
     parser.add_argument(
         "--reference_dir",
         type=str,
-        default="/sata1/data/kevin/realworld_datasets/3d_printing_meshes/renders_2442_0316",
+        default="cad_prompted_sam3_assets/renders_2442_0316",
         help="Path to reference renders.",
     )
     parser.add_argument(
         "--dataset_root",
         type=str,
-        default=["/sata1/data/kevin/realworld_datasets/3d_printing_dataset"],
+        default=["cad_prompted_sam3_assets/3d_printing_dataset"],
         help="Comma-separated dataset roots.",
     )
-    # parser.add_argument(
-    #     "--reference_dir",
-    #     type=str,
-    #     default="/sata1/data/kevin/realworld_datasets/persam_real_coco/stl_renders_blender_2442_0120",
-    #     help="Path to reference renders.",
-    # )
-    # parser.add_argument(
-    #     "--dataset_root",
-    #     type=str,
-    #     default="/sata1/data/kevin/lego_datasets/named_lego_structure_converted",
-    #     help="Comma-separated dataset roots.",
-    # )
-    # parser.add_argument(
-    #     "--reference_dir",
-    #     type=str,
-    #     default="/sata1/data/kevin/lego_datasets/lego_structure_refs",
-    #     help="Path to reference renders.",
-    # )
-    # parser.add_argument(
-    #     "--dataset_root",
-    #     type=str,
-    #     nargs="+",
-    #     default=["/sata1/data/kevin/realworld_datasets/primesense_converted/000006", "/sata1/data/kevin/realworld_datasets/primesense_converted/000001", 
-    #     "/sata1/data/kevin/realworld_datasets/primesense_converted/000003",
-    #     "/sata1/data/kevin/realworld_datasets/primesense_converted/000004",
-    #     "/sata1/data/kevin/realworld_datasets/primesense_converted/000005",
-    #     "/sata1/data/kevin/realworld_datasets/primesense_converted/000006",
-    #     "/sata1/data/kevin/realworld_datasets/primesense_converted/000007",
-    #     "/sata1/data/kevin/realworld_datasets/primesense_converted/000008",
-    #     "/sata1/data/kevin/realworld_datasets/primesense_converted/000009",
-    #     "/sata1/data/kevin/realworld_datasets/primesense_converted/000010"],
-    #     help="Dataset roots (space-separated, and/or comma-separated).",
-    # )
-#     parser.add_argument(
-#         "--dataset_root",
-#         type=str,
-#         nargs="+",
-#         default=[
-#     "/sata1/data/kevin/realworld_datasets/primesense_converted/000011",
-#     "/sata1/data/kevin/realworld_datasets/primesense_converted/000012",
-#     "/sata1/data/kevin/realworld_datasets/primesense_converted/000013",
-#     "/sata1/data/kevin/realworld_datasets/primesense_converted/000014",
-#     "/sata1/data/kevin/realworld_datasets/primesense_converted/000015",
-#     "/sata1/data/kevin/realworld_datasets/primesense_converted/000016",
-#     "/sata1/data/kevin/realworld_datasets/primesense_converted/000017",
-#     "/sata1/data/kevin/realworld_datasets/primesense_converted/000018",
-#     "/sata1/data/kevin/realworld_datasets/primesense_converted/000019",
-#     "/sata1/data/kevin/realworld_datasets/primesense_converted/000020",
-# ],
-#         help="Dataset roots (space-separated, and/or comma-separated).",
-#     )
-#     parser.add_argument(
-#         "--reference_dir",
-#         type=str,
-#         default="/sata1/data/kevin/realworld_datasets/primesense_converted/cad_renders",
-#         help="Path to reference renders.",
-#     )
-    #"0,3,6,9"
-    #"0,1,2,3,4,5,6,7,8,9,10,11"
-    parser.add_argument("--ref_view_ids", type=str, default="0", help="Reference view ids to use.")
+    parser.add_argument("--ref_view_ids", type=str, default="0,1,2,3,4,5,6,7,8,9,10,11,12", help="Reference view ids to use.")
     parser.add_argument("--max_side_length", type=int, default=1008)
     parser.add_argument("--no_square", action="store_true", help="Disable square resizing in encoder.")
     parser.add_argument("--num_points_approx", type=int, default=24)
@@ -927,17 +862,15 @@ def parse_args() -> argparse.Namespace:
         default="",
         help="Comma-separated or Python list of full rgb image paths to evaluate.",
     )
-    #[/sata1/data/kevin/realworld_datasets/primesense_converted/000011/rgb_0009.png]
     parser.add_argument("--grayscale", default = False, help="Convert all input images to grayscale.")
     parser.add_argument(
         "--multi_gt_only",
         default = False,
         help="Only evaluate samples with multiple GT instances for the target object.",
     )
-    parser.add_argument("--finetune_ckpt", type=str, default="", help="Optional finetuned detector checkpoint.")
+    parser.add_argument("--finetune_ckpt", type=str, default="cad_prompted_sam3_assets/0321_k12_b156_resume_from_preprinte18_s1_e34.pth", help="finetuned detector checkpoint.")
     return parser.parse_args()
 
-#/home/kevin/muggled_sam/finetune_exemplar/multi_object_best/finetune_epoch_017.pth
 def main() -> None:
     args = parse_args()
     dataset_roots: List[str] = []

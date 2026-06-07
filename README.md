@@ -1,28 +1,42 @@
 # CAD Prompted SAM3
 
-This repo builds on MuggledSAM, which reimplements SAM3 with better modularity. Inferencing using official SAM3 repo has been tested and yields nearly identify results.
-Install the packages in `requirements.txt`, and run all scripts (except the Blender renderer) from the repo root: `rendering_prompted_muggled_sam/`.
+This project builds on MuggledSAM, a more modular reimplementation of SAM3. The model is also tested to work on a fork of official SAM3 repository and produces nearly identical results.
 
-Quick tasks:
-1. Sample eval on the 3D‑printing dataset. Segmentation results will be outputed to outputs_eval_exemplar/
+## Installation
+
+Clone the repository:
+```bash
+git clone https://github.com/kevinPOI/cad_prompted_sam3.git
+```
+
+Download the CAD Prompted SAM3 checkpoint, sample dataset, sample meshes, and sample renderings from:
+https://drive.google.com/file/d/1od0gZB6zJh-YW_l_sGuW06M7J-st9Zfe/view?usp=sharing
+
+Unzip the archive into the repo root so the assets are available at:
+`path/to/cad_prompted_sam3/cad_prompted_sam3_assets`
+
+Download the SAM3.0 checkpoint from https://github.com/facebookresearch/sam3 and place `sam3.pt` in the repository root.
+
+Install the Python dependencies:
+```bash
+pip install -r requirements.txt
+```
+
+## Quick Tasks
+
+1. Run the sample evaluation on the 3D-printing dataset. Segmentation outputs will be written to `outputs_eval_exemplar/`.
    ```bash
    python eval_image_exemplar.py
    ```
-1. Generate a rendering template from an STL (Blender 5.0 required). From the Blender root folder:
+1. Generate a rendering template from an STL file (requires Blender 5.0). Run this from the Blender root folder:
    ```bash
    ./blender -b -P path/to/rendering_prompted_muggled_sam/blender_renderer.py
    ```
-1. Realtime webcam inference: set the object reference dir and object name in `run_webcam_exemplar.py`, then run:
+1. Run real-time webcam inference. First set the object reference directory and object name in `run_webcam_exemplar.py`, then run:
    ```bash
    python run_webcam_exemplar.py
    ```
 
-## Pretrained Weights
-
-Pretrained checkpoints are included in the export zip under `model_weights/`.
-
-- `preprint_e18.pth`: Best detection IoU. Recommended when you care about a single class of interest or need better separation between adjacent instances of the same object.
-- `0321_k12_b156_resume_from_preprinte18_s1_e34.pth`: More consistent detection scores across multiple classes for better thresholding, has higher PQ and mAP. Recommended for multi-class detection.
 
 # MuggledSAM
 
