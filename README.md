@@ -1,3 +1,29 @@
+# CAD Prompted SAM3
+
+This repo builds on MuggledSAM, which reimplements SAM3 with better modularity. Inferencing using official SAM3 repo has been tested and yields nearly identify results.
+Install the packages in `requirements.txt`, and run all scripts (except the Blender renderer) from the repo root: `rendering_prompted_muggled_sam/`.
+
+Quick tasks:
+1. Sample eval on the 3D‑printing dataset. Segmentation results will be outputed to outputs_eval_exemplar/
+   ```bash
+   python eval_image_exemplar.py
+   ```
+1. Generate a rendering template from an STL (Blender 5.0 required). From the Blender root folder:
+   ```bash
+   ./blender -b -P path/to/rendering_prompted_muggled_sam/blender_renderer.py
+   ```
+1. Realtime webcam inference: set the object reference dir and object name in `run_webcam_exemplar.py`, then run:
+   ```bash
+   python run_webcam_exemplar.py
+   ```
+
+## Pretrained Weights
+
+Pretrained checkpoints are included in the export zip under `model_weights/`.
+
+- `preprint_e18.pth`: Best detection IoU. Recommended when you care about a single class of interest or need better separation between adjacent instances of the same object.
+- `0321_k12_b156_resume_from_preprinte18_s1_e34.pth`: More consistent detection scores across multiple classes for better thresholding, has higher PQ and mAP. Recommended for multi-class detection.
+
 # MuggledSAM
 
 This repo contains a simplified implementation of the awesome 'Segment Anything' models from [facebookresearch](https://ai.meta.com/research/#projects) ([SAM1](https://github.com/facebookresearch/segment-anything), [SAM2](https://github.com/facebookresearch/sam2) & [SAM3](https://github.com/facebookresearch/sam3)), with the intention of [removing the magic](https://en.wikipedia.org/wiki/Muggle) from the original code base to make it easier to understand.
@@ -45,9 +71,6 @@ pip3 install torch --index-url https://download.pytorch.org/whl/cu121
 
 </details>
 
-<details>
-<summary> Alternative installations</summary>
-
 #### Install from Github
 
 It's also possible to install this repo directly from Github:
@@ -58,11 +81,10 @@ pip install git+https://github.com/heyoeyo/muggled_sam
 This will make the repo available as a library (e.g. to use models in another project), though the demo scripts will not be available through this installation method.
 
 
-#### Other package managers
+#### Alternative methods
 
-Using package managers like [conda](https://docs.conda.io/projects/conda/en/stable/user-guide/getting-started.html) or [uv](https://docs.astral.sh/uv/) can also work but may require slightly different installation commands. If you have an existing python environment set up for another pytorch image model, it can probably be reused with this repo.
+Using an alternative package manager like [conda](https://docs.conda.io/projects/conda/en/stable/user-guide/getting-started.html) or [uv](https://docs.astral.sh/uv/) can also work but may require slightly different installation commands. If you have an existing python environment set up for another pytorch image model, it can probably be reused with this repo.
 
-</details>
 
 ### Model Weights
 
@@ -182,8 +204,6 @@ As with the other scripts, you can add `--help` to the end of this command to se
 The basic usage of this script is to input point or box prompts on the left image while the corresponding detections will be displayed on the right. When using text prompts, the UI will 'freeze' and hand off input to your terminal (the one that launched the script) for text input. Entering a blank prompt will return control to the UI.
 
 While this script only works with images, the detection capabilities of SAMv3 can be used with video tracking. See the [video segmentation from detections](https://github.com/heyoeyo/muggled_sam/tree/main/simple_examples#video-segmentation-from-detections) example script for more info.
-
-For a more hackable version of cross-image detection (i.e. using an object from one image to detect objects in other images), see the [cross-image object detection](https://github.com/heyoeyo/muggled_sam/tree/main/simple_examples#object-detection-cross-image) example.
 
 # Acknowledgements
 
