@@ -96,30 +96,7 @@ Without `--recreate_splits`, the script fails if only some split files exist. Th
 
 ## Recommended Command
 
-```bash
-cd /home/henryzhu/repos/cad_prompted_sam3
-
-DATA=/home/henryzhu/data/brick_sam_sdg/run_500_scenes_yaw20_not_stud_aligned
-WEIGHTS=/home/henryzhu/repos/LegoSegmentation/weights
-REFS=/home/henryzhu/repos/LegoSegmentation/exemplars/renders
-
-python finetune_image_exemplar_multi_gt_split.py \
-  --model_path "$WEIGHTS/sam3.pt" \
-  --resume_path "$WEIGHTS/lego_sam3_runB_e80.pth" \
-  --dataset_root "$DATA/Side_Camera_0,$DATA/Side_Camera_1,$DATA/Side_Camera_2,$DATA/Side_Camera_3" \
-  --reference_dir "$REFS" \
-  --split_dir splits/lego_yaw20 \
-  --split_ratios 0.8,0.1,0.1 \
-  --ref_view_ids 0,1,2,3,4,5,6,7,8,9,10,11 \
-  --epochs 100 \
-  --batch_size 8 \
-  --grad_accum 12 \
-  --lr 1e-4 \
-  --device cuda:0 \
-  --save_every 5 \
-  --save_debug_every 0 \
-  --output_dir finetune_exemplar_lego_continue
-```
+Use the canonical continuation command in [fine-tune-note.md](fine-tune-note.md). This split-behavior note explains how the split options work, while the fine-tuning note keeps the current run paths, checkpoint, logging, and plotting commands in one place.
 
 ## Test Set
 

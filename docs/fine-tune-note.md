@@ -59,13 +59,42 @@ python finetune_image_exemplar_multi_gt_split.py \
   --split_ratios 0.8,0.1,0.1 \
   --ref_view_ids 0,1,2,3,4,5,6,7,8,9,10,11 \
   --epochs 100 \
-  --batch_size 8 \
+  --batch_size 4 \
   --grad_accum 12 \
   --lr 1e-4 \
   --device cuda:0 \
   --save_every 5 \
   --save_debug_every 0 \
   --output_dir finetune_exemplar_lego_continue
+```
+
+Save the terminal output when launching a run, because the script prints training and validation metrics to stdout. Use `python -u` plus `tee` so the log updates promptly and is still visible in the terminal:
+
+```bash
+python -u finetune_image_exemplar_multi_gt_split.py \
+  ...same training args... \
+  2>&1 | tee -a finetune_exemplar_lego_continue/train.log
+```
+
+For a continuation inside an existing run directory, append to a run-specific log:
+
+```bash
+RUN=finetune_exemplar_lego_continue/run_20260707_150733
+
+python -u finetune_image_exemplar_multi_gt_split.py \
+  ...same training args... \
+  --resume_path "$RUN/finetune_epoch_100.pth" \
+  --resume_in_place \
+  --epochs 120 \
+  2>&1 | tee -a "$RUN/train_continue_e101_e120.log"
+```
+
+After training, generate loss and metric plots from the saved log:
+
+```bash
+uv run --with matplotlib python plot_finetune_log.py \
+  "$RUN/train_continue_e101_e120.log" \
+  --out-dir "$RUN"
 ```
 
 `--epochs` is the final target epoch, not the number of additional epochs. Since `lego_sam3_runB_e80.pth` is the epoch-80 primary checkpoint, `--epochs 100` means continue for about 20 more epochs.
@@ -93,3 +122,37 @@ The split is by `frame_id`, so matching frame IDs stay together across all four 
 3. Pick the best checkpoint based on validation metrics.
 4. Run the held-out test set once for final numbers.
 5. Archive the chosen checkpoint with the exact command, data split, and commit hash used for the run.
+
+## Commands
+
+```bash
+cd /home/henryzhu/repos/cad_prompted_sam3
+
+DATA=/home/henryzhu/data/brick_sam_sdg/run_500_scenes_yaw20_not_stud_aligned
+WEIGHTS=/home/henryzhu/repos/LegoSegmentation/weights
+REFS=/home/henryzhu/repos/LegoSegmentation/exemplars/renders
+RUN=/home/henryzhu/repos/cad_prompted_sam3/finetune_exemplar_lego_continue/run_20260707_150733
+LOG="$RUN/train_continue_e101_e120_$(date +%Y%m%d_%H%M%S).log"
+
+set -o pipefail
+
+python -u finetune_image_exemplar_multi_gt_split.py \
+  --model_path "$WEIGHTS/sam3.pt" \
+  --resume_path "$RUN/finetune_epoch_100.pth" \
+  --no_resume_optimizer \
+  --resume_in_place True \
+  --dataset_root "$DATA/Side_Camera_0,$DATA/Side_Camera_1,$DATA/Side_Camera_2,$DATA/Side_Camera_3" \
+  --reference_dir "$REFS" \
+  --split_dir splits/lego_yaw20 \
+  --split_ratios 0.8,0.1,0.1 \
+  --ref_view_ids 0,1,2,3,4,5,6,7,8,9,10,11 \
+  --epochs 120 \
+  --batch_size 4 \
+  --grad_accum 12 \
+  --lr 2e-5 \
+  --device cuda:0 \
+  --save_every 5 \
+  --save_debug_every 0 \
+  --output_dir finetune_exemplar_lego_continue \
+  2>&1 | tee -a "$LOG"
+```

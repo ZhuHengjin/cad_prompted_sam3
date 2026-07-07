@@ -37,6 +37,11 @@ pip install -r requirements.txt
    python run_webcam_exemplar.py
    ```
 
+## Project Docs
+
+- [Fine-tuning notes](docs/fine-tune-note.md): LEGO SAM3 continuation commands, logging, plotting, and checkpoint-selection workflow.
+- [Fine-tuning split behavior](docs/finetune-split-behavior.md): frame-level train/validation/test split behavior for `finetune_image_exemplar_multi_gt_split.py`.
+
 
 # MuggledSAM
 
