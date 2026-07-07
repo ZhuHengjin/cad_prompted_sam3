@@ -47,7 +47,6 @@ import torch.nn.functional as F
 
 from loss_fns import (
     compute_bbox_l1_loss_from_matches,
-    compute_matched_mask_losses,
     compute_presence_loss_logits,
 )
 from muggled_sam.make_sam import make_sam_from_state_dict
@@ -1082,13 +1081,21 @@ def compute_multi_gt_detection_loss(
     if not o2m_matches:
         return None
 
-    matched_losses = compute_matched_mask_losses(
-        logits_mhw,
-        gt_targets,
-        o2m_matches,
-        bce_weight=bce_weight,
-        dice_weight=dice_weight,
-    )
+    matched_losses: List[torch.Tensor] = []
+    eps = 1e-6
+    for gt_idx, pred_idx in o2m_matches:
+        if gt_idx < 0 or gt_idx >= len(gt_targets):
+            continue
+        if pred_idx < 0 or pred_idx >= logits_mhw.shape[0]:
+            continue
+        logits_hw = logits_mhw[pred_idx]
+        target_hw = gt_targets[gt_idx].to(device=logits_hw.device, dtype=logits_hw.dtype)
+        loss_bce = F.binary_cross_entropy_with_logits(logits_hw, target_hw, reduction="mean")
+        probs_hw = torch.sigmoid(logits_hw)
+        dice_num = 2 * (probs_hw * target_hw).sum() + eps
+        dice_den = probs_hw.sum() + target_hw.sum() + eps
+        loss_dice = 1.0 - dice_num / dice_den
+        matched_losses.append(bce_weight * loss_bce + dice_weight * loss_dice)
     if not matched_losses:
         return None
 
