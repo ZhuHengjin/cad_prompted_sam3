@@ -47,9 +47,12 @@ When `--split_dir` or `--train_split_csv` is provided:
 - Training entries are filtered through `train.csv`.
 - Dataset multipliers are applied after the train split filter.
 - Validation entries are filtered through `val.csv`.
+- Validation reports `val_loss` plus task metrics such as `avg_iou`, `correct_rate`, and PQ stats.
 - `test.csv` is checked and logged, but not used during training.
 
 If no split arguments are provided, the script keeps the old behavior and trains on all entries from `--dataset_root`.
+
+`val_loss` uses the same multi-GT objective as the training loop, but it is computed under `torch.no_grad()` and without validation-time augmentation. It is for monitoring overfitting and stability; it does not change optimizer behavior.
 
 ## CLI Options
 

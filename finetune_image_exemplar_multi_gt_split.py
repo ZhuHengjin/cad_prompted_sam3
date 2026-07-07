@@ -24,7 +24,8 @@ Dataset split behavior:
     script fails and asks for ``--recreate_splits`` instead of silently mixing
     old and new split files. ``test.csv`` is reserved for final evaluation; it
     is recorded and sanity-checked during training but is not used by the
-    training loop.
+    training loop. Validation reports both task metrics and ``val_loss`` using
+    the same multi-GT objective as training, computed without gradients.
 """
 
 import argparse
@@ -48,7 +49,6 @@ from loss_fns import (
     compute_bbox_l1_loss_from_matches,
     compute_matched_mask_losses,
     compute_presence_loss_logits,
-    compute_score_weighted_mask_loss_from_matches,
 )
 from muggled_sam.make_sam import make_sam_from_state_dict
 
@@ -69,6 +69,11 @@ class EvalConfig:
     det_filter: float = 0.0
     nms_iou: float = 0.5
     matches_per_gt: int = 1
+    bce_weight: float = 2.0
+    dice_weight: float = 2.0
+    bbox_weight: float = 1.0
+    score_weight: float = 0.3
+    no_object_weight: float = 0.45
     shuffle: bool = False
     max_batches: int = 0
 
@@ -1045,6 +1050,69 @@ def greedy_unique_k_assign(cost: np.ndarray, max_per_gt: int = 1) -> List[Tuple[
     return matches
 
 
+def compute_multi_gt_detection_loss(
+    logits_mhw: torch.Tensor,
+    box_preds_n22: torch.Tensor,
+    det_scores_logits_n: torch.Tensor,
+    gt_targets_hw: Sequence[torch.Tensor],
+    bce_weight: float,
+    dice_weight: float,
+    bbox_weight: float,
+    score_weight: float,
+    no_object_weight: float,
+    max_per_gt: int = 12,
+) -> Optional[torch.Tensor]:
+    """Compute the same multi-GT objective used by the training loop.
+
+    Validation uses this helper under ``torch.no_grad()`` so it can report loss
+    without changing model state. The helper intentionally mirrors the existing
+    training objective, including the hard-coded mask multiplier and the
+    one-to-many matching setting used for loss assignment.
+    """
+    if logits_mhw.numel() == 0 or not gt_targets_hw:
+        return None
+    gt_targets = [target.float() for target in gt_targets_hw]
+    logits_mhw = logits_mhw.float()
+    o2m_matches, o2m_iou = match_predictions_to_gts_greedy_k(
+        logits_mhw,
+        gt_targets,
+        max_matches=None,
+        max_per_gt=max_per_gt,
+    )
+    if not o2m_matches:
+        return None
+
+    matched_losses = compute_matched_mask_losses(
+        logits_mhw,
+        gt_targets,
+        o2m_matches,
+        bce_weight=bce_weight,
+        dice_weight=dice_weight,
+    )
+    if not matched_losses:
+        return None
+
+    loss_mask = torch.stack(matched_losses).mean()
+    loss_bbox = compute_bbox_l1_loss_from_matches(
+        box_preds_n22,
+        gt_targets,
+        o2m_matches,
+    )
+    loss_presence = compute_presence_loss_logits(
+        det_scores_logits_n,
+        o2m_matches,
+        o2m_iou,
+        pos_weight=score_weight,
+        neg_weight=no_object_weight,
+        alpha=0.5,
+        use_focal=False,
+        focal_alpha=0.25,
+        focal_gamma=4.0,
+        focal_weight=300.0,
+    )
+    return loss_mask * 2.0 + loss_presence + bbox_weight * loss_bbox
+
+
 def pad_exemplar_batch(
     exemplars_list: List[torch.Tensor],
     device: torch.device,
@@ -1561,7 +1629,7 @@ def run_exemplar_eval(
     detmodel,
     config: EvalConfig,
     device: torch.device,
-) -> Tuple[float, int, float]:
+) -> Tuple[float, int, float, float]:
     dataset_roots = normalize_dataset_roots(config.dataset_root)
     if not dataset_roots:
         raise ValueError("No eval dataset roots provided.")
@@ -1601,6 +1669,8 @@ def run_exemplar_eval(
     total_iou_sum = 0.0
     total_iou_count = 0
     total_correct = 0
+    total_loss_sum = 0.0
+    total_loss_count = 0
     batch_step = 0
     pq_iou_threshold = 0.5
     pq_score_thresholds = [round(0.10 + 0.01 * idx, 2) for idx in range(30)]
@@ -1683,6 +1753,7 @@ def run_exemplar_eval(
                     group_map[shape_key].append(idx)
 
                 batch_ious: List[float] = []
+                batch_losses: List[float] = []
                 batch_correct = 0
                 for _, idxs in group_map.items():
                     img_batch = torch.cat([prepared[i]["img_tensor"] for i in idxs], dim=0)
@@ -1733,6 +1804,23 @@ def run_exemplar_eval(
                         if not gt_down_list:
                             continue
 
+                        val_loss = compute_multi_gt_detection_loss(
+                            mask_preds[local_idx].float(),
+                            box_preds[local_idx],
+                            det_scores_logits[local_idx],
+                            gt_down_list,
+                            bce_weight=config.bce_weight,
+                            dice_weight=config.dice_weight,
+                            bbox_weight=config.bbox_weight,
+                            score_weight=config.score_weight,
+                            no_object_weight=config.no_object_weight,
+                        )
+                        if val_loss is not None:
+                            val_loss_float = float(val_loss.item())
+                            batch_losses.append(val_loss_float)
+                            total_loss_sum += val_loss_float
+                            total_loss_count += 1
+
                         boxes_nms, masks_nms, scores_nms = apply_mask_nms(
                             box_preds[local_idx],
                             mask_preds[local_idx],
@@ -1771,11 +1859,13 @@ def run_exemplar_eval(
                             batch_correct += 1
                             total_correct += 1
 
-                if batch_ious:
-                    avg_iou = sum(batch_ious) / max(1, len(batch_ious))
+                if batch_ious or batch_losses:
+                    avg_iou = sum(batch_ious) / max(1, len(batch_ious)) if batch_ious else 0.0
                     correct_rate = batch_correct / max(1, len(batch_ious))
+                    avg_loss = sum(batch_losses) / max(1, len(batch_losses)) if batch_losses else float("nan")
+                    loss_part = f" val_loss={avg_loss:.4f}" if np.isfinite(avg_loss) else ""
                     print(
-                        f"[eval] step={batch_step} avg_iou={avg_iou:.4f} "
+                        f"[eval] step={batch_step}{loss_part} avg_iou={avg_iou:.4f} "
                         f"correct_rate={correct_rate:.3f} samples={len(batch_ious)}"
                     )
 
@@ -1788,6 +1878,7 @@ def run_exemplar_eval(
     if total_iou_count > 0:
         overall_avg = total_iou_sum / total_iou_count
         overall_correct = total_correct / total_iou_count
+        overall_loss = total_loss_sum / total_loss_count if total_loss_count > 0 else float("nan")
         for score_threshold in sorted(pq_stats.keys()):
             stats = pq_stats[score_threshold]
             denom = stats["tp"] + 0.5 * stats["fp"] + 0.5 * stats["fn"]
@@ -1799,7 +1890,7 @@ def run_exemplar_eval(
                 f"[eval] PQ@score>={score_threshold:.2f}={pq:.4f} "
                 f"tp={int(stats['tp'])} fp={int(stats['fp'])} fn={int(stats['fn'])}"
             )
-        return overall_avg, total_iou_count, overall_correct
+        return overall_avg, total_iou_count, overall_correct, overall_loss
     for score_threshold in sorted(pq_stats.keys()):
         stats = pq_stats[score_threshold]
         denom = stats["tp"] + 0.5 * stats["fp"] + 0.5 * stats["fn"]
@@ -1811,7 +1902,8 @@ def run_exemplar_eval(
             f"[eval] PQ@score>={score_threshold:.2f}={pq:.4f} "
             f"tp={int(stats['tp'])} fp={int(stats['fp'])} fn={int(stats['fn'])}"
         )
-    return 0.0, 0, 0.0
+    overall_loss = total_loss_sum / total_loss_count if total_loss_count > 0 else float("nan")
+    return 0.0, 0, 0.0, overall_loss
 
 
 def main() -> None:
@@ -1986,6 +2078,11 @@ def main() -> None:
             det_filter=args.det_filter,
             nms_iou=args.nms_iou,
             matches_per_gt=args.matches_per_gt,
+            bce_weight=args.bce_weight,
+            dice_weight=args.dice_weight,
+            bbox_weight=args.bbox_weight,
+            score_weight=args.score_weight,
+            no_object_weight=args.no_object_weight,
             shuffle=False,
             max_batches=0,
         )
@@ -2004,14 +2101,16 @@ def main() -> None:
     for epoch in range(start_epoch, args.epochs + 1):
         if epoch != start_epoch:
             eval_config = validation_config if validation_config is not None else EVAL_CONFIG
-            eval_avg, eval_count, eval_correct = run_exemplar_eval(detmodel, eval_config, device=device)
+            eval_avg, eval_count, eval_correct, eval_loss = run_exemplar_eval(detmodel, eval_config, device=device)
             if eval_count > 0:
+                loss_part = f" val_loss={eval_loss:.4f}" if np.isfinite(eval_loss) else ""
                 print(
-                    f"[eval] epoch={epoch} avg_iou={eval_avg:.4f} "
+                    f"[eval] epoch={epoch}{loss_part} avg_iou={eval_avg:.4f} "
                     f"correct_rate={eval_correct:.3f} samples={eval_count}"
                 )
             else:
-                print(f"[eval] epoch={epoch} no valid samples")
+                loss_part = f" val_loss={eval_loss:.4f}" if np.isfinite(eval_loss) else ""
+                print(f"[eval] epoch={epoch}{loss_part} no valid samples")
 
         random.shuffle(all_entries)
         epoch_loss = 0.0
@@ -2131,49 +2230,19 @@ def main() -> None:
                         continue
 
                     logits_mhw = mask_preds[local_idx].float()
-                    o2o_matches, o2o_iou = match_predictions_to_gts_hungarian(
+                    loss = compute_multi_gt_detection_loss(
                         logits_mhw,
+                        box_preds[local_idx],
+                        det_scores_logits[local_idx],
                         gt_targets,
-                        max_matches=None,
-                    )
-                    o2m_matches, o2m_iou = match_predictions_to_gts_greedy_k(
-                        logits_mhw,
-                        gt_targets,
-                        max_matches=None,
-                        max_per_gt=12,
-                    )
-                    matched_losses = compute_matched_mask_losses(
-                        logits_mhw,
-                        gt_targets,
-                        o2m_matches,
                         bce_weight=args.bce_weight,
                         dice_weight=args.dice_weight,
+                        bbox_weight=args.bbox_weight,
+                        score_weight=args.score_weight,
+                        no_object_weight=args.no_object_weight,
                     )
-                    loss_mask = torch.stack(matched_losses).mean()
-                    loss_bbox = compute_bbox_l1_loss_from_matches(
-                        box_preds[local_idx],
-                        gt_targets,
-                        o2m_matches,
-                    )
-                    loss_presence = compute_presence_loss_logits(
-                        det_scores_logits[local_idx],
-                        o2m_matches,
-                        o2m_iou,
-                        pos_weight=args.score_weight,
-                        neg_weight=args.no_object_weight,
-                        alpha=0.5,
-                        use_focal=False,
-                        focal_alpha=0.25,
-                        focal_gamma=4.0,
-                        focal_weight=300.0,
-                    )
-                    loss_weighted_mask = compute_score_weighted_mask_loss_from_matches(
-                        det_scores[local_idx],
-                        o2m_matches,
-                        matched_losses,
-                        power=2.0,
-                    )
-                    loss = loss_mask * 2.0 + loss_presence + args.bbox_weight * loss_bbox
+                    if loss is None:
+                        continue
                     batch_losses.append(loss)
 
                     scores = det_scores[local_idx]

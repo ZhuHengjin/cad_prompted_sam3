@@ -76,7 +76,7 @@ With `--split_dir splits/lego_yaw20`, the script creates or reuses:
 - `splits/lego_yaw20/val.csv`
 - `splits/lego_yaw20/test.csv`
 
-The split is by `frame_id`, so matching frame IDs stay together across all four side cameras. Training uses `train.csv`; validation during training uses `val.csv`; `test.csv` is reserved for final evaluation and is not used during training.
+The split is by `frame_id`, so matching frame IDs stay together across all four side cameras. Training uses `train.csv`; validation during training uses `val.csv`; `test.csv` is reserved for final evaluation and is not used during training. Validation logs `val_loss` alongside task metrics such as `avg_iou`, `correct_rate`, and PQ stats.
 
 ## Practical Notes
 
@@ -89,7 +89,7 @@ The split is by `frame_id`, so matching frame IDs stay together across all four 
 ## After Training
 
 1. Inspect logs for training loss and average IoU.
-2. Review validation performance, not just training performance.
+2. Review validation loss and validation metrics, not just training performance.
 3. Pick the best checkpoint based on validation metrics.
 4. Run the held-out test set once for final numbers.
 5. Archive the chosen checkpoint with the exact command, data split, and commit hash used for the run.
