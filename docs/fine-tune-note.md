@@ -125,6 +125,7 @@ The split is by `frame_id`, so matching frame IDs stay together across all four 
 
 ## Commands
 
+### Resume in place
 ```bash
 cd /home/henryzhu/repos/cad_prompted_sam3
 
@@ -132,13 +133,13 @@ DATA=/home/henryzhu/data/brick_sam_sdg/run_500_scenes_yaw20_not_stud_aligned
 WEIGHTS=/home/henryzhu/repos/LegoSegmentation/weights
 REFS=/home/henryzhu/repos/LegoSegmentation/exemplars/renders
 RUN=/home/henryzhu/repos/cad_prompted_sam3/finetune_exemplar_lego_continue/run_20260707_150733
-LOG="$RUN/train_continue_e101_e120_$(date +%Y%m%d_%H%M%S).log"
+LOG="$RUN/train_continue_e121_e160_lr1e-4_$(date +%Y%m%d_%H%M%S).log"
 
 set -o pipefail
 
 python -u finetune_image_exemplar_multi_gt_split.py \
   --model_path "$WEIGHTS/sam3.pt" \
-  --resume_path "$RUN/finetune_epoch_100.pth" \
+  --resume_path "$WEIGHTS/lego_sam3_runB_e80.pth" \
   --no_resume_optimizer \
   --resume_in_place True \
   --dataset_root "$DATA/Side_Camera_0,$DATA/Side_Camera_1,$DATA/Side_Camera_2,$DATA/Side_Camera_3" \
@@ -146,13 +147,75 @@ python -u finetune_image_exemplar_multi_gt_split.py \
   --split_dir splits/lego_yaw20 \
   --split_ratios 0.8,0.1,0.1 \
   --ref_view_ids 0,1,2,3,4,5,6,7,8,9,10,11 \
-  --epochs 120 \
-  --batch_size 4 \
+  --epochs 160 \
+  --batch_size 2 \
   --grad_accum 12 \
-  --lr 2e-5 \
+  --lr 1e-4 \
   --device cuda:0 \
   --save_every 5 \
   --save_debug_every 0 \
   --output_dir finetune_exemplar_lego_continue \
   2>&1 | tee -a "$LOG"
 ```
+
+### Resume from initial
+
+```bash
+cd /home/henryzhu/repos/cad_prompted_sam3
+
+DATA=/home/henryzhu/data/brick_sam_sdg/run_500_scenes_yaw20_not_stud_aligned_repaired
+WEIGHTS=/home/henryzhu/repos/LegoSegmentation/weights
+REFS=/home/henryzhu/repos/LegoSegmentation/exemplars/renders
+RUN=/home/henryzhu/repos/cad_prompted_sam3/finetune_exemplar_lego_continue/run_$(date +%Y%m%d_%H%M%S)
+LOG="$RUN/train_continue_e81_e160_lr1e-4_$(date +%Y%m%d_%H%M%S).log"
+
+set -o pipefail
+
+python -u finetune_image_exemplar_multi_gt_split.py \
+  --model_path "$WEIGHTS/sam3.pt" \
+  --resume_path "$WEIGHTS/lego_sam3_runB_e80.pth" \
+  --no_resume_optimizer \
+  --dataset_root "$DATA/Side_Camera_0,$DATA/Side_Camera_1,$DATA/Side_Camera_2,$DATA/Side_Camera_3" \
+  --reference_dir "$REFS" \
+  --split_dir splits/lego_yaw20_repaired \
+  --split_ratios 0.8,0.1,0.1 \
+  --ref_view_ids 0,1,2,3,4,5,6,7,8,9,10,11 \
+  --epochs 160 \
+  --batch_size 2 \
+  --grad_accum 12 \
+  --lr 1e-4 \
+  --device cuda:0 \
+  --save_every 5 \
+  --save_debug_every 0 \
+  --output_dir finetune_exemplar_lego_continue \
+  2>&1 | tee -a "$LOG"
+```
+
+### First command I got
+
+```bash
+cd /home/henryzhu/repos/cad_prompted_sam3
+
+DATA=/home/henryzhu/data/brick_sam_sdg/run_500_scenes_yaw20_not_stud_aligned
+WEIGHTS=/home/henryzhu/repos/LegoSegmentation/weights
+REFS=/home/henryzhu/repos/LegoSegmentation/exemplars/renders
+
+python finetune_image_exemplar_multi_gt_split.py \
+  --model_path "$WEIGHTS/sam3.pt" \
+  --resume_path "$WEIGHTS/lego_sam3_runB_e80.pth" \
+  --dataset_root "$DATA/Side_Camera_0,$DATA/Side_Camera_1,$DATA/Side_Camera_2,$DATA/Side_Camera_3" \
+  --reference_dir "$REFS" \
+  --split_dir splits/lego_yaw20 \
+  --split_ratios 0.8,0.1,0.1 \
+  --ref_view_ids 0,1,2,3,4,5,6,7,8,9,10,11 \
+  --epochs 100 \
+  --batch_size 4 \
+  --grad_accum 12 \
+  --lr 1e-4 \
+  --device cuda:0 \
+  --save_every 5 \
+  --save_debug_every 0 \
+  --output_dir finetune_exemplar_lego_continue
+```
+
+  --resume_path "$RUN/finetune_epoch_120.pth" \

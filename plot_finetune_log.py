@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Plot fine-tuning losses and metrics from a captured training log."""
+"""Plot fine-tuning losses and metrics from captured training logs."""
 
 import argparse
 import csv
@@ -64,9 +64,22 @@ def parse_log(log_path: Path) -> tuple[list[dict[str, float]], list[dict[str, fl
     return train_rows, eval_rows
 
 
+def parse_logs(log_paths: list[Path]) -> tuple[list[dict[str, float]], list[dict[str, float]]]:
+    train_rows: list[dict[str, float]] = []
+    eval_rows: list[dict[str, float]] = []
+
+    for log_path in log_paths:
+        log_train_rows, log_eval_rows = parse_log(log_path)
+        train_rows.extend(log_train_rows)
+        eval_rows.extend(log_eval_rows)
+
+    return train_rows, eval_rows
+
+
 def write_csv(path: Path, rows: list[dict[str, float]]) -> None:
     if not rows:
         return
+    path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=list(rows[0].keys()))
         writer.writeheader()
@@ -176,22 +189,23 @@ def plot_curves(train_rows: list[dict[str, float]], eval_rows: list[dict[str, fl
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("log_path", type=Path, help="Captured training log to parse.")
+    parser.add_argument("log_paths", type=Path, nargs="+", help="Captured training log(s) to parse, in plot order.")
     parser.add_argument("--out-dir", type=Path, default=None, help="Directory for plot and CSV outputs.")
     args = parser.parse_args()
 
-    log_path = args.log_path.expanduser().resolve()
-    out_dir = args.out_dir.expanduser().resolve() if args.out_dir else log_path.parent
-    train_rows, eval_rows = parse_log(log_path)
+    log_paths = [path.expanduser().resolve() for path in args.log_paths]
+    out_dir = args.out_dir.expanduser().resolve() if args.out_dir else log_paths[0].parent
+    train_rows, eval_rows = parse_logs(log_paths)
 
     if not train_rows and not eval_rows:
-        raise SystemExit(f"No training or eval metric lines found in {log_path}")
+        logs = ", ".join(str(path) for path in log_paths)
+        raise SystemExit(f"No training or eval metric lines found in: {logs}")
 
     write_csv(out_dir / "training_metrics.csv", train_rows)
     write_csv(out_dir / "validation_metrics.csv", eval_rows)
     plot_curves(train_rows, eval_rows, out_dir / "training_validation_curves.png")
 
-    print(f"Parsed {len(train_rows)} training rows and {len(eval_rows)} validation rows.")
+    print(f"Parsed {len(train_rows)} training rows and {len(eval_rows)} validation rows from {len(log_paths)} log(s).")
     print(f"Wrote {out_dir / 'training_validation_curves.png'}")
 
 
