@@ -1,5 +1,22 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+"""Canonical SAMv3 multi-GT exemplar training and evaluation entry point.
+
+Manifest mode resolves exact dataset/camera/frame rows, trains only on the
+``train`` split, and evaluates every target object in the unweighted
+``validation`` split between epochs. Training epochs retain the original total
+view count while allocating draws equally among dataset IDs; small domains are
+sampled with replacement using an epoch-local ``seed + epoch`` RNG. Final test
+evaluation is available only through explicit ``--eval_only --eval_split test``
+with a fine-tuned checkpoint.
+
+Each manifest-backed run stores a manifest copy, SHA-256 digest, resolved split
+counts, sampling policy, data root, and CLI arguments beside its checkpoints.
+The older root and frame-CSV path remains temporarily available for migration,
+but cannot be mixed with the dataset-qualified manifest interface. Model loss,
+matching, augmentation, checkpoint keys, and debug visualization behavior are
+otherwise retained from the original multi-GT trainer.
+"""
 
 import argparse
 import csv
@@ -7,6 +24,8 @@ import json
 import os
 import random
 import re
+import shutil
+import warnings
 from collections import defaultdict, deque
 from dataclasses import dataclass
 from datetime import datetime
@@ -20,14 +39,29 @@ import torch.nn.functional as F
 
 from loss_fns import (
     compute_bbox_l1_loss_from_matches,
-    compute_matched_mask_losses,
     compute_presence_loss_logits,
-    compute_score_weighted_mask_loss_from_matches,
+)
+from dataset_manifest import (
+    ManifestRow,
+    balanced_epoch_entries,
+    load_manifest,
+    manifest_sha256,
 )
 from muggled_sam.make_sam import make_sam_from_state_dict
 
 
 IGNORED_LABELS = {"BACKGROUND", "UNLABELLED"}
+METRIC_FIELDS = (
+    "phase",
+    "epoch",
+    "global_step",
+    "batch_step",
+    "loss",
+    "avg_loss",
+    "avg_iou",
+    "correct_rate",
+    "samples",
+)
 
 
 @dataclass(frozen=True)
@@ -35,6 +69,8 @@ class EvalConfig:
     dataset_root: object
     reference_dir: str
     ref_view_ids: str
+    split_csv: str = ""
+    dataset_entries: Optional[Sequence[Dict[str, str]]] = None
     max_side_length: int = 1008
     use_square_sizing: bool = True
     num_points_approx: int = 25
@@ -42,24 +78,13 @@ class EvalConfig:
     det_filter: float = 0.0
     nms_iou: float = 0.5
     matches_per_gt: int = 1
+    bce_weight: float = 2.0
+    dice_weight: float = 2.0
+    bbox_weight: float = 1.0
+    score_weight: float = 0.3
+    no_object_weight: float = 0.45
     shuffle: bool = False
     max_batches: int = 0
-
-
-EVAL_CONFIG = EvalConfig(
-    dataset_root="/sata1/data/kevin/realworld_datasets/3d_printing_dataset",
-    reference_dir="/sata1/data/kevin/realworld_datasets/3d_printing_meshes/renders_2442_0316",
-    ref_view_ids="0,1,2,3,4,5,6,7,8,9,10,11",
-    max_side_length=1008,
-    use_square_sizing=True,
-    num_points_approx=24,
-    batch_size=8,
-    det_filter=0.0,
-    nms_iou=0.5,
-    matches_per_gt=1,
-    shuffle=False,
-    max_batches=0,
-)
 
 
 def parse_color_key(key: str) -> Tuple[int, ...]:
@@ -330,6 +355,111 @@ def apply_dataset_filter_entries(
     return filtered
 
 
+def parse_split_ratios(value: str) -> Tuple[float, float, float]:
+    """Parse and normalize train/validation/test ratios from CLI text.
+
+    The ratios do not need to sum to 1.0; for example, ``8,1,1`` and
+    ``0.8,0.1,0.1`` are equivalent. The returned tuple always sums to 1.0.
+    """
+    parts = [part.strip() for part in str(value).split(",") if part.strip()]
+    if len(parts) != 3:
+        raise ValueError(f"Expected three comma-separated split ratios, got: {value}")
+    try:
+        train_ratio, val_ratio, test_ratio = (float(part) for part in parts)
+    except ValueError as exc:
+        raise ValueError(f"Invalid split ratios: {value}") from exc
+    if train_ratio < 0 or val_ratio < 0 or test_ratio < 0:
+        raise ValueError(f"Split ratios must be non-negative, got: {value}")
+    total = train_ratio + val_ratio + test_ratio
+    if total <= 0:
+        raise ValueError(f"At least one split ratio must be positive, got: {value}")
+    return train_ratio / total, val_ratio / total, test_ratio / total
+
+
+def load_split_frame_ids(csv_path: Path) -> set:
+    """Load frame IDs from a split CSV for logging and validation.
+
+    Split CSVs are compatible with ``load_dataset_filter_set`` and can contain
+    either a simple ``frame_id`` column or the fuller dataset-filter format with
+    ``frame_id``, ``rgb_path``, and ``inst_path``. For the canonical train/val/
+    test split, only ``frame_id`` is written and required.
+    """
+    if not csv_path.is_file():
+        raise FileNotFoundError(csv_path)
+    _, frame_ids = load_dataset_filter_set(csv_path)
+    return frame_ids if frame_ids is not None else set()
+
+
+def write_frame_split_csv(csv_path: Path, frame_ids: Sequence[str]) -> None:
+    """Write a simple frame-level split CSV.
+
+    The file contains only ``frame_id`` values so the same frame ID can match
+    entries from every camera directory. This keeps camera views of the same
+    scene together in train, validation, or test.
+    """
+    csv_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(csv_path, "w", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=["frame_id"])
+        writer.writeheader()
+        for frame_id in frame_ids:
+            writer.writerow({"frame_id": frame_id})
+
+
+def create_frame_split_csvs(
+    split_dir: Path,
+    frame_ids: Sequence[str],
+    ratios: Tuple[float, float, float],
+    seed: int,
+    overwrite: bool = False,
+) -> Tuple[Path, Path, Path]:
+    """Create or reuse train/validation/test CSV files under ``split_dir``.
+
+    Behavior is intentionally conservative:
+    - If all three files exist and ``overwrite`` is false, reuse them.
+    - If only some files exist and ``overwrite`` is false, fail loudly.
+    - If ``overwrite`` is true, regenerate all three files using ``seed``.
+
+    The split is generated from unique frame IDs after any dataset-level filter
+    has been applied, before dataset multipliers are applied. Multipliers can
+    duplicate training examples, but they do not change split membership.
+    """
+    train_path = split_dir / "train.csv"
+    val_path = split_dir / "val.csv"
+    test_path = split_dir / "test.csv"
+    split_paths = (train_path, val_path, test_path)
+    if not overwrite:
+        existing = [path.is_file() for path in split_paths]
+        if all(existing):
+            return split_paths
+        if any(existing):
+            raise FileExistsError(
+                f"Partial split files exist under {split_dir}. "
+                "Provide all of train.csv/val.csv/test.csv or pass --recreate_splits."
+            )
+    if not frame_ids:
+        raise ValueError("Cannot create data splits with no frame ids.")
+
+    shuffled = sorted(set(frame_ids))
+    rng = random.Random(seed)
+    rng.shuffle(shuffled)
+
+    train_ratio, val_ratio, _ = ratios
+    total = len(shuffled)
+    train_count = int(round(total * train_ratio))
+    val_count = int(round(total * val_ratio))
+    train_count = min(max(train_count, 0), total)
+    val_count = min(max(val_count, 0), total - train_count)
+
+    train_ids = sorted(shuffled[:train_count])
+    val_ids = sorted(shuffled[train_count : train_count + val_count])
+    test_ids = sorted(shuffled[train_count + val_count :])
+
+    write_frame_split_csv(train_path, train_ids)
+    write_frame_split_csv(val_path, val_ids)
+    write_frame_split_csv(test_path, test_ids)
+    return split_paths
+
+
 def unique_frame_entries(entries: Sequence[Dict[str, str]]) -> List[Dict[str, str]]:
     unique_entries: Dict[Tuple[str, str, str], Dict[str, str]] = {}
     for entry in entries:
@@ -346,6 +476,40 @@ def unique_object_entries(entries: Sequence[Dict[str, str]]) -> List[Dict[str, s
         if key not in unique_entries:
             unique_entries[key] = entry
     return list(unique_entries.values())
+
+
+def entries_from_manifest_rows(
+    rows: Sequence[ManifestRow], data_root: Path, *, object_level: bool
+) -> List[Dict[str, str]]:
+    """Resolve exact manifest samples through the existing dataset parser."""
+    requested: Dict[Tuple[str, str], Dict[str, ManifestRow]] = defaultdict(dict)
+    for row in rows:
+        camera_root = str((data_root / row.dataset_path / row.camera_dir).resolve())
+        requested[(row.dataset_id, camera_root)][row.frame_id] = row
+
+    resolved: List[Dict[str, str]] = []
+    for (dataset_id, camera_root), frame_rows in sorted(requested.items()):
+        _, camera_entries = collect_multi_object_samples(camera_root)
+        camera_entries = (
+            unique_object_entries(camera_entries) if object_level else unique_frame_entries(camera_entries)
+        )
+        found_frames = set()
+        for entry in camera_entries:
+            row = frame_rows.get(entry["frame_id"])
+            if row is None:
+                continue
+            enriched = dict(entry)
+            enriched["dataset_id"] = dataset_id
+            enriched["group_id"] = row.group_id
+            enriched["split"] = row.split
+            resolved.append(enriched)
+            found_frames.add(entry["frame_id"])
+        missing = sorted(set(frame_rows) - found_frames)
+        if missing:
+            raise RuntimeError(
+                f"Manifest rows under {camera_root} yielded no usable labeled entries for frames: {missing[:10]}"
+            )
+    return resolved
 
 
 def apply_dataset_multiplier(entries: Sequence[Dict[str, str]], multiplier: float) -> List[Dict[str, str]]:
@@ -913,6 +1077,77 @@ def greedy_unique_k_assign(cost: np.ndarray, max_per_gt: int = 1) -> List[Tuple[
     return matches
 
 
+def compute_multi_gt_detection_loss(
+    logits_mhw: torch.Tensor,
+    box_preds_n22: torch.Tensor,
+    det_scores_logits_n: torch.Tensor,
+    gt_targets_hw: Sequence[torch.Tensor],
+    bce_weight: float,
+    dice_weight: float,
+    bbox_weight: float,
+    score_weight: float,
+    no_object_weight: float,
+    max_per_gt: int = 12,
+) -> Optional[torch.Tensor]:
+    """Compute the same multi-GT objective used by the training loop.
+
+    Validation uses this helper under ``torch.no_grad()`` so it can report loss
+    without changing model state. The helper intentionally mirrors the existing
+    training objective, including the hard-coded mask multiplier and the
+    one-to-many matching setting used for loss assignment.
+    """
+    if logits_mhw.numel() == 0 or not gt_targets_hw:
+        return None
+    gt_targets = [target.float() for target in gt_targets_hw]
+    logits_mhw = logits_mhw.float()
+    o2m_matches, o2m_iou = match_predictions_to_gts_greedy_k(
+        logits_mhw,
+        gt_targets,
+        max_matches=None,
+        max_per_gt=max_per_gt,
+    )
+    if not o2m_matches:
+        return None
+
+    matched_losses: List[torch.Tensor] = []
+    eps = 1e-6
+    for gt_idx, pred_idx in o2m_matches:
+        if gt_idx < 0 or gt_idx >= len(gt_targets):
+            continue
+        if pred_idx < 0 or pred_idx >= logits_mhw.shape[0]:
+            continue
+        logits_hw = logits_mhw[pred_idx]
+        target_hw = gt_targets[gt_idx].to(device=logits_hw.device, dtype=logits_hw.dtype)
+        loss_bce = F.binary_cross_entropy_with_logits(logits_hw, target_hw, reduction="mean")
+        probs_hw = torch.sigmoid(logits_hw)
+        dice_num = 2 * (probs_hw * target_hw).sum() + eps
+        dice_den = probs_hw.sum() + target_hw.sum() + eps
+        loss_dice = 1.0 - dice_num / dice_den
+        matched_losses.append(bce_weight * loss_bce + dice_weight * loss_dice)
+    if not matched_losses:
+        return None
+
+    loss_mask = torch.stack(matched_losses).mean()
+    loss_bbox = compute_bbox_l1_loss_from_matches(
+        box_preds_n22,
+        gt_targets,
+        o2m_matches,
+    )
+    loss_presence = compute_presence_loss_logits(
+        det_scores_logits_n,
+        o2m_matches,
+        o2m_iou,
+        pos_weight=score_weight,
+        neg_weight=no_object_weight,
+        alpha=0.5,
+        use_focal=False,
+        focal_alpha=0.25,
+        focal_gamma=4.0,
+        focal_weight=300.0,
+    )
+    return loss_mask * 2.0 + loss_presence + bbox_weight * loss_bbox
+
+
 def pad_exemplar_batch(
     exemplars_list: List[torch.Tensor],
     device: torch.device,
@@ -1261,17 +1496,77 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--dataset_root",
         type=str,
-        default=[
-            ("/sata1/data/kevin/v2_dataset/v2_multi_gt/v2_sdg_output", 1, True),
-            ("/sata1/data/kevin/v2_imgs/train_1", 1, True),
-            ("/sata1/data/kevin/v2_dataset/v2_multi_gt_merged_345", 1,True)
-        ],
-        help="Comma-separated dataset roots. Can also set a list of (path, multiplier, use_filter) in code defaults.",
+        default="",
+        help="Deprecated unsplit fallback: comma-separated camera dataset roots.",
+    )
+    parser.add_argument(
+        "--dataset_manifest",
+        type=str,
+        default="",
+        help="Canonical versioned CSV manifest containing train/validation/test samples.",
+    )
+    parser.add_argument(
+        "--data_root",
+        type=str,
+        default="",
+        help="Parent directory used to resolve dataset_path values in --dataset_manifest.",
+    )
+    parser.add_argument(
+        "--eval_only",
+        action="store_true",
+        help="Load --resume_path and evaluate one manifest split without training.",
+    )
+    parser.add_argument(
+        "--eval_split",
+        choices=["validation", "test"],
+        default="validation",
+        help="Manifest split evaluated by --eval_only.",
+    )
+    parser.add_argument(
+        "--split_dir",
+        type=str,
+        default="",
+        help=(
+            "Directory containing frame-level train.csv/val.csv/test.csv, or where they should be created. "
+            "Existing complete split files are reused."
+        ),
+    )
+    parser.add_argument(
+        "--train_split_csv",
+        type=str,
+        default="",
+        help="CSV of frame_id values to use for training. Overrides --split_dir/train.csv when provided.",
+    )
+    parser.add_argument(
+        "--val_split_csv",
+        type=str,
+        default="",
+        help="CSV of frame_id values to use for validation during training. Overrides --split_dir/val.csv.",
+    )
+    parser.add_argument(
+        "--test_split_csv",
+        type=str,
+        default="",
+        help=(
+            "CSV of frame_id values reserved for final test evaluation. "
+            "It is checked/logged but not used by the training loop."
+        ),
+    )
+    parser.add_argument(
+        "--split_ratios",
+        type=str,
+        default="0.8,0.1,0.1",
+        help="Train,val,test ratios used when --split_dir needs to create split CSVs. Values are normalized.",
+    )
+    parser.add_argument(
+        "--recreate_splits",
+        action="store_true",
+        help="Overwrite train.csv/val.csv/test.csv under --split_dir.",
     )
     parser.add_argument(
         "--reference_dir",
         type=str,
-        default="/sata1/data/kevin/v2_3d/v2_usds/v2_stl_render_0212",
+        default="",
         help="Path to reference renders.",
     )
     #"0,3,6,9"
@@ -1316,13 +1611,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--seed",
         type=int,
-        default=0,
+        default=42,
         help="Random seed for Python, NumPy, and PyTorch.",
     )
     parser.add_argument(
         "--resume_path",
         type=str,
-        default="finetune_exemplar/run_20260321_202844/finetune_epoch_006.pth",
+        default="",
         help="Path to a finetune checkpoint (.pth) to resume from.",
     )
     parser.add_argument(
@@ -1332,7 +1627,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--resume_in_place",
-        default= False,
+        action="store_true",
         help="When resuming, save checkpoints into the original run directory.",
     )
     return parser.parse_args()
@@ -1351,6 +1646,19 @@ def create_run_dir(base_dir: str) -> str:
             os.makedirs(candidate, exist_ok=True)
             return candidate
     raise RuntimeError(f"Unable to create run directory under {base_dir}")
+
+
+def initialize_metrics_log(metrics_path: Path) -> None:
+    if metrics_path.is_file() and metrics_path.stat().st_size > 0:
+        return
+    with metrics_path.open("w", newline="") as handle:
+        csv.DictWriter(handle, fieldnames=METRIC_FIELDS).writeheader()
+
+
+def append_metric(metrics_path: Path, **values: object) -> None:
+    row = {field: values.get(field, "") for field in METRIC_FIELDS}
+    with metrics_path.open("a", newline="") as handle:
+        csv.DictWriter(handle, fieldnames=METRIC_FIELDS).writerow(row)
 
 
 def load_finetune_checkpoint(
@@ -1388,11 +1696,7 @@ def run_exemplar_eval(
     detmodel,
     config: EvalConfig,
     device: torch.device,
-) -> Tuple[float, int, float]:
-    dataset_roots = normalize_dataset_roots(config.dataset_root)
-    if not dataset_roots:
-        raise ValueError("No eval dataset roots provided.")
-
+) -> Tuple[float, int, float, float]:
     ref_view_ids = parse_ref_view_ids(config.ref_view_ids)
     if not ref_view_ids:
         raise ValueError("No eval reference view ids resolved.")
@@ -1400,17 +1704,28 @@ def run_exemplar_eval(
     reference_dir = Path(config.reference_dir).expanduser().resolve()
     if not reference_dir.is_dir():
         raise FileNotFoundError(reference_dir)
+    split_path = Path(config.split_csv).expanduser().resolve() if config.split_csv else None
+    if split_path is not None and not split_path.is_file():
+        raise FileNotFoundError(split_path)
 
     all_entries: List[Dict[str, str]] = []
-    for root, multiplier, use_filter in dataset_roots:
-        _, cur_entries = collect_multi_object_samples(root)
-        cur_entries = unique_object_entries(cur_entries)
-        if use_filter:
-            filter_path = resolve_dataset_filter_path(root)
-            if filter_path is not None:
-                cur_entries = apply_dataset_filter_entries(cur_entries, filter_path)
-        cur_entries = apply_dataset_multiplier(cur_entries, multiplier)
-        all_entries.extend(cur_entries)
+    if config.dataset_entries is not None:
+        all_entries = list(config.dataset_entries)
+    else:
+        dataset_roots = normalize_dataset_roots(config.dataset_root)
+        if not dataset_roots:
+            raise ValueError("No eval dataset roots or manifest entries provided.")
+        for root, multiplier, use_filter in dataset_roots:
+            _, cur_entries = collect_multi_object_samples(root)
+            cur_entries = unique_object_entries(cur_entries)
+            if use_filter:
+                filter_path = resolve_dataset_filter_path(root)
+                if filter_path is not None:
+                    cur_entries = apply_dataset_filter_entries(cur_entries, filter_path)
+            if split_path is not None:
+                cur_entries = apply_dataset_filter_entries(cur_entries, split_path)
+            cur_entries = apply_dataset_multiplier(cur_entries, multiplier)
+            all_entries.extend(cur_entries)
     if not all_entries:
         raise RuntimeError("No eval dataset entries found.")
 
@@ -1423,6 +1738,8 @@ def run_exemplar_eval(
     total_iou_sum = 0.0
     total_iou_count = 0
     total_correct = 0
+    total_loss_sum = 0.0
+    total_loss_count = 0
     batch_step = 0
     pq_iou_threshold = 0.5
     pq_score_thresholds = [round(0.10 + 0.01 * idx, 2) for idx in range(30)]
@@ -1505,6 +1822,7 @@ def run_exemplar_eval(
                     group_map[shape_key].append(idx)
 
                 batch_ious: List[float] = []
+                batch_losses: List[float] = []
                 batch_correct = 0
                 for _, idxs in group_map.items():
                     img_batch = torch.cat([prepared[i]["img_tensor"] for i in idxs], dim=0)
@@ -1555,6 +1873,23 @@ def run_exemplar_eval(
                         if not gt_down_list:
                             continue
 
+                        val_loss = compute_multi_gt_detection_loss(
+                            mask_preds[local_idx].float(),
+                            box_preds[local_idx],
+                            det_scores_logits[local_idx],
+                            gt_down_list,
+                            bce_weight=config.bce_weight,
+                            dice_weight=config.dice_weight,
+                            bbox_weight=config.bbox_weight,
+                            score_weight=config.score_weight,
+                            no_object_weight=config.no_object_weight,
+                        )
+                        if val_loss is not None:
+                            val_loss_float = float(val_loss.item())
+                            batch_losses.append(val_loss_float)
+                            total_loss_sum += val_loss_float
+                            total_loss_count += 1
+
                         boxes_nms, masks_nms, scores_nms = apply_mask_nms(
                             box_preds[local_idx],
                             mask_preds[local_idx],
@@ -1593,11 +1928,13 @@ def run_exemplar_eval(
                             batch_correct += 1
                             total_correct += 1
 
-                if batch_ious:
-                    avg_iou = sum(batch_ious) / max(1, len(batch_ious))
+                if batch_ious or batch_losses:
+                    avg_iou = sum(batch_ious) / max(1, len(batch_ious)) if batch_ious else 0.0
                     correct_rate = batch_correct / max(1, len(batch_ious))
+                    avg_loss = sum(batch_losses) / max(1, len(batch_losses)) if batch_losses else float("nan")
+                    loss_part = f" val_loss={avg_loss:.4f}" if np.isfinite(avg_loss) else ""
                     print(
-                        f"[eval] step={batch_step} avg_iou={avg_iou:.4f} "
+                        f"[eval] step={batch_step}{loss_part} avg_iou={avg_iou:.4f} "
                         f"correct_rate={correct_rate:.3f} samples={len(batch_ious)}"
                     )
 
@@ -1610,6 +1947,7 @@ def run_exemplar_eval(
     if total_iou_count > 0:
         overall_avg = total_iou_sum / total_iou_count
         overall_correct = total_correct / total_iou_count
+        overall_loss = total_loss_sum / total_loss_count if total_loss_count > 0 else float("nan")
         for score_threshold in sorted(pq_stats.keys()):
             stats = pq_stats[score_threshold]
             denom = stats["tp"] + 0.5 * stats["fp"] + 0.5 * stats["fn"]
@@ -1621,7 +1959,7 @@ def run_exemplar_eval(
                 f"[eval] PQ@score>={score_threshold:.2f}={pq:.4f} "
                 f"tp={int(stats['tp'])} fp={int(stats['fp'])} fn={int(stats['fn'])}"
             )
-        return overall_avg, total_iou_count, overall_correct
+        return overall_avg, total_iou_count, overall_correct, overall_loss
     for score_threshold in sorted(pq_stats.keys()):
         stats = pq_stats[score_threshold]
         denom = stats["tp"] + 0.5 * stats["fp"] + 0.5 * stats["fn"]
@@ -1633,7 +1971,8 @@ def run_exemplar_eval(
             f"[eval] PQ@score>={score_threshold:.2f}={pq:.4f} "
             f"tp={int(stats['tp'])} fp={int(stats['fp'])} fn={int(stats['fn'])}"
         )
-    return 0.0, 0, 0.0
+    overall_loss = total_loss_sum / total_loss_count if total_loss_count > 0 else float("nan")
+    return 0.0, 0, 0.0, overall_loss
 
 
 def main() -> None:
@@ -1646,9 +1985,40 @@ def main() -> None:
         torch.cuda.manual_seed_all(args.seed)
     print(f"Using random seed {args.seed}")
 
-    dataset_roots = normalize_dataset_roots(args.dataset_root)
-    if not dataset_roots:
-        raise ValueError("No dataset roots provided.")
+    manifest_path = Path(args.dataset_manifest).expanduser().resolve() if args.dataset_manifest else None
+    data_root = Path(args.data_root).expanduser().resolve() if args.data_root else None
+    legacy_split_requested = any(
+        (args.split_dir, args.train_split_csv, args.val_split_csv, args.test_split_csv, args.recreate_splits)
+    )
+    if manifest_path is not None:
+        if args.dataset_root:
+            raise ValueError("--dataset_manifest and --dataset_root are mutually exclusive.")
+        if legacy_split_requested:
+            raise ValueError("Manifest mode cannot be combined with legacy split CSV arguments.")
+        if data_root is None:
+            raise ValueError("--data_root is required with --dataset_manifest.")
+        manifest_rows, manifest_summary = load_manifest(manifest_path, data_root, validate_files=True)
+        dataset_roots: List[Tuple[str, float, bool]] = []
+        print(f"Loaded manifest {manifest_path} (sha256={manifest_sha256(manifest_path)})")
+        print(json.dumps(manifest_summary, indent=2, sort_keys=True))
+    else:
+        manifest_rows = []
+        manifest_summary = {}
+        dataset_roots = normalize_dataset_roots(args.dataset_root)
+        if not dataset_roots:
+            raise ValueError("Provide --dataset_manifest with --data_root, or deprecated --dataset_root.")
+        warnings.warn(
+            "--dataset_root is deprecated; create a versioned manifest for reproducible multi-dataset training.",
+            FutureWarning,
+            stacklevel=2,
+        )
+        if args.eval_only:
+            raise ValueError("--eval_only requires --dataset_manifest.")
+
+    if not args.reference_dir:
+        raise ValueError("--reference_dir is required.")
+    if args.eval_only and not args.resume_path:
+        raise ValueError("--eval_only requires an explicit --resume_path checkpoint.")
 
     ref_view_ids = parse_ref_view_ids(args.ref_view_ids)
     if not ref_view_ids:
@@ -1714,26 +2084,152 @@ def main() -> None:
     args.output_dir = run_dir
     debug_dir = os.path.join(run_dir, "debug_boxes")
     os.makedirs(debug_dir, exist_ok=True)
+    metrics_path = Path(run_dir) / "metrics.csv"
+    initialize_metrics_log(metrics_path)
+    if manifest_path is not None:
+        manifest_copy = Path(run_dir) / "dataset_manifest.csv"
+        shutil.copy2(manifest_path, manifest_copy)
+        provenance = {
+            "manifest_source": str(manifest_path),
+            "manifest_copy": str(manifest_copy),
+            "manifest_sha256": manifest_sha256(manifest_path),
+            "data_root": str(data_root),
+            "sampling_policy": "equal_domain_with_replacement",
+            "manifest_summary": manifest_summary,
+            "args": vars(args),
+        }
+        with (Path(run_dir) / "run_config.json").open("w") as handle:
+            json.dump(provenance, handle, indent=2, sort_keys=True, default=str)
 
-    object_samples: Dict[str, List[Dict[str, str]]] = {}
-    all_entries: List[Dict[str, str]] = []
+    # Split handling is frame-level. Build or load split CSVs before training
+    # entries are multiplied so duplicate sampling cannot move data across
+    # train/validation/test boundaries.
+    split_dir = Path(args.split_dir).expanduser().resolve() if args.split_dir else None
+    train_split_csv = Path(args.train_split_csv).expanduser().resolve() if args.train_split_csv else None
+    val_split_csv = Path(args.val_split_csv).expanduser().resolve() if args.val_split_csv else None
+    test_split_csv = Path(args.test_split_csv).expanduser().resolve() if args.test_split_csv else None
+    if split_dir is not None:
+        if train_split_csv is None:
+            train_split_csv = split_dir / "train.csv"
+        if val_split_csv is None:
+            val_split_csv = split_dir / "val.csv"
+        if test_split_csv is None:
+            test_split_csv = split_dir / "test.csv"
+
+    dataset_parts: List[Tuple[str, float, List[Dict[str, str]]]] = []
+    all_frame_ids: set = set()
     for root, multiplier, use_filter in dataset_roots:
-        cur_samples, cur_entries = collect_multi_object_samples(root)
-        for obj_id, entries in cur_samples.items():
-            object_samples.setdefault(obj_id, []).extend(entries)
+        _, cur_entries = collect_multi_object_samples(root)
         cur_entries = unique_frame_entries(cur_entries)
         if use_filter:
             filter_path = resolve_dataset_filter_path(root)
             if filter_path is not None:
                 cur_entries = apply_dataset_filter_entries(cur_entries, filter_path)
+        all_frame_ids.update(entry["frame_id"] for entry in cur_entries)
+        dataset_parts.append((root, multiplier, cur_entries))
+
+    if split_dir is not None:
+        # First run: create train/val/test CSVs. Later runs: reuse them so
+        # checkpoints remain comparable unless --recreate_splits is explicit.
+        ratios = parse_split_ratios(args.split_ratios)
+        train_path, val_path, test_path = create_frame_split_csvs(
+            split_dir,
+            sorted(all_frame_ids),
+            ratios,
+            seed=args.seed,
+            overwrite=args.recreate_splits,
+        )
+        print(f"Using split CSVs: train={train_path} val={val_path} test={test_path}")
+
+    for split_name, split_path in (
+        ("train", train_split_csv),
+        ("val", val_split_csv),
+        ("test", test_split_csv),
+    ):
+        if split_path is not None and not split_path.is_file():
+            raise FileNotFoundError(f"Missing {split_name} split CSV: {split_path}")
+
+    if train_split_csv is not None:
+        train_frame_ids = load_split_frame_ids(train_split_csv)
+        print(f"Train split: {len(train_frame_ids)} frame ids from {train_split_csv}")
+    if val_split_csv is not None:
+        val_frame_ids = load_split_frame_ids(val_split_csv)
+        print(f"Validation split: {len(val_frame_ids)} frame ids from {val_split_csv}")
+    if test_split_csv is not None:
+        test_frame_ids = load_split_frame_ids(test_split_csv)
+        print(f"Test split reserved: {len(test_frame_ids)} frame ids from {test_split_csv}")
+
+    all_entries: List[Dict[str, str]] = []
+    for _, multiplier, cur_entries in dataset_parts:
+        if train_split_csv is not None:
+            cur_entries = apply_dataset_filter_entries(cur_entries, train_split_csv)
         cur_entries = apply_dataset_multiplier(cur_entries, multiplier)
         all_entries.extend(cur_entries)
+    entries_by_dataset: Dict[str, List[Dict[str, str]]] = {}
+    if manifest_rows:
+        train_rows = [row for row in manifest_rows if row.split == "train"]
+        all_entries = entries_from_manifest_rows(train_rows, data_root, object_level=False)
+        for entry in all_entries:
+            entries_by_dataset.setdefault(entry["dataset_id"], []).append(entry)
     if not all_entries:
         raise RuntimeError("No dataset entries found.")
+    train_frames = {(entry.get("dataset_id", "legacy"), entry["frame_id"]) for entry in all_entries}
+    print(f"Training entries: {len(all_entries)} frames/views from {len(train_frames)} dataset-qualified frames.")
+    if entries_by_dataset:
+        print(f"Equal-domain training pools: { {key: len(value) for key, value in sorted(entries_by_dataset.items())} }")
 
     reference_dir = Path(args.reference_dir).expanduser().resolve()
     if not reference_dir.is_dir():
         raise FileNotFoundError(reference_dir)
+
+    validation_config: Optional[EvalConfig] = None
+    if manifest_rows:
+        validation_rows = [row for row in manifest_rows if row.split == "validation"]
+        validation_entries = entries_from_manifest_rows(validation_rows, data_root, object_level=True)
+        validation_config = EvalConfig(
+            dataset_root=None,
+            dataset_entries=validation_entries,
+            reference_dir=args.reference_dir,
+            ref_view_ids=args.ref_view_ids,
+            max_side_length=args.max_side_length,
+            use_square_sizing=not args.no_square,
+            num_points_approx=args.num_points_approx,
+            batch_size=args.batch_size,
+            det_filter=args.det_filter,
+            nms_iou=args.nms_iou,
+            matches_per_gt=args.matches_per_gt,
+            bce_weight=args.bce_weight,
+            dice_weight=args.dice_weight,
+            bbox_weight=args.bbox_weight,
+            score_weight=args.score_weight,
+            no_object_weight=args.no_object_weight,
+            shuffle=False,
+            max_batches=0,
+        )
+    elif val_split_csv is not None:
+        # Validation uses the same dataset roots and exemplar renders as
+        # training, but filters entries through val.csv and disables training
+        # augmentation inside run_exemplar_eval.
+        validation_config = EvalConfig(
+            dataset_root=args.dataset_root,
+            reference_dir=args.reference_dir,
+            ref_view_ids=args.ref_view_ids,
+            split_csv=str(val_split_csv),
+            max_side_length=args.max_side_length,
+            use_square_sizing=not args.no_square,
+            num_points_approx=args.num_points_approx,
+            batch_size=args.batch_size,
+            det_filter=args.det_filter,
+            nms_iou=args.nms_iou,
+            matches_per_gt=args.matches_per_gt,
+            bce_weight=args.bce_weight,
+            dice_weight=args.dice_weight,
+            bbox_weight=args.bbox_weight,
+            score_weight=args.score_weight,
+            no_object_weight=args.no_object_weight,
+            shuffle=False,
+            max_batches=0,
+        )
 
     ref_cache: Dict[str, torch.Tensor] = {}
     ref_image_cache: Dict[str, List[np.ndarray]] = {}
@@ -1742,29 +2238,91 @@ def main() -> None:
     running_losses: deque[float] = deque(maxlen=5)
     running_top_ious: deque[float] = deque(maxlen=5)
 
+    if args.eval_only:
+        eval_rows = [row for row in manifest_rows if row.split == args.eval_split]
+        eval_entries = entries_from_manifest_rows(eval_rows, data_root, object_level=True)
+        eval_config = EvalConfig(
+            dataset_root=None,
+            dataset_entries=eval_entries,
+            reference_dir=args.reference_dir,
+            ref_view_ids=args.ref_view_ids,
+            max_side_length=args.max_side_length,
+            use_square_sizing=not args.no_square,
+            num_points_approx=args.num_points_approx,
+            batch_size=args.batch_size,
+            det_filter=args.det_filter,
+            nms_iou=args.nms_iou,
+            matches_per_gt=args.matches_per_gt,
+            bce_weight=args.bce_weight,
+            dice_weight=args.dice_weight,
+            bbox_weight=args.bbox_weight,
+            score_weight=args.score_weight,
+            no_object_weight=args.no_object_weight,
+            shuffle=False,
+            max_batches=0,
+        )
+        eval_avg, eval_count, eval_correct, eval_loss = run_exemplar_eval(detmodel, eval_config, device=device)
+        append_metric(
+            metrics_path,
+            phase=f"eval_{args.eval_split}",
+            epoch=start_epoch - 1,
+            global_step=global_step,
+            batch_step=batch_step,
+            loss=eval_loss,
+            avg_iou=eval_avg,
+            correct_rate=eval_correct,
+            samples=eval_count,
+        )
+        print(
+            f"[eval:{args.eval_split}] loss={eval_loss:.4f} avg_iou={eval_avg:.4f} "
+            f"correct_rate={eval_correct:.3f} samples={eval_count}"
+        )
+        return
+
     if start_epoch > args.epochs:
         print(f"Resume epoch {start_epoch - 1} exceeds requested --epochs={args.epochs}. Nothing to do.")
         return
 
     for epoch in range(start_epoch, args.epochs + 1):
-        if epoch != start_epoch:
-            eval_avg, eval_count, eval_correct = run_exemplar_eval(detmodel, EVAL_CONFIG, device=device)
+        if epoch != start_epoch and validation_config is not None:
+            eval_avg, eval_count, eval_correct, eval_loss = run_exemplar_eval(
+                detmodel, validation_config, device=device
+            )
+            append_metric(
+                metrics_path,
+                phase="validation",
+                epoch=epoch - 1,
+                global_step=global_step,
+                batch_step=batch_step,
+                loss=eval_loss,
+                avg_iou=eval_avg,
+                correct_rate=eval_correct,
+                samples=eval_count,
+            )
             if eval_count > 0:
+                loss_part = f" val_loss={eval_loss:.4f}" if np.isfinite(eval_loss) else ""
                 print(
-                    f"[eval] epoch={epoch} avg_iou={eval_avg:.4f} "
+                    f"[eval] epoch={epoch}{loss_part} avg_iou={eval_avg:.4f} "
                     f"correct_rate={eval_correct:.3f} samples={eval_count}"
                 )
             else:
-                print(f"[eval] epoch={epoch} no valid samples")
+                loss_part = f" val_loss={eval_loss:.4f}" if np.isfinite(eval_loss) else ""
+                print(f"[eval] epoch={epoch}{loss_part} no valid samples")
 
-        random.shuffle(all_entries)
+        if entries_by_dataset:
+            epoch_entries = balanced_epoch_entries(
+                entries_by_dataset, epoch_size=len(all_entries), seed=args.seed, epoch=epoch
+            )
+        else:
+            epoch_entries = list(all_entries)
+            random.shuffle(epoch_entries)
         epoch_loss = 0.0
         epoch_count = 0
         epoch_iou_sum = 0.0
         epoch_iou_count = 0
 
-        for start in range(0, len(all_entries), args.batch_size):
-            subset = all_entries[start : start + args.batch_size]
+        for start in range(0, len(epoch_entries), args.batch_size):
+            subset = epoch_entries[start : start + args.batch_size]
             prepared: List[Dict[str, object]] = []
             for entry in subset:
                 try:
@@ -1875,49 +2433,19 @@ def main() -> None:
                         continue
 
                     logits_mhw = mask_preds[local_idx].float()
-                    o2o_matches, o2o_iou = match_predictions_to_gts_hungarian(
+                    loss = compute_multi_gt_detection_loss(
                         logits_mhw,
+                        box_preds[local_idx],
+                        det_scores_logits[local_idx],
                         gt_targets,
-                        max_matches=None,
-                    )
-                    o2m_matches, o2m_iou = match_predictions_to_gts_greedy_k(
-                        logits_mhw,
-                        gt_targets,
-                        max_matches=None,
-                        max_per_gt=12,
-                    )
-                    matched_losses = compute_matched_mask_losses(
-                        logits_mhw,
-                        gt_targets,
-                        o2m_matches,
                         bce_weight=args.bce_weight,
                         dice_weight=args.dice_weight,
+                        bbox_weight=args.bbox_weight,
+                        score_weight=args.score_weight,
+                        no_object_weight=args.no_object_weight,
                     )
-                    loss_mask = torch.stack(matched_losses).mean()
-                    loss_bbox = compute_bbox_l1_loss_from_matches(
-                        box_preds[local_idx],
-                        gt_targets,
-                        o2m_matches,
-                    )
-                    loss_presence = compute_presence_loss_logits(
-                        det_scores_logits[local_idx],
-                        o2m_matches,
-                        o2m_iou,
-                        pos_weight=args.score_weight,
-                        neg_weight=args.no_object_weight,
-                        alpha=0.5,
-                        use_focal=False,
-                        focal_alpha=0.25,
-                        focal_gamma=4.0,
-                        focal_weight=300.0,
-                    )
-                    loss_weighted_mask = compute_score_weighted_mask_loss_from_matches(
-                        det_scores[local_idx],
-                        o2m_matches,
-                        matched_losses,
-                        power=2.0,
-                    )
-                    loss = loss_mask * 2.0 + loss_presence + args.bbox_weight * loss_bbox
+                    if loss is None:
+                        continue
                     batch_losses.append(loss)
 
                     scores = det_scores[local_idx]
@@ -1988,10 +2516,21 @@ def main() -> None:
 
             epoch_loss += float(batch_loss.item())
             epoch_count += 1
+            avg_loss = epoch_loss / epoch_count
+            avg_epoch_iou = epoch_iou_sum / max(1, epoch_iou_count)
+            append_metric(
+                metrics_path,
+                phase="train_batch",
+                epoch=epoch,
+                global_step=global_step,
+                batch_step=batch_step,
+                loss=float(batch_loss.item()),
+                avg_loss=avg_loss,
+                avg_iou=avg_epoch_iou,
+                samples=len(batch_losses),
+            )
 
             if args.log_every > 0 and global_step % args.log_every == 0:
-                avg_loss = epoch_loss / max(1, epoch_count)
-                avg_epoch_iou = epoch_iou_sum / max(1, epoch_iou_count)
                 running_avg = sum(running_losses) / max(1, len(running_losses))
                 running_iou = sum(running_top_ious) / max(1, len(running_top_ious))
                 print(
@@ -2014,6 +2553,17 @@ def main() -> None:
                     },
                     save_path,
                 )
+        if epoch_count > 0:
+            append_metric(
+                metrics_path,
+                phase="train_epoch",
+                epoch=epoch,
+                global_step=global_step,
+                batch_step=batch_step,
+                avg_loss=epoch_loss / epoch_count,
+                avg_iou=epoch_iou_sum / max(1, epoch_iou_count),
+                samples=epoch_count,
+            )
         if args.save_every > 0 and epoch % args.save_every == 0:
             save_path = os.path.join(args.output_dir, f"finetune_epoch_{epoch:03d}.pth")
             torch.save(
@@ -2030,6 +2580,32 @@ def main() -> None:
                 save_path,
             )
             print(f"Saved checkpoint to {save_path}")
+
+        # Earlier epochs are validated at the start of the following epoch.
+        # The final epoch has no following iteration, so evaluate it here too.
+        if epoch == args.epochs and validation_config is not None:
+            eval_avg, eval_count, eval_correct, eval_loss = run_exemplar_eval(
+                detmodel, validation_config, device=device
+            )
+            append_metric(
+                metrics_path,
+                phase="validation",
+                epoch=epoch,
+                global_step=global_step,
+                batch_step=batch_step,
+                loss=eval_loss,
+                avg_iou=eval_avg,
+                correct_rate=eval_correct,
+                samples=eval_count,
+            )
+            loss_part = f" val_loss={eval_loss:.4f}" if np.isfinite(eval_loss) else ""
+            if eval_count > 0:
+                print(
+                    f"[eval] epoch={epoch}{loss_part} avg_iou={eval_avg:.4f} "
+                    f"correct_rate={eval_correct:.3f} samples={eval_count}"
+                )
+            else:
+                print(f"[eval] epoch={epoch}{loss_part} no valid samples")
 
     print("Done.")
 

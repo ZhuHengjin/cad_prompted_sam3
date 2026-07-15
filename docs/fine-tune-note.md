@@ -1,221 +1,88 @@
-# Fine-Tuning Notes for LEGO SAM3
+# Brick SAM Fine-Tuning
 
-This note summarizes how to continue fine-tuning the LEGO SAM3 model using the existing primary checkpoint and the new synthetic data.
+Use `finetune_image_exemplar_multi_gt.py` with the versioned manifest described in [finetune-split-behavior.md](finetune-split-behavior.md).
 
-## Paths
-
-- Repo: `/home/henryzhu/repos/cad_prompted_sam3`
-- Base SAM3 weights: `/home/henryzhu/repos/LegoSegmentation/weights/sam3.pt`
-- Primary LEGO fine-tuned checkpoint: `/home/henryzhu/repos/LegoSegmentation/weights/lego_sam3_runB_e80.pth`
-- Training data parent: `/home/henryzhu/data/brick_sam_sdg/run_500_scenes_yaw20_not_stud_aligned`
-- Exemplar renders: `/home/henryzhu/repos/LegoSegmentation/exemplars/renders`
-
-The data parent contains camera folders:
-
-- `Side_Camera_0`
-- `Side_Camera_1`
-- `Side_Camera_2`
-- `Side_Camera_3`
-
-Pass these camera folders directly to the training script. The script does not recursively discover them from the parent directory.
-
-## Dataset Split
-
-Split the data before fine-tuning if this run is meant to produce a model you will evaluate or compare.
-
-Recommended split:
-
-- Train: 70-80%
-- Validation: 10-15%
-- Test: 10-15%
-
-Split by frame or scene ID, not by individual object instance. Keep the same frame ID in the same split across all camera folders. For example, frame `0042` should be train, validation, or test for every `Side_Camera_*`, never split across cameras.
-
-Use the splits like this:
-
-- Train: used for optimizer updates.
-- Validation: used to choose checkpoint, tune epochs, LR, and catch overfitting.
-- Test: untouched until the final report.
-
-Use `finetune_image_exemplar_multi_gt_split.py` for split-aware training. It supports split CSVs via `--split_dir`, or explicit `--train_split_csv`, `--val_split_csv`, and `--test_split_csv` paths.
-
-## Recommended Continuation Command
-
-Run this from the repo root using the existing Python/CUDA environment that already has PyTorch installed.
+Set the local model and exemplar-render paths before running:
 
 ```bash
-cd /home/henryzhu/repos/cad_prompted_sam3
+DATA_ROOT=/home/hengjinz/data/brick_sam_sdg
+MANIFEST="$DATA_ROOT/splits/v1/manifest.csv"
+MODEL=/path/to/sam3.pt
+REFS=/path/to/brick/exemplar/renders
+OUTPUT=finetune_exemplar
+```
 
-DATA=/home/henryzhu/data/brick_sam_sdg/run_500_scenes_yaw20_not_stud_aligned
-WEIGHTS=/home/henryzhu/repos/LegoSegmentation/weights
-REFS=/home/henryzhu/repos/LegoSegmentation/exemplars/renders
+## Train
 
-python finetune_image_exemplar_multi_gt_split.py \
-  --model_path "$WEIGHTS/sam3.pt" \
-  --resume_path "$WEIGHTS/lego_sam3_runB_e80.pth" \
-  --dataset_root "$DATA/Side_Camera_0,$DATA/Side_Camera_1,$DATA/Side_Camera_2,$DATA/Side_Camera_3" \
+```bash
+python3 finetune_image_exemplar_multi_gt.py \
+  --model_path "$MODEL" \
+  --dataset_manifest "$MANIFEST" \
+  --data_root "$DATA_ROOT" \
   --reference_dir "$REFS" \
-  --split_dir splits/lego_yaw20 \
-  --split_ratios 0.8,0.1,0.1 \
-  --ref_view_ids 0,1,2,3,4,5,6,7,8,9,10,11 \
-  --epochs 100 \
-  --batch_size 4 \
-  --grad_accum 12 \
-  --lr 1e-4 \
-  --device cuda:0 \
-  --save_every 5 \
-  --save_debug_every 0 \
-  --output_dir finetune_exemplar_lego_continue
+  --output_dir "$OUTPUT" \
+  --seed 42
 ```
 
-Save the terminal output when launching a run, because the script prints training and validation metrics to stdout. Use `python -u` plus `tee` so the log updates promptly and is still visible in the terminal:
+The two training domains contribute 50/50 samples while the overall epoch size remains equal to the number of unique training views.
+
+At startup, the trainer validates all 2,253 manifest rows, prints the manifest checksum and per-dataset split summary, and resolves 1,808 training views. The unbalanced train pools contain 1,513 wrist views and 295 side-camera views; deterministic epoch construction draws 904 entries from each.
+
+Validation is performed after every completed epoch, including the final epoch. It uses all 230 validation views without training augmentation or domain oversampling. A view can contribute multiple evaluation targets when its mapping contains multiple brick labels.
+
+## Resume
+
+For the current Run B epoch-80 continuation, run:
 
 ```bash
-python -u finetune_image_exemplar_multi_gt_split.py \
-  ...same training args... \
-  2>&1 | tee -a finetune_exemplar_lego_continue/train.log
+bash scripts/train_brick_manifest_runb_e80.sh
 ```
 
-For a continuation inside an existing run directory, append to a run-specific log:
+The script resumes through epoch 180 (100 additional epochs), uses GPU 2, and creates a new run directory. It starts at `batch_size=2` because the 1008px exemplar model exhausted a 48 GiB GPU at batch size 13; `grad_accum=12` is retained.
+
+For a custom resume checkpoint:
 
 ```bash
-RUN=finetune_exemplar_lego_continue/run_20260707_150733
-
-python -u finetune_image_exemplar_multi_gt_split.py \
-  ...same training args... \
-  --resume_path "$RUN/finetune_epoch_100.pth" \
+python3 finetune_image_exemplar_multi_gt.py \
+  --model_path "$MODEL" \
+  --dataset_manifest "$MANIFEST" \
+  --data_root "$DATA_ROOT" \
+  --reference_dir "$REFS" \
+  --resume_path /path/to/finetune_epoch_006.pth \
   --resume_in_place \
-  --epochs 120 \
-  2>&1 | tee -a "$RUN/train_continue_e101_e120.log"
+  --seed 42
 ```
 
-After training, generate loss and metric plots from the saved log:
+Keep the same manifest and seed when resuming; epoch sampling is derived from `seed + epoch`.
+
+`--resume_in_place` writes new checkpoints and refreshed provenance into the checkpoint's existing run directory. Without it, resuming creates a new timestamped run directory while retaining checkpoint-compatible module keys.
+
+## Final test evaluation
+
+Select the checkpoint using validation results, then run the untouched test split explicitly:
 
 ```bash
-uv run --with matplotlib python plot_finetune_log.py \
-  "$RUN/train_continue_e101_e120.log" \
-  --out-dir "$RUN"
-```
-
-`--epochs` is the final target epoch, not the number of additional epochs. Since `lego_sam3_runB_e80.pth` is the epoch-80 primary checkpoint, `--epochs 100` means continue for about 20 more epochs.
-
-With `--split_dir splits/lego_yaw20`, the script creates or reuses:
-
-- `splits/lego_yaw20/train.csv`
-- `splits/lego_yaw20/val.csv`
-- `splits/lego_yaw20/test.csv`
-
-The split is by `frame_id`, so matching frame IDs stay together across all four side cameras. Training uses `train.csv`; validation during training uses `val.csv`; `test.csv` is reserved for final evaluation and is not used during training. Validation logs `val_loss` alongside task metrics such as `avg_iou`, `correct_rate`, and PQ stats.
-
-## Practical Notes
-
-- The multi-GT script reloads the fine-tuned model modules from `--resume_path`.
-- In the current script, optimizer loading is commented out, so continuation is a weight warm-start with a fresh AdamW optimizer.
-- If CUDA memory is tight, reduce `--batch_size` first and keep `--grad_accum` high enough to preserve the effective batch size.
-- Keep `--save_debug_every 0` for routine training to avoid extra disk usage. Enable it briefly if you need visual debugging.
-- Free disk space before launching. Checkpoints are large, and the root filesystem was nearly full during setup.
-
-## After Training
-
-1. Inspect logs for training loss and average IoU.
-2. Review validation loss and validation metrics, not just training performance.
-3. Pick the best checkpoint based on validation metrics.
-4. Run the held-out test set once for final numbers.
-5. Archive the chosen checkpoint with the exact command, data split, and commit hash used for the run.
-
-## Commands
-
-### Resume in place
-```bash
-cd /home/henryzhu/repos/cad_prompted_sam3
-
-DATA=/home/henryzhu/data/brick_sam_sdg/run_500_scenes_yaw20_not_stud_aligned
-WEIGHTS=/home/henryzhu/repos/LegoSegmentation/weights
-REFS=/home/henryzhu/repos/LegoSegmentation/exemplars/renders
-RUN=/home/henryzhu/repos/cad_prompted_sam3/finetune_exemplar_lego_continue/run_20260707_150733
-LOG="$RUN/train_continue_e121_e160_lr1e-4_$(date +%Y%m%d_%H%M%S).log"
-
-set -o pipefail
-
-python -u finetune_image_exemplar_multi_gt_split.py \
-  --model_path "$WEIGHTS/sam3.pt" \
-  --resume_path "$WEIGHTS/lego_sam3_runB_e80.pth" \
-  --no_resume_optimizer \
-  --resume_in_place True \
-  --dataset_root "$DATA/Side_Camera_0,$DATA/Side_Camera_1,$DATA/Side_Camera_2,$DATA/Side_Camera_3" \
+python3 finetune_image_exemplar_multi_gt.py \
+  --model_path "$MODEL" \
+  --dataset_manifest "$MANIFEST" \
+  --data_root "$DATA_ROOT" \
   --reference_dir "$REFS" \
-  --split_dir splits/lego_yaw20 \
-  --split_ratios 0.8,0.1,0.1 \
-  --ref_view_ids 0,1,2,3,4,5,6,7,8,9,10,11 \
-  --epochs 160 \
-  --batch_size 2 \
-  --grad_accum 12 \
-  --lr 1e-4 \
-  --device cuda:0 \
-  --save_every 5 \
-  --save_debug_every 0 \
-  --output_dir finetune_exemplar_lego_continue \
-  2>&1 | tee -a "$LOG"
+  --resume_path /path/to/best_checkpoint.pth \
+  --eval_only \
+  --eval_split test \
+  --seed 42
 ```
 
-### Resume from initial
+Use `--eval_split validation` for a standalone validation pass. Test data is never evaluated by the training loop.
 
-```bash
-cd /home/henryzhu/repos/cad_prompted_sam3
+## Run artifacts and failure behavior
 
-DATA=/home/henryzhu/data/brick_sam_sdg/run_500_scenes_yaw20_not_stud_aligned_repaired
-WEIGHTS=/home/henryzhu/repos/LegoSegmentation/weights
-REFS=/home/henryzhu/repos/LegoSegmentation/exemplars/renders
-RUN=/home/henryzhu/repos/cad_prompted_sam3/finetune_exemplar_lego_continue/run_$(date +%Y%m%d_%H%M%S)
-LOG="$RUN/train_continue_e81_e160_lr1e-4_$(date +%Y%m%d_%H%M%S).log"
+- `dataset_manifest.csv` is a byte-for-byte copy of the manifest used for the run.
+- `run_config.json` contains its SHA-256 digest, resolved counts and paths, sampling policy, and parsed arguments.
+- `metrics.csv` is durable, append-only training telemetry. It has one `train_batch` row for every successful loss/backpropagation batch, a `train_epoch` summary row, and one `validation` row after each completed epoch. Standalone validation/test runs use `eval_validation` or `eval_test` rows.
+- Checkpoints retain the existing exemplar fusion, detector, segmentation, optimizer, epoch, and step fields.
+- Manifest mode fails before training if paths are missing, rows overlap, provenance is inconsistent, or manifest and legacy dataset arguments are mixed.
+- `--eval_only` requires both a manifest and an explicit `--resume_path`; only `validation` and `test` are accepted evaluation splits.
+- The test split currently contains 215 views and should be run only after selecting a checkpoint from validation behavior.
 
-set -o pipefail
-
-python -u finetune_image_exemplar_multi_gt_split.py \
-  --model_path "$WEIGHTS/sam3.pt" \
-  --resume_path "$WEIGHTS/lego_sam3_runB_e80.pth" \
-  --no_resume_optimizer \
-  --dataset_root "$DATA/Side_Camera_0,$DATA/Side_Camera_1,$DATA/Side_Camera_2,$DATA/Side_Camera_3" \
-  --reference_dir "$REFS" \
-  --split_dir splits/lego_yaw20_repaired \
-  --split_ratios 0.8,0.1,0.1 \
-  --ref_view_ids 0,1,2,3,4,5,6,7,8,9,10,11 \
-  --epochs 160 \
-  --batch_size 2 \
-  --grad_accum 12 \
-  --lr 1e-4 \
-  --device cuda:0 \
-  --save_every 5 \
-  --save_debug_every 0 \
-  --output_dir finetune_exemplar_lego_continue \
-  2>&1 | tee -a "$LOG"
-```
-
-### First command I got
-
-```bash
-cd /home/henryzhu/repos/cad_prompted_sam3
-
-DATA=/home/henryzhu/data/brick_sam_sdg/run_500_scenes_yaw20_not_stud_aligned
-WEIGHTS=/home/henryzhu/repos/LegoSegmentation/weights
-REFS=/home/henryzhu/repos/LegoSegmentation/exemplars/renders
-
-python finetune_image_exemplar_multi_gt_split.py \
-  --model_path "$WEIGHTS/sam3.pt" \
-  --resume_path "$WEIGHTS/lego_sam3_runB_e80.pth" \
-  --dataset_root "$DATA/Side_Camera_0,$DATA/Side_Camera_1,$DATA/Side_Camera_2,$DATA/Side_Camera_3" \
-  --reference_dir "$REFS" \
-  --split_dir splits/lego_yaw20 \
-  --split_ratios 0.8,0.1,0.1 \
-  --ref_view_ids 0,1,2,3,4,5,6,7,8,9,10,11 \
-  --epochs 100 \
-  --batch_size 4 \
-  --grad_accum 12 \
-  --lr 1e-4 \
-  --device cuda:0 \
-  --save_every 5 \
-  --save_debug_every 0 \
-  --output_dir finetune_exemplar_lego_continue
-```
-
-  --resume_path "$RUN/finetune_epoch_120.pth" \
+The exemplar render directory remains external to these datasets and must contain the image/mask naming convention expected by the existing reference loader. The manifest controls scene images and labels; it does not select or package exemplar renders.
