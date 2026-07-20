@@ -32,3 +32,4 @@ dataset_debug
 dataset_filter.csv
 *.csv
 assets/
+.vscode/
