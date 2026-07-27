@@ -39,7 +39,7 @@ CAD render exemplars ─> exemplar encoding  ───┘
               detection tokens + boxes
                     /                \
                    v                  v
-       existing segmentation       new pose head
+       existing segmentation       new pose head <── effective prompted dimensions
                    │                  │
                    └──── mask + box + R + t + pose score
 ```
@@ -85,15 +85,19 @@ R=[r_1\;r_2\;r_3].
 $$
 
 YOPO predicts an unconstrained category-level 3-D size. CAD-Prompted SAM3
-uses the prompted mesh's known metric dimensions directly and does not predict
-object size or scale:
+instead receives the prompted instance's known effective metric dimensions and
+does not predict object size or scale. If the catalog dimensions are $d_{CAD}$
+and Perseve applies rendering scale $s_{render}$, the required prompt input is
 
 $$
-d_{pred}=d_{CAD}.
+d_{prompt}=d_{CAD}\odot s_{render}.
 $$
 
-The CAD dimensions are required metric metadata, not a pose-head output. This
-plan does not include a scale branch, scale residual, or size loss.
+The loader supplies `dimensions_m = d_prompt` during training, and the caller
+supplies the real prompted object's dimensions during inference. These
+dimensions are a pose-head input and metric cue, not a predicted output. This
+plan does not include a scale branch, scale residual, size loss, or a separate
+metric generation mode.
 
 ## Pose-head module
 
@@ -103,6 +107,7 @@ Add a SAMV3CADPoseHead module with the initial interface:
 pose_predictions = pose_head(
     detection_tokens_bnc,
     boxes_xy1xy2_bn22,
+    cad_dimensions_m_b3,
     cad_geometry_tokens_bkc=None,
 )
 ```
@@ -110,21 +115,28 @@ pose_predictions = pose_head(
 The first version should remain small:
 
 1. Convert each box to normalized (cx, cy, w, h).
-2. Concatenate the box with its 256-D detection token.
-3. Pass the result through a shared two-layer MLP with LayerNorm and GELU.
-4. Use separate MLP branches for center residual, log-depth, 6-D rotation,
+2. Normalize `log(cad_dimensions_m_b3)` using training-split statistics and
+   broadcast it across that CAD prompt's candidate tokens.
+3. Concatenate the box and dimension features with the 256-D detection token.
+4. Pass the result through a shared two-layer MLP with LayerNorm and GELU.
+5. Use separate MLP branches for center residual, log-depth, 6-D rotation,
    and pose confidence.
 
 The center branch predicts a residual from the detected box center. The depth
 branch is also box-conditioned, matching the useful dependency in YOPO's
 released configuration.
 
+The dimension input is required in the baseline. It supplies the physical-size
+cue needed to disambiguate monocular translation under Perseve's random object
+scaling. It must not be silently replaced with catalog base dimensions.
+
 After establishing the baseline, add two optional inputs:
 
 - ROI-pooled features from the exemplar-fused image feature map inside each
   predicted box;
-- a CAD geometry token containing metric dimensions, canonical source axes,
-  symmetry, and optionally a learned point-cloud or mesh encoding.
+- a CAD geometry token containing canonical axes, symmetry, and optionally a
+  learned point-cloud or mesh encoding. Effective metric dimensions remain the
+  separate required input above.
 
 Rendered exemplar poses are known during rendering. A later improvement should
 embed each render's camera-to-CAD viewpoint and add it to its exemplar tokens.
@@ -175,6 +187,15 @@ angle sampling. Reflectional symmetry is not automatically a valid rotation:
 include only proper rotations in $SO(3)$ unless the representation explicitly
 supports reflections.
 
+The object catalog is populated by the automatic symmetry-labeling pipeline
+defined in the dataset-format specification. Rotation supervision is enabled
+only for catalog labels with status `verified_auto` or `verified_manual`;
+`needs_review` objects may still contribute segmentation supervision but are
+excluded from pose matching, pose losses, and pose evaluation. Manual
+appearance- or task-based overrides take precedence over a
+geometry-only result. Training, assignment, evaluation, and checkpoint
+provenance must all use the same catalog checksum and symmetry-pipeline version.
+
 ## Dataset contract
 
 [Perseve pose-label and dataset format](perseve-pose-dataset-format.md) is the
@@ -184,17 +205,27 @@ versioned per-frame annotations through the existing CSV manifest.
 
 For each training instance, the loader must provide the format-defined:
 
-- stable `cad_id` and exact instance-mask join;
+- stable `cad_id`, explicit annotation state, pose-training eligibility, and
+  exact logical-RGBA instance-mask join;
 - camera intrinsics $K$ and canonical object-to-camera transform
   `T_cam_from_cad`;
-- fixed canonical CAD dimensions and source axes;
-- symmetry metadata; and
+- catalog `base_dimensions_m`, per-instance `render_scale_xyz`, and required
+  effective `dimensions_m` satisfying
+  $d_{prompt}=d_{CAD}\odot s_{render}$;
+- source-unit conversion, rigid source-to-canonical transform, and canonical
+  axes;
+- symmetry metadata with verification status and pipeline provenance; and
 - available visibility information.
 
 The pose head assumes the format's OpenCV camera frame, metres, column-vector
-transform action, and top-left-pixel-center convention. It predicts no object
-size or scale. Validate the sidecar against the manifest before training and
-store the dataset-format version and checksums with run provenance.
+transform action, top-left-pixel-center convention, logical RGBA masks, and
+inclusive integer `[x_min, y_min, x_max, y_max]` boxes derived from those masks.
+It predicts no object size or scale. Every placed object remains represented in
+the sidecar, including fully occluded, out-of-frame, invalid-geometry, and
+capture-error states, but only eligible visible entries enter pose matching.
+Validate all sidecars and catalogs against the published JSON Schemas and the
+CSV manifest before training. Store the schema version, catalog checksum,
+annotation checksum, and symmetry-pipeline version with run provenance.
 
 ## Matching strategy
 
@@ -203,7 +234,9 @@ with up to 12 predictions assigned to one GT object. Preserve this initially
 for mask, box, and presence training, as documented in
 [current-training-loss.md](current-training-loss.md).
 
-Pose supervision should use one prediction per GT instance:
+Pose supervision should use one prediction per eligible visible GT instance.
+Entries whose `pose_training_eligible` flag is false are retained for audit and
+dataset diagnostics but excluded from pose assignment and losses:
 
 1. Compute the existing mask-IoU matrix.
 2. Select the highest-IoU unique prediction for each GT, or run one-to-one
@@ -245,8 +278,9 @@ The components are:
 
 For each one-to-one pose match, compute the same symmetry-aware rotation error
 used by $L_R$, denoted $e_R$, and metric translation error $e_t$. Let
-$d_{CAD}$ be the supplied CAD bounding-box diagonal and define normalized
-translation error $\tilde e_t=e_t/d_{CAD}$.
+$d_{prompt}$ be the bounding-box diagonal computed from the supplied effective
+`dimensions_m` and define normalized translation error
+$\tilde e_t=e_t/d_{prompt}$.
 
 The confidence target is the soft probability that the pose meets the declared
 task-success tolerances:
@@ -262,7 +296,7 @@ are positive soft-boundary widths; they make near-threshold poses receive
 intermediate targets instead of a brittle binary label. Declare all four values
 in the training configuration before fitting. If the task uses an absolute
 translation tolerance, use $e_t$ and a metre-valued $\theta_t$ instead of
-normalizing by $d_{CAD}$.
+normalizing by $d_{prompt}$.
 
 If $\hat q$ is the pose-score logit, train it directly with
 
@@ -296,11 +330,18 @@ shared detection-token gradients.
 
 ### Stage 0: data and geometry validation
 
+- Validate dataset metadata, object catalogs, and every frame sidecar against
+  the versioned JSON Schemas.
 - Round-trip canonical CAD points through every annotated pose.
 - Reproject object centers and cuboid corners with adjusted intrinsics.
 - Overlay projected CAD geometry on RGB images and instance masks.
-- Verify discrete and continuous symmetry metadata with transformed meshes.
-- Check metric units and the catalog's source-to-canonical transform.
+- Recompute logical-RGBA mask joins and inclusive mask-derived boxes.
+- Check source-unit conversion, rigid source-to-canonical transforms, and
+  `dimensions_m = base_dimensions_m * render_scale_xyz`.
+- Verify repeated `(scene_id, cad_id)` entries share scale and effective
+  dimensions within a scene.
+- Verify automatic discrete and continuous symmetry labels, including their
+  review status, with the exact checksummed canonical meshes.
 
 ### Stage 1: pose-head baseline
 
@@ -308,7 +349,8 @@ shared detection-token gradients.
 - Freeze the image encoder, image projection, fusion, detector, and mask head.
 - Train only the new pose head from fixed detection tokens.
 - Use one-to-one mask-based pose matching.
-- Use the supplied canonical CAD dimensions directly.
+- Consume the supplied effective prompted dimensions as a required pose-head
+  input.
 - Train the pose-confidence branch with the detached soft pose-quality target.
 
 ### Stage 2: detector adaptation
@@ -340,6 +382,10 @@ For every retained instance, return:
 }
 ```
 
+The caller must provide the effective physical dimensions for the prompted
+object. The returned `cad_dimensions_m` echoes this input; it is not a model
+prediction.
+
 Pose prediction happens before filtering. NMS and thresholding must preserve
 candidate indices. Translation is reconstructed using intrinsics adjusted for
 the model's actual input geometry and reported in the declared camera
@@ -368,8 +414,8 @@ Preserve an untouched test split following the existing manifest workflow.
 
 ## Implementation roadmap
 
-1. Add muggled_sam/v3_sam/cad_pose_head.py with typed prediction outputs and
-   6-D rotation conversion.
+1. Add muggled_sam/v3_sam/cad_pose/head.py with typed prediction outputs,
+   required effective-dimension conditioning, and 6-D rotation conversion.
 2. Add geometry and symmetry utilities with tests for rotation equivalence,
    translation reconstruction, projection, and continuous-axis losses.
 3. Register the pose head in the SAM3 detector wrapper and construction path.
@@ -377,7 +423,9 @@ Preserve an untouched test split following the existing manifest workflow.
    weights.
 4. Extend the exemplar detection helper to expose detection tokens and pose
    predictions without changing existing callers by default.
-5. Add a versioned pose-annotation sidecar loader and startup validation.
+5. Add a versioned pose-annotation sidecar loader, JSON Schema validation,
+   state/eligibility filtering, RGBA mask joins, inclusive-box checks, and
+   effective-dimension validation.
 6. Add one-to-one pose matching beside existing one-to-many segmentation
    matching.
 7. Add pose losses, component logging, visualization overlays, and NaN checks
@@ -396,9 +444,14 @@ The baseline is complete when:
 - existing segmentation inference and checkpoints remain usable;
 - a batch produces finite center, depth, rotation, and pose-confidence outputs
   for every detection token;
+- changing the supplied effective dimensions changes the pose-head conditioning,
+  while no scale or size prediction branch exists;
 - one-to-one pose matching aligns each GT instance with the correct mask token;
+- schema, logical-RGBA mask, inclusive-box, scale-sharing, and effective-
+  dimension validation pass for generated training data;
 - projection tests pass under model resize and padding;
 - equivalent symmetric rotations yield identical loss and evaluation error;
+- unresolved automatic symmetry labels are excluded from rotation supervision;
 - asymmetric rotations retain ordinary geodesic supervision;
 - checkpoint resume restores the pose head and optimizer state;
 - validation reports segmentation and pose metrics without using the test split;

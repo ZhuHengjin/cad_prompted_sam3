@@ -64,6 +64,18 @@ def sample_paths(row: ManifestRow, data_root: Path) -> Tuple[Path, Path, Path]:
     return rgb_path, inst_path, mapping_path
 
 
+def pose_sample_paths(row: ManifestRow, data_root: Path) -> Tuple[Path, Path, Path]:
+    """Resolve the frame sidecar and dataset-level pose metadata for one manifest row."""
+
+    dataset_root = data_root / row.dataset_path
+    camera_root = dataset_root / row.camera_dir
+    return (
+        camera_root / f"pose_annotations_{row.frame_id}.json",
+        dataset_root / "objects.json",
+        dataset_root / "dataset_meta.json",
+    )
+
+
 def validate_manifest_rows(
     rows: Sequence[ManifestRow], data_root: Path, *, validate_files: bool = True
 ) -> Dict[str, object]:

@@ -1,0 +1,65 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://perseve.local/schemas/perseve-pose-v1/objects.schema.json",
+  "title": "Perseve object catalog v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "objects"],
+  "properties": {
+    "schema_version": {"type": "string", "pattern": "^1\\.[0-9]+\\.[0-9]+$"},
+    "objects": {
+      "type": "object", "minProperties": 1,
+      "additionalProperties": {"$ref": "#/$defs/object"}
+    },
+    "extensions": {"type": "object"}
+  },
+  "$defs": {
+    "vec3": {"type": "array", "minItems": 3, "maxItems": 3, "items": {"type": "number"}},
+    "mat3": {
+      "type": "array", "minItems": 3, "maxItems": 3,
+      "items": {"type": "array", "minItems": 3, "maxItems": 3, "items": {"type": "number"}}
+    },
+    "mat4": {
+      "type": "array", "minItems": 4, "maxItems": 4,
+      "items": {"type": "array", "minItems": 4, "maxItems": 4, "items": {"type": "number"}}
+    },
+    "symmetry": {
+      "type": "object", "additionalProperties": false,
+      "required": ["type", "transforms", "label_source", "status", "pipeline_version", "parameters_sha256"],
+      "properties": {
+        "type": {"enum": ["none", "discrete", "continuous_axis"]},
+        "transforms": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/mat3"}},
+        "axis_cad": {"$ref": "#/$defs/vec3"},
+        "label_source": {"enum": ["automatic_geometry", "manual_override", "manual"]},
+        "status": {"enum": ["verified_auto", "verified_manual", "needs_review"]},
+        "pipeline_version": {"type": "string", "minLength": 1},
+        "parameters_sha256": {"type": "string", "minLength": 1},
+        "extensions": {"type": "object"}
+      },
+      "allOf": [
+        {"if": {"properties": {"type": {"const": "continuous_axis"}}}, "then": {"required": ["axis_cad"]}}
+      ]
+    },
+    "object": {
+      "type": "object", "additionalProperties": false,
+      "required": [
+        "mesh_path", "mesh_sha256", "source_length_unit", "source_to_meters",
+        "T_cad_from_source_meters", "bbox_min_m", "bbox_max_m",
+        "base_dimensions_m", "canonical_origin", "symmetry"
+      ],
+      "properties": {
+        "mesh_path": {"type": "string", "minLength": 1},
+        "mesh_sha256": {"type": "string", "minLength": 1},
+        "source_length_unit": {"type": "string", "minLength": 1},
+        "source_to_meters": {"type": "number", "exclusiveMinimum": 0},
+        "T_cad_from_source_meters": {"$ref": "#/$defs/mat4"},
+        "bbox_min_m": {"$ref": "#/$defs/vec3"},
+        "bbox_max_m": {"$ref": "#/$defs/vec3"},
+        "base_dimensions_m": {"$ref": "#/$defs/vec3"},
+        "canonical_origin": {"type": "string", "minLength": 1},
+        "symmetry": {"$ref": "#/$defs/symmetry"},
+        "extensions": {"type": "object"}
+      }
+    }
+  }
+}

@@ -11,4 +11,5 @@ This folder holds project-specific notes for CAD-prompted SAM3 work. Upstream Mu
 ## Model Extensions
 
 - [CAD pose-head plan](cad-pose-head-plan.md): architecture, representation, symmetry-aware supervision, data contract, training stages, evaluation, and implementation roadmap for a YOPO-inspired 9-DoF head.
+- [CAD pose-head implementation guide](cad-pose-head-implementation.md): architecture, dataset validation, training stages, losses, provenance, evaluation, inference, tests, and current limitations.
 - [Perseve pose-label and dataset format](perseve-pose-dataset-format.md): canonical frames, camera-space pose capture, versioned sidecars, scale modes, mask identity, validation, and optional BOP export for Perseve synthetic data.

@@ -27,6 +27,7 @@ from .sampling_encoder import SAMV3SamplingEncoder
 from .image_exemplar_fusion_model import SAMV3ImageExemplarFusion
 from .exemplar_detector_model import SAMV3ExemplarDetector
 from .exemplar_segmentation_model import SAMV3ExemplarSegmentation
+from .cad_pose import CADPosePredictions, SAMV3CADPoseHead
 
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -62,6 +63,7 @@ class SAMV3Model(nn.Module):
         image_exemplar_fusion_model: SAMV3ImageExemplarFusion,
         exemplar_detector_model: SAMV3ExemplarDetector,
         exemplar_segmentation_model: SAMV3ExemplarSegmentation,
+        cad_pose_head_model: SAMV3CADPoseHead | None = None,
     ):
 
         # Inherit from parent
@@ -84,6 +86,7 @@ class SAMV3Model(nn.Module):
         self.image_exemplar_fusion = image_exemplar_fusion_model
         self.exemplar_detector = exemplar_detector_model
         self.exemplar_segmentation = exemplar_segmentation_model
+        self.cad_pose_head = cad_pose_head_model or SAMV3CADPoseHead()
 
         # Default to eval mode, expecting to use inference only
         self.eval()
@@ -476,6 +479,7 @@ class SAMV3Model(nn.Module):
             self.exemplar_detector,
             self.exemplar_segmentation,
             bpe_vocab_path,
+            self.cad_pose_head,
         )
 
     # .................................................................................................................
@@ -510,6 +514,7 @@ class SAMV3DetectorModel(nn.Module):
         exemplar_detector_model: SAMV3ExemplarDetector,
         exemplar_segmentation_model: SAMV3ExemplarSegmentation,
         bpe_vocab_path: str | None = None,
+        cad_pose_head_model: SAMV3CADPoseHead | None = None,
     ):
         # Inherit from parent
         super().__init__()
@@ -522,6 +527,7 @@ class SAMV3DetectorModel(nn.Module):
         self.image_exemplar_fusion = image_exemplar_fusion_model
         self.exemplar_detector = exemplar_detector_model
         self.exemplar_segmentation = exemplar_segmentation_model
+        self.cad_pose_head = cad_pose_head_model or SAMV3CADPoseHead()
 
         # Fill in default vocab path
         if bpe_vocab_path is None:
@@ -665,7 +671,10 @@ class SAMV3DetectorModel(nn.Module):
         detection_filter_threshold: float = 0.0,
         exemplar_padding_mask_bn: Tensor | None = None,
         blank_no_exemplar_outputs: bool = True,
-    ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+        cad_dimensions_m_b3: Tensor | None = None,
+        camera_intrinsics_b33: Tensor | None = None,
+        return_pose: bool = False,
+    ) -> tuple[Tensor, Tensor, Tensor, Tensor] | tuple[Tensor, Tensor, Tensor, Tensor, CADPosePredictions]:
         """
         Takes in encoded image features and exemplar tokens, along with an optional padding mask,
         and produces segmentation masks and bounding box predictions.
@@ -713,7 +722,17 @@ class SAMV3DetectorModel(nn.Module):
                     lowres_imgenc_bchw
                 )
                 blk_masks, _ = self.exemplar_segmentation.create_blank_output(blk_tok, lowres_imgenc_bchw)
-                return blk_masks, blk_box, blk_score, blk_pres
+                if not return_pose:
+                    return blk_masks, blk_box, blk_score, blk_pres
+                if cad_dimensions_m_b3 is None:
+                    raise ValueError("cad_dimensions_m_b3 is required when return_pose=True")
+                if camera_intrinsics_b33 is None:
+                    raise ValueError("Adjusted camera_intrinsics_b33 is required when return_pose=True")
+                pose_predictions = self.cad_pose_head(blk_tok, blk_box, cad_dimensions_m_b3)
+                patch_size = self.image_encoder.get_image_tiling_size_constraint()
+                image_size_wh = (lowres_imgenc_bchw.shape[-1] * patch_size, lowres_imgenc_bchw.shape[-2] * patch_size)
+                pose_predictions = pose_predictions.with_translation(camera_intrinsics_b33, image_size_wh)
+                return blk_masks, blk_box, blk_score, blk_pres, pose_predictions
 
             # Mix exemplar data into image tokens
             fused_imgexm_tokens_bchw = self.image_exemplar_fusion(
@@ -727,6 +746,17 @@ class SAMV3DetectorModel(nn.Module):
                 fused_imgexm_tokens_bchw, encoded_exemplars_bnc, exemplar_padding_mask_bn
             )
 
+            pose_predictions = None
+            if return_pose:
+                if cad_dimensions_m_b3 is None:
+                    raise ValueError("cad_dimensions_m_b3 is required when return_pose=True")
+                if camera_intrinsics_b33 is None:
+                    raise ValueError("Adjusted camera_intrinsics_b33 is required when return_pose=True")
+                pose_predictions = self.cad_pose_head(enc_det_tokens_bnc, boxes_xy1xy2_bn22, cad_dimensions_m_b3)
+                patch_size = self.image_encoder.get_image_tiling_size_constraint()
+                image_size_wh = (lowres_imgenc_bchw.shape[-1] * patch_size, lowres_imgenc_bchw.shape[-2] * patch_size)
+                pose_predictions = pose_predictions.with_translation(camera_intrinsics_b33, image_size_wh)
+
             # Special optimization: Filter out 'bad' detections before performing segmentation
             # -> For example, if there are only 3 'valid' detections based on filter threshold
             #    then we only need to generate 3 masks, instead of all 200 of them
@@ -736,6 +766,8 @@ class SAMV3DetectorModel(nn.Module):
                 enc_det_tokens_bnc = enc_det_tokens_bnc[:, ok_filter]
                 boxes_xy1xy2_bn22 = boxes_xy1xy2_bn22[:, ok_filter]
                 det_scores_bn = det_scores_bn[:, ok_filter]
+                if pose_predictions is not None:
+                    pose_predictions = pose_predictions.index_candidates(ok_filter)
 
             # Generate masks
             mask_preds_bnhw, _ = self.exemplar_segmentation(
@@ -747,6 +779,8 @@ class SAMV3DetectorModel(nn.Module):
                 exemplar_padding_mask_bn,
             )
 
+        if return_pose:
+            return mask_preds_bnhw, boxes_xy1xy2_bn22, det_scores_bn, pres_scores, pose_predictions
         return mask_preds_bnhw, boxes_xy1xy2_bn22, det_scores_bn, pres_scores
 
     # .................................................................................................................

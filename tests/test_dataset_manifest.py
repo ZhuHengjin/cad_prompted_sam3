@@ -18,6 +18,7 @@ from dataset_manifest import (
     assign_group_splits,
     balanced_epoch_entries,
     load_manifest,
+    pose_sample_paths,
     validate_manifest_rows,
     write_manifest,
 )
@@ -57,6 +58,10 @@ class DatasetManifestTests(unittest.TestCase):
             loaded, summary = load_manifest(path, root)
             self.assertEqual(loaded, [row])
             self.assertEqual(summary["rows"], 1)
+            pose_paths = pose_sample_paths(row, root)
+            self.assertEqual(pose_paths[0], root / "dataset" / "Camera" / "pose_annotations_0001.json")
+            self.assertEqual(pose_paths[1], root / "dataset" / "objects.json")
+            self.assertEqual(pose_paths[2], root / "dataset" / "dataset_meta.json")
 
     def test_validation_rejects_duplicate_leakage_invalid_paths_and_missing_files(self):
         with tempfile.TemporaryDirectory() as tmp:

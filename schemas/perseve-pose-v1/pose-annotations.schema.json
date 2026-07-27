@@ -1,0 +1,119 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://perseve.local/schemas/perseve-pose-v1/pose-annotations.schema.json",
+  "title": "Perseve frame pose annotations v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "frame_id", "scene_id", "image", "camera", "instances"],
+  "properties": {
+    "schema_version": {"type": "string", "pattern": "^1\\.[0-9]+\\.[0-9]+$"},
+    "frame_id": {"type": "string", "minLength": 1},
+    "scene_id": {"type": "string", "minLength": 1},
+    "image": {"$ref": "#/$defs/image"},
+    "camera": {"$ref": "#/$defs/camera"},
+    "instances": {"type": "array", "items": {"$ref": "#/$defs/instance"}},
+    "extensions": {"type": "object"}
+  },
+  "$defs": {
+    "vec3": {"type": "array", "minItems": 3, "maxItems": 3, "items": {"type": "number"}},
+    "mat3": {
+      "type": "array", "minItems": 3, "maxItems": 3,
+      "items": {"type": "array", "minItems": 3, "maxItems": 3, "items": {"type": "number"}}
+    },
+    "mat4": {
+      "type": "array", "minItems": 4, "maxItems": 4,
+      "items": {"type": "array", "minItems": 4, "maxItems": 4, "items": {"type": "number"}}
+    },
+    "image": {
+      "type": "object", "additionalProperties": false,
+      "required": ["rgb_path", "instance_path", "mapping_path", "size_wh"],
+      "properties": {
+        "rgb_path": {"type": "string", "minLength": 1},
+        "instance_path": {"type": "string", "minLength": 1},
+        "mapping_path": {"type": "string", "minLength": 1},
+        "size_wh": {"type": "array", "minItems": 2, "maxItems": 2, "items": {"type": "integer", "minimum": 1}}
+      }
+    },
+    "camera": {
+      "type": "object", "additionalProperties": false,
+      "required": ["model", "distortion_model", "K", "T_world_from_camera_cv"],
+      "properties": {
+        "model": {"const": "pinhole"},
+        "distortion_model": {"const": "none"},
+        "K": {"$ref": "#/$defs/mat3"},
+        "T_world_from_camera_cv": {"$ref": "#/$defs/mat4"},
+        "extensions": {"type": "object"}
+      }
+    },
+    "mask": {
+      "type": ["object", "null"],
+      "additionalProperties": false,
+      "required": ["mapping_key", "value", "value_order", "match_alpha"],
+      "properties": {
+        "mapping_key": {"type": "string", "minLength": 1},
+        "value": {"type": "array", "minItems": 4, "maxItems": 4, "items": {"type": "integer", "minimum": 0, "maximum": 255}},
+        "value_order": {"const": "RGBA"},
+        "match_alpha": {"const": true}
+      }
+    },
+    "visibility": {
+      "type": ["object", "null"], "additionalProperties": false,
+      "properties": {
+        "visible_pixel_count": {"type": ["integer", "null"], "minimum": 0},
+        "visible_fraction": {"type": ["number", "null"], "minimum": 0, "maximum": 1},
+        "truncated": {"type": ["boolean", "null"]}
+      }
+    },
+    "instance": {
+      "type": "object", "additionalProperties": false,
+      "required": [
+        "instance_id", "cad_id", "prim_path", "annotation_state",
+        "pose_training_eligible", "mask", "bbox_xyxy_px", "T_cam_from_cad",
+        "render_scale_xyz", "dimensions_m", "visibility"
+      ],
+      "properties": {
+        "instance_id": {"type": "string", "minLength": 1},
+        "cad_id": {"type": "string", "minLength": 1},
+        "prim_path": {"type": "string", "minLength": 1},
+        "annotation_state": {"enum": ["visible", "fully_occluded", "out_of_frame", "invalid_geometry", "capture_error"]},
+        "pose_training_eligible": {"type": "boolean"},
+        "mask": {"$ref": "#/$defs/mask"},
+        "bbox_xyxy_px": {
+          "oneOf": [
+            {"type": "null"},
+            {"type": "array", "minItems": 4, "maxItems": 4, "items": {"type": "integer", "minimum": 0}}
+          ]
+        },
+        "T_cam_from_cad": {"oneOf": [{"type": "null"}, {"$ref": "#/$defs/mat4"}]},
+        "render_scale_xyz": {"oneOf": [{"type": "null"}, {"$ref": "#/$defs/vec3"}]},
+        "dimensions_m": {"oneOf": [{"type": "null"}, {"$ref": "#/$defs/vec3"}]},
+        "visibility": {"$ref": "#/$defs/visibility"},
+        "extensions": {"type": "object"}
+      },
+      "allOf": [
+        {
+          "if": {"properties": {"annotation_state": {"const": "visible"}}},
+          "then": {
+            "properties": {
+              "mask": {"type": "object"},
+              "bbox_xyxy_px": {"type": "array"}
+            }
+          }
+        },
+        {
+          "if": {"properties": {"pose_training_eligible": {"const": true}}},
+          "then": {
+            "properties": {
+              "annotation_state": {"const": "visible"},
+              "mask": {"type": "object"},
+              "bbox_xyxy_px": {"type": "array"},
+              "T_cam_from_cad": {"type": "array"},
+              "render_scale_xyz": {"type": "array"},
+              "dimensions_m": {"type": "array"}
+            }
+          }
+        }
+      ]
+    }
+  }
+}

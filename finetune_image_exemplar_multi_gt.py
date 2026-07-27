@@ -20,6 +20,7 @@ otherwise retained from the original multi-GT trainer.
 
 import argparse
 import csv
+import hashlib
 import json
 import os
 import random
@@ -27,7 +28,7 @@ import re
 import shutil
 import warnings
 from collections import defaultdict, deque
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple, Union
@@ -48,6 +49,22 @@ from dataset_manifest import (
     manifest_sha256,
 )
 from muggled_sam.make_sam import make_sam_from_state_dict
+from muggled_sam.v3_sam.cad_pose.geometry import adjust_intrinsics_for_resize_and_pad
+from muggled_sam.v3_sam.cad_pose.evaluation import (
+    evaluate_pose_matches,
+    expected_calibration_error,
+    fit_pose_score_temperature,
+)
+from muggled_sam.v3_sam.cad_pose.inference import mask_nms_indices
+from muggled_sam.v3_sam.cad_pose.losses import CADPoseLossConfig, compute_cad_pose_losses
+from muggled_sam.v3_sam.cad_pose.matching import match_pose_predictions_one_to_one
+from muggled_sam.v3_sam.cad_pose.symmetry import symmetry_aware_rotation_error
+from muggled_sam.v3_sam.cad_pose.dataset import (
+    instance_mask_rgba,
+    load_perseve_pose_sample,
+    make_pose_target,
+    validate_scale_sharing,
+)
 
 
 IGNORED_LABELS = {"BACKGROUND", "UNLABELLED"}
@@ -60,6 +77,19 @@ METRIC_FIELDS = (
     "avg_loss",
     "avg_iou",
     "correct_rate",
+    "pose_center_loss",
+    "pose_depth_loss",
+    "pose_rotation_loss",
+    "pose_quality_loss",
+    "rotation_error_deg",
+    "translation_error_cm",
+    "center_error_norm",
+    "depth_error_m",
+    "accuracy_5deg_5cm",
+    "accuracy_10deg_10cm",
+    "brier_score",
+    "expected_calibration_error",
+    "pose_score_temperature",
     "samples",
 )
 
@@ -247,6 +277,45 @@ def select_target_object_and_masks(
         mapping_cache=mapping_cache,
     )
     return obj_id, masks
+
+
+def select_pose_target_and_masks(
+    entry: Dict[str, str],
+    pose_cache: Dict[Tuple[str, str], object],
+    *,
+    require_pose_eligible: bool,
+):
+    """Select one CAD prompt and retain the exact sidecar-instance/mask join order."""
+
+    camera_root = Path(entry["inst_path"]).parent
+    cache_key = (str(camera_root), entry["frame_id"])
+    sample = pose_cache.get(cache_key)
+    if sample is None:
+        sample = load_perseve_pose_sample(camera_root, entry["frame_id"], validate_pixels=True)
+        pose_cache[cache_key] = sample
+    grouped: Dict[str, List[object]] = defaultdict(list)
+    for instance in sample.frame.instances:
+        if instance.annotation_state != "visible" or instance.mask_rgba is None or instance.dimensions_m is None:
+            continue
+        if require_pose_eligible and not instance.pose_training_eligible:
+            continue
+        grouped[instance.cad_id].append(instance)
+    if not grouped:
+        return None, [], [], sample, []
+    cad_id = random.choice(sorted(grouped))
+    masks, instances = [], []
+    for instance in grouped[cad_id]:
+        mask = instance_mask_rgba(Path(entry["inst_path"]), instance).astype(np.float32)
+        if int(mask.sum()) >= 100:
+            masks.append(mask)
+            instances.append(instance)
+    if not masks:
+        return None, [], [], sample, []
+    dimensions = [instance.dimensions_m for instance in instances]
+    if any(value is None or not np.allclose(value, dimensions[0], atol=1e-6, rtol=1e-5) for value in dimensions):
+        raise ValueError(f"Instances for CAD {cad_id!r} do not share one effective dimension prompt")
+    eligible_gt_indices = [index for index, instance in enumerate(instances) if instance.pose_training_eligible]
+    return cad_id, masks, instances, sample, eligible_gt_indices
 
 
 def load_bgr(path: str) -> np.ndarray:
@@ -712,7 +781,11 @@ def generate_detections_train(
     encoded_exemplars_bnc: torch.Tensor,
     detection_filter_threshold: float = 0.0,
     exemplar_padding_mask_bn: Optional[torch.Tensor] = None,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    cad_dimensions_m_b3: Optional[torch.Tensor] = None,
+    adjusted_intrinsics_b33: Optional[torch.Tensor] = None,
+    model_image_size_wh: Optional[Tuple[int, int]] = None,
+    return_pose: bool = False,
+):
     lowres_imgenc_bchw, hiresx2_imgenc_bchw, hiresx4_imgenc_bchw = encoded_image_features_list
     no_exemplars = encoded_exemplars_bnc.shape[1] == 0
     if no_exemplars:
@@ -720,7 +793,17 @@ def generate_detections_train(
             lowres_imgenc_bchw
         )
         blk_masks, _ = detmodel.exemplar_segmentation.create_blank_output(blk_tok, lowres_imgenc_bchw)
-        return blk_masks, blk_box, blk_score, blk_score_logits, blk_pres
+        if not return_pose:
+            return blk_masks, blk_box, blk_score, blk_score_logits, blk_pres
+        # Handle pose prediction when there are no exemplars.
+        if cad_dimensions_m_b3 is None:
+            raise ValueError("cad_dimensions_m_b3 is required for pose training")
+        pose_predictions = detmodel.cad_pose_head(blk_tok, blk_box, cad_dimensions_m_b3)
+        if adjusted_intrinsics_b33 is not None:
+            if model_image_size_wh is None:
+                raise ValueError("model_image_size_wh is required with adjusted intrinsics")
+            pose_predictions = pose_predictions.with_translation(adjusted_intrinsics_b33, model_image_size_wh)
+        return blk_masks, blk_box, blk_score, blk_score_logits, blk_pres, pose_predictions
 
     fused_imgexm_tokens_bchw = detmodel.image_exemplar_fusion(
         lowres_imgenc_bchw,
@@ -731,6 +814,17 @@ def generate_detections_train(
         fused_imgexm_tokens_bchw, encoded_exemplars_bnc, exemplar_padding_mask_bn
     )
 
+    pose_predictions = None
+    # Handle pose prediction for detected candidates.
+    if return_pose:
+        if cad_dimensions_m_b3 is None:
+            raise ValueError("cad_dimensions_m_b3 is required for pose training")
+        pose_predictions = detmodel.cad_pose_head(enc_det_tokens_bnc, boxes_xy1xy2_bn22, cad_dimensions_m_b3)
+        if adjusted_intrinsics_b33 is not None:
+            if model_image_size_wh is None:
+                raise ValueError("model_image_size_wh is required with adjusted intrinsics")
+            pose_predictions = pose_predictions.with_translation(adjusted_intrinsics_b33, model_image_size_wh)
+
     if detection_filter_threshold > 1e-3:
         if det_scores_bn.shape[0] != 1:
             raise ValueError("Cannot pre-filter detections when using batched inputs!")
@@ -738,6 +832,9 @@ def generate_detections_train(
         enc_det_tokens_bnc = enc_det_tokens_bnc[:, ok_filter]
         boxes_xy1xy2_bn22 = boxes_xy1xy2_bn22[:, ok_filter]
         det_scores_bn = det_scores_bn[:, ok_filter]
+        det_scores_logits_bn = det_scores_logits_bn[:, ok_filter]
+        if pose_predictions is not None:
+            pose_predictions = pose_predictions.index_candidates(ok_filter)
 
     mask_preds_bnhw, _ = detmodel.exemplar_segmentation(
         enc_det_tokens_bnc,
@@ -747,7 +844,8 @@ def generate_detections_train(
         encoded_exemplars_bnc,
         exemplar_padding_mask_bn,
     )
-    return mask_preds_bnhw, boxes_xy1xy2_bn22, det_scores_bn, det_scores_logits_bn, pres_scores
+    outputs = (mask_preds_bnhw, boxes_xy1xy2_bn22, det_scores_bn, det_scores_logits_bn, pres_scores)
+    return (*outputs, pose_predictions) if return_pose else outputs
 
 
 def encode_detection_image_no_infer(
@@ -1583,6 +1681,29 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--bbox_weight", type=float, default=1.0)
     parser.add_argument("--score_weight", type=float, default=0.3)
     parser.add_argument("--no_object_weight", type=float, default=0.45)
+    parser.add_argument("--enable_pose", action="store_true", help="Train from validated Perseve pose-v1 sidecars.")
+    parser.add_argument(
+        "--pose_stage",
+        choices=["head", "joint"],
+        default="head",
+        help="Train only the new pose head (stage 1) or jointly adapt detector/fusion/mask modules (stage 2).",
+    )
+    parser.add_argument("--pose_weight", type=float, default=1.0)
+    parser.add_argument("--pose_center_weight", type=float, default=1.0)
+    parser.add_argument("--pose_depth_weight", type=float, default=1.0)
+    parser.add_argument("--pose_rotation_weight", type=float, default=1.0)
+    parser.add_argument("--pose_quality_weight", type=float, default=1.0)
+    parser.add_argument("--log_depth_mean", type=float, default=0.0)
+    parser.add_argument("--log_depth_std", type=float, default=1.0)
+    parser.add_argument("--rotation_tolerance_deg", type=float, default=5.0)
+    parser.add_argument("--translation_tolerance", type=float, default=0.1)
+    parser.add_argument("--rotation_soft_width_deg", type=float, default=1.0)
+    parser.add_argument("--translation_soft_width", type=float, default=0.02)
+    parser.add_argument(
+        "--absolute_translation_tolerance",
+        action="store_true",
+        help="Interpret translation tolerance/width in metres instead of object-diagonal-normalized units.",
+    )
     parser.add_argument(
         "--matches_per_gt",
         type=int,
@@ -1678,9 +1799,52 @@ def load_finetune_checkpoint(
         if key not in checkpoint:
             raise KeyError(f"Checkpoint missing '{key}' state.")
         module.load_state_dict(checkpoint[key])
-    # if optimizer is not None and load_optimizer and "optimizer" in checkpoint:
-    #     optimizer.load_state_dict(checkpoint["optimizer"])
+    if "cad_pose_head" in checkpoint:
+        detmodel.cad_pose_head.load_state_dict(checkpoint["cad_pose_head"])
+    if optimizer is not None and load_optimizer and "optimizer" in checkpoint:
+        try:
+            optimizer.load_state_dict(checkpoint["optimizer"])
+        except ValueError as exc:
+            warnings.warn(f"Optimizer state is incompatible with the selected training stage; starting fresh: {exc}")
     return checkpoint
+
+
+def build_finetune_checkpoint(
+    detmodel,
+    optimizer: torch.optim.Optimizer,
+    args: argparse.Namespace,
+    *,
+    epoch: int,
+    global_step: int,
+    batch_step: int,
+    pose_config: Optional[CADPoseLossConfig],
+    catalog_checksums: set,
+    dataset_meta_checksums: set,
+    annotation_checksums: set,
+    symmetry_pipeline_versions: set,
+    schema_checksums: set,
+    schema_versions: set,
+) -> Dict[str, object]:
+    annotation_digest = hashlib.sha256("\n".join(sorted(annotation_checksums)).encode("utf-8")).hexdigest()
+    return {
+        "epoch": epoch,
+        "global_step": global_step,
+        "batch_step": batch_step,
+        "image_exemplar_fusion": detmodel.image_exemplar_fusion.state_dict(),
+        "exemplar_detector": detmodel.exemplar_detector.state_dict(),
+        "exemplar_segmentation": detmodel.exemplar_segmentation.state_dict(),
+        "cad_pose_head": detmodel.cad_pose_head.state_dict(),
+        "optimizer": optimizer.state_dict(),
+        "pose_config": None if pose_config is None else pose_config.__dict__,
+        "catalog_checksums": sorted(catalog_checksums),
+        "dataset_meta_checksums": sorted(dataset_meta_checksums),
+        "annotation_checksums": sorted(annotation_checksums),
+        "annotation_checksum_sha256": annotation_digest,
+        "symmetry_pipeline_versions": sorted(symmetry_pipeline_versions),
+        "schema_checksums": sorted(schema_checksums),
+        "schema_versions": sorted(schema_versions),
+        "args": vars(args),
+    }
 
 
 def _capture_training_state(module: torch.nn.Module) -> List[Tuple[torch.nn.Module, bool]]:
@@ -1975,6 +2139,170 @@ def run_exemplar_eval(
     return 0.0, 0, 0.0, overall_loss
 
 
+def run_cad_pose_eval(
+    detmodel,
+    entries: Sequence[Dict[str, str]],
+    args: argparse.Namespace,
+    device: torch.device,
+    pose_config: CADPoseLossConfig,
+    *,
+    calibrate_temperature: bool,
+) -> Dict[str, float]:
+    """Evaluate retained validation candidates with the training symmetry contract."""
+
+    reference_dir = Path(args.reference_dir).expanduser().resolve()
+    ref_view_ids = parse_ref_view_ids(args.ref_view_ids)
+    frame_entries = unique_frame_entries(entries)
+    pose_cache: Dict[Tuple[str, str], object] = {}
+    ref_cache: Dict[str, torch.Tensor] = {}
+    metric_sums: Dict[str, float] = defaultdict(float)
+    calibration_logits: List[torch.Tensor] = []
+    calibration_targets: List[torch.Tensor] = []
+    total_count = 0
+    training_state = _capture_training_state(detmodel)
+    detmodel.eval()
+    try:
+        with torch.no_grad():
+            for entry in frame_entries:
+                image_bgr = load_bgr(entry["rgb_path"])
+                camera_root = Path(entry["inst_path"]).parent
+                cache_key = (str(camera_root), entry["frame_id"])
+                sample = pose_cache.get(cache_key)
+                if sample is None:
+                    sample = load_perseve_pose_sample(camera_root, entry["frame_id"], validate_pixels=True)
+                    pose_cache[cache_key] = sample
+                grouped: Dict[str, List[object]] = defaultdict(list)
+                for instance in sample.frame.eligible_instances():
+                    grouped[instance.cad_id].append(instance)
+                for cad_id, instances in sorted(grouped.items()):
+                    masks = [instance_mask_rgba(Path(entry["inst_path"]), instance).astype(np.float32) for instance in instances]
+                    if not masks:
+                        continue
+                    if cad_id not in ref_cache:
+                        exemplar = build_exemplar_tokens_for_object(
+                            detmodel,
+                            cad_id,
+                            reference_dir,
+                            ref_view_ids,
+                            args.max_side_length,
+                            not args.no_square,
+                            args.num_points_approx,
+                            device,
+                        )
+                        if exemplar is None:
+                            continue
+                        ref_cache[cad_id] = exemplar.detach().cpu()
+                    image_tensor = detmodel.image_encoder.prepare_image(
+                        image_bgr,
+                        max_side_length=args.max_side_length,
+                        use_square_sizing=not args.no_square,
+                    )
+                    encoded = detmodel.image_encoder(image_tensor)
+                    features = detmodel.image_projection.v3_projection(encoded)
+                    pre_h, pre_w = image_tensor.shape[-2:]
+                    model_dtype = image_tensor.dtype
+                    raw_k = torch.as_tensor(sample.frame.intrinsics, device=device, dtype=model_dtype)
+                    adjusted_k = adjust_intrinsics_for_resize_and_pad(
+                        raw_k, sample.frame.image_size_wh, (pre_w, pre_h)
+                    ).unsqueeze(0)
+                    dimensions = torch.as_tensor(
+                        instances[0].dimensions_m, device=device, dtype=model_dtype
+                    ).unsqueeze(0)
+                    outputs = generate_detections_train(
+                        detmodel,
+                        features,
+                        ref_cache[cad_id].to(device),
+                        detection_filter_threshold=args.det_filter,
+                        cad_dimensions_m_b3=dimensions,
+                        adjusted_intrinsics_b33=adjusted_k,
+                        model_image_size_wh=(pre_w, pre_h),
+                        return_pose=True,
+                    )
+                    mask_predictions, _, detection_scores, _, _, pose_predictions = outputs
+                    logits_nhw = mask_predictions[0].float()
+                    scores_n = detection_scores[0]
+                    retained = mask_nms_indices(logits_nhw, scores_n, args.nms_iou)
+                    logits_nhw = logits_nhw[retained]
+                    pose_predictions = pose_predictions.index_candidates(retained)
+                    gt_targets = build_gt_down_list(
+                        masks,
+                        (pre_h, pre_w),
+                        logits_nhw.shape[-2:],
+                        device,
+                    )
+                    matches, _ = match_pose_predictions_one_to_one(logits_nhw, gt_targets)
+                    pose_targets = [
+                        make_pose_target(
+                            instance,
+                            sample.catalog[cad_id],
+                            raw_k,
+                            sample.frame.image_size_wh,
+                            (pre_w, pre_h),
+                        )
+                        for instance in instances
+                    ]
+                    evaluation = evaluate_pose_matches(pose_predictions, pose_targets, matches)
+                    if evaluation.count == 0:
+                        continue
+                    total_count += evaluation.count
+                    for field in (
+                        "rotation_error_deg",
+                        "translation_error_cm",
+                        "center_error_norm",
+                        "depth_error_m",
+                        "accuracy_5deg_5cm",
+                        "accuracy_10deg_10cm",
+                    ):
+                        metric_sums[field] += float(getattr(evaluation, field)) * evaluation.count
+                    for gt_index, prediction_index in matches:
+                        target = pose_targets[gt_index]
+                        if not target.rotation_eligible:
+                            continue
+                        predicted_rotation = pose_predictions.rotation_matrix_bn33[0, prediction_index]
+                        rotation_error = symmetry_aware_rotation_error(
+                            predicted_rotation,
+                            target.rotation_matrix.to(predicted_rotation),
+                            symmetry_type=target.symmetry_type,
+                            symmetry_transforms=(
+                                target.symmetry_transforms.to(predicted_rotation)
+                                if target.symmetry_transforms is not None else None
+                            ),
+                            axis_cad=(target.axis_cad.to(predicted_rotation) if target.axis_cad is not None else None),
+                        )
+                        translation = pose_predictions.translation_m_bn3[0, prediction_index]
+                        translation_error = torch.linalg.vector_norm(translation - target.translation_m.to(translation))
+                        if pose_config.normalize_translation_error:
+                            translation_error = translation_error / torch.linalg.vector_norm(
+                                target.dimensions_m.to(translation_error)
+                            ).clamp_min(1e-8)
+                        success = (
+                            (rotation_error <= pose_config.rotation_tolerance_rad)
+                            & (translation_error <= pose_config.translation_tolerance)
+                        ).float()
+                        calibration_logits.append(pose_predictions.pose_score_logits_bn[0, prediction_index].float())
+                        calibration_targets.append(success.float())
+    finally:
+        _restore_training_state(training_state)
+
+    if total_count == 0:
+        return {"count": 0.0}
+    metrics = {name: value / total_count for name, value in metric_sums.items()}
+    metrics["count"] = float(total_count)
+    if calibration_logits:
+        logits = torch.stack(calibration_logits)
+        targets = torch.stack(calibration_targets)
+        if calibrate_temperature:
+            temperature = fit_pose_score_temperature(logits, targets)
+            detmodel.cad_pose_head.set_pose_score_temperature(temperature)
+        else:
+            temperature = float(detmodel.cad_pose_head.pose_score_temperature)
+        probabilities = torch.sigmoid(logits / max(temperature, 1e-6))
+        metrics["pose_score_temperature"] = temperature
+        metrics["brier_score"] = float(((probabilities - targets) ** 2).mean())
+        metrics["expected_calibration_error"] = float(expected_calibration_error(probabilities, targets))
+    return metrics
+
+
 def main() -> None:
     print("Starting fine-tuning with SAMv3 exemplar detection modules.")
     args = parse_args()
@@ -2014,6 +2342,8 @@ def main() -> None:
         )
         if args.eval_only:
             raise ValueError("--eval_only requires --dataset_manifest.")
+    if args.enable_pose and not manifest_rows:
+        raise ValueError("--enable_pose requires the versioned --dataset_manifest interface.")
 
     if not args.reference_dir:
         raise ValueError("--reference_dir is required.")
@@ -2035,16 +2365,33 @@ def main() -> None:
     detmodel = base_model.make_detector_model()
     detmodel.to(device=device, dtype=dtype)
 
-    unfreeze_module(detmodel.image_encoder)
-    unfreeze_module(detmodel.image_projection)
     freeze_module(detmodel.text_encoder)
-    unfreeze_module(detmodel.sampling_encoder)
-    unfreeze_module(detmodel.image_exemplar_fusion)
-    unfreeze_module(detmodel.exemplar_detector)
-    unfreeze_module(detmodel.exemplar_segmentation)
+    if args.enable_pose:
+        freeze_module(detmodel.image_encoder)
+        freeze_module(detmodel.image_projection)
+        freeze_module(detmodel.sampling_encoder)
+    else:
+        unfreeze_module(detmodel.image_encoder)
+        unfreeze_module(detmodel.image_projection)
+        unfreeze_module(detmodel.sampling_encoder)
+    if args.enable_pose and args.pose_stage == "head":
+        freeze_module(detmodel.image_exemplar_fusion)
+        freeze_module(detmodel.exemplar_detector)
+        freeze_module(detmodel.exemplar_segmentation)
+    else:
+        unfreeze_module(detmodel.image_exemplar_fusion)
+        unfreeze_module(detmodel.exemplar_detector)
+        unfreeze_module(detmodel.exemplar_segmentation)
+    if args.enable_pose:
+        unfreeze_module(detmodel.cad_pose_head)
+    else:
+        freeze_module(detmodel.cad_pose_head)
 
     trainable_params: List[torch.nn.Parameter] = []
-    for module in (detmodel.image_exemplar_fusion, detmodel.exemplar_detector, detmodel.exemplar_segmentation):
+    trainable_modules = [detmodel.image_exemplar_fusion, detmodel.exemplar_detector, detmodel.exemplar_segmentation]
+    if args.enable_pose:
+        trainable_modules.append(detmodel.cad_pose_head)
+    for module in trainable_modules:
         trainable_params.extend([p for p in module.parameters() if p.requires_grad])
     total_params = sum(p.numel() for p in detmodel.parameters())
     trainable_params_count = sum(p.numel() for p in detmodel.parameters() if p.requires_grad)
@@ -2054,6 +2401,7 @@ def main() -> None:
     start_epoch = 1 
     global_step = 0
     batch_step = 0
+    resume_checkpoint = None
 
     if args.resume_in_place and not args.resume_path:
         raise ValueError("--resume_in_place requires --resume_path.")
@@ -2069,6 +2417,7 @@ def main() -> None:
             device=device,
             load_optimizer=not args.no_resume_optimizer,
         )
+        resume_checkpoint = checkpoint
         ckpt_epoch = int(checkpoint.get("epoch", 0))
         start_epoch = max(1, ckpt_epoch + 1)
         global_step = int(checkpoint.get("global_step", 0))
@@ -2183,9 +2532,11 @@ def main() -> None:
         raise FileNotFoundError(reference_dir)
 
     validation_config: Optional[EvalConfig] = None
+    validation_pose_entries: List[Dict[str, str]] = []
     if manifest_rows:
         validation_rows = [row for row in manifest_rows if row.split == "validation"]
         validation_entries = entries_from_manifest_rows(validation_rows, data_root, object_level=True)
+        validation_pose_entries = entries_from_manifest_rows(validation_rows, data_root, object_level=False)
         validation_config = EvalConfig(
             dataset_root=None,
             dataset_entries=validation_entries,
@@ -2235,6 +2586,109 @@ def main() -> None:
     ref_image_cache: Dict[str, List[np.ndarray]] = {}
     seg_cache: Dict[str, np.ndarray] = {}
     mapping_cache: Dict[str, Dict[str, List[Tuple[int, ...]]]] = {}
+    pose_cache: Dict[Tuple[str, str], object] = {}
+    catalog_checksums: set = set()
+    dataset_meta_checksums: set = set()
+    annotation_checksums: set = set()
+    symmetry_pipeline_versions: set = set()
+    schema_checksums: set = set()
+    schema_versions: set = set()
+    pose_config = None
+    if args.enable_pose:
+        pose_config = CADPoseLossConfig(
+            center_weight=args.pose_center_weight,
+            depth_weight=args.pose_depth_weight,
+            rotation_weight=args.pose_rotation_weight,
+            quality_weight=args.pose_quality_weight,
+            pose_weight=args.pose_weight,
+            log_depth_mean=args.log_depth_mean,
+            log_depth_std=args.log_depth_std,
+            rotation_tolerance_rad=np.deg2rad(args.rotation_tolerance_deg),
+            translation_tolerance=args.translation_tolerance,
+            rotation_soft_width_rad=np.deg2rad(args.rotation_soft_width_deg),
+            translation_soft_width=args.translation_soft_width,
+            normalize_translation_error=not args.absolute_translation_tolerance,
+        )
+        if resume_checkpoint is not None and resume_checkpoint.get("pose_config") is not None:
+            pose_config = CADPoseLossConfig(**resume_checkpoint["pose_config"])
+        preflight_entries = list(all_entries)
+        if manifest_rows:
+            preflight_rows = [row for row in manifest_rows if row.split in ("train", "validation")]
+            preflight_entries = entries_from_manifest_rows(preflight_rows, data_root, object_level=False)
+        preflight_samples = []
+        training_log_dimensions = []
+        training_log_depths = []
+        for entry in preflight_entries:
+            camera_root = Path(entry["inst_path"]).parent
+            key = (str(camera_root), entry["frame_id"])
+            sample = pose_cache.get(key)
+            if sample is None:
+                sample = load_perseve_pose_sample(camera_root, entry["frame_id"], validate_pixels=True)
+                pose_cache[key] = sample
+            preflight_samples.append(sample)
+            catalog_checksums.add(sample.catalog_checksum)
+            dataset_meta_checksums.add(sample.dataset_meta_checksum)
+            annotation_checksums.add(sample.annotation_checksum)
+            symmetry_pipeline_versions.update(sample.symmetry_pipeline_versions)
+            schema_checksums.update(sample.schema_checksums.values())
+            schema_versions.add(sample.frame.schema_version)
+            if entry.get("split", "train") == "train":
+                for instance in sample.frame.eligible_instances():
+                    training_log_dimensions.append(np.log(instance.dimensions_m))
+                    training_log_depths.append(np.log(instance.translation_m[2]))
+        validate_scale_sharing(preflight_samples)
+        if len(catalog_checksums) != 1:
+            raise ValueError(f"Pose training requires one object-catalog checksum, got {sorted(catalog_checksums)}")
+        if len(symmetry_pipeline_versions) != 1:
+            raise ValueError(
+                "Pose training requires one symmetry-pipeline version, got "
+                f"{sorted(symmetry_pipeline_versions)}"
+            )
+        if resume_checkpoint is not None:
+            expected_catalogs = set(resume_checkpoint.get("catalog_checksums", []))
+            expected_metadata = set(resume_checkpoint.get("dataset_meta_checksums", []))
+            expected_symmetry = set(resume_checkpoint.get("symmetry_pipeline_versions", []))
+            expected_schemas = set(resume_checkpoint.get("schema_versions", []))
+            if expected_catalogs and expected_catalogs != catalog_checksums:
+                raise ValueError("Resume checkpoint object-catalog checksum differs from the current dataset")
+            if expected_metadata and expected_metadata != dataset_meta_checksums:
+                raise ValueError("Resume checkpoint dataset-metadata checksums differ from the current dataset")
+            if expected_symmetry and expected_symmetry != symmetry_pipeline_versions:
+                raise ValueError("Resume checkpoint symmetry-pipeline version differs from the current dataset")
+            if expected_schemas and expected_schemas != schema_versions:
+                raise ValueError("Resume checkpoint pose schema version differs from the current dataset")
+        if not training_log_dimensions or not training_log_depths:
+            raise ValueError("Pose training split contains no eligible pose instances")
+        dimension_values = np.stack(training_log_dimensions)
+        dimension_mean = torch.as_tensor(dimension_values.mean(axis=0), device=device, dtype=dtype)
+        dimension_std = torch.as_tensor(dimension_values.std(axis=0).clip(min=1e-6), device=device, dtype=dtype)
+        detmodel.cad_pose_head.set_dimension_statistics(dimension_mean, dimension_std)
+        depth_mean = float(np.mean(training_log_depths))
+        depth_std = float(max(np.std(training_log_depths), 1e-6))
+        pose_config = replace(pose_config, log_depth_mean=depth_mean, log_depth_std=depth_std)
+        annotation_digest = hashlib.sha256(
+            "\n".join(sorted(annotation_checksums)).encode("utf-8")
+        ).hexdigest()
+        pose_provenance = {
+            "schema_versions": sorted(schema_versions),
+            "schema_checksums": sorted(schema_checksums),
+            "catalog_checksums": sorted(catalog_checksums),
+            "dataset_meta_checksums": sorted(dataset_meta_checksums),
+            "annotation_checksums": sorted(annotation_checksums),
+            "annotation_checksum_sha256": annotation_digest,
+            "symmetry_pipeline_versions": sorted(symmetry_pipeline_versions),
+            "pose_config": pose_config.__dict__,
+            "dimension_log_mean": detmodel.cad_pose_head.dimension_log_mean.detach().float().cpu().tolist(),
+            "dimension_log_std": detmodel.cad_pose_head.dimension_log_std.detach().float().cpu().tolist(),
+            "training_eligible_instances": len(training_log_depths),
+        }
+        with (Path(run_dir) / "pose_provenance.json").open("w") as handle:
+            json.dump(pose_provenance, handle, indent=2, sort_keys=True, default=str)
+        print(
+            "Pose preflight passed: "
+            f"frames={len(preflight_samples)} eligible_instances={len(training_log_depths)} "
+            f"log_depth_mean={depth_mean:.6f} log_depth_std={depth_std:.6f}"
+        )
     running_losses: deque[float] = deque(maxlen=5)
     running_top_ious: deque[float] = deque(maxlen=5)
 
@@ -2277,6 +2731,26 @@ def main() -> None:
             f"[eval:{args.eval_split}] loss={eval_loss:.4f} avg_iou={eval_avg:.4f} "
             f"correct_rate={eval_correct:.3f} samples={eval_count}"
         )
+        if args.enable_pose:
+            pose_eval_entries = entries_from_manifest_rows(eval_rows, data_root, object_level=False)
+            pose_metrics = run_cad_pose_eval(
+                detmodel,
+                pose_eval_entries,
+                args,
+                device,
+                pose_config,
+                calibrate_temperature=args.eval_split == "validation",
+            )
+            append_metric(
+                metrics_path,
+                phase=f"eval_{args.eval_split}_pose",
+                epoch=start_epoch - 1,
+                global_step=global_step,
+                batch_step=batch_step,
+                samples=int(pose_metrics.get("count", 0)),
+                **{key: value for key, value in pose_metrics.items() if key != "count"},
+            )
+            print(f"[eval:{args.eval_split}:pose] {json.dumps(pose_metrics, sort_keys=True)}")
         return
 
     if start_epoch > args.epochs:
@@ -2308,6 +2782,25 @@ def main() -> None:
             else:
                 loss_part = f" val_loss={eval_loss:.4f}" if np.isfinite(eval_loss) else ""
                 print(f"[eval] epoch={epoch}{loss_part} no valid samples")
+            if args.enable_pose and validation_pose_entries:
+                pose_metrics = run_cad_pose_eval(
+                    detmodel,
+                    validation_pose_entries,
+                    args,
+                    device,
+                    pose_config,
+                    calibrate_temperature=False,
+                )
+                append_metric(
+                    metrics_path,
+                    phase="validation_pose",
+                    epoch=epoch - 1,
+                    global_step=global_step,
+                    batch_step=batch_step,
+                    samples=int(pose_metrics.get("count", 0)),
+                    **{key: value for key, value in pose_metrics.items() if key != "count"},
+                )
+                print(f"[eval:pose] epoch={epoch - 1} {json.dumps(pose_metrics, sort_keys=True)}")
 
         if entries_by_dataset:
             epoch_entries = balanced_epoch_entries(
@@ -2330,16 +2823,30 @@ def main() -> None:
                 except FileNotFoundError:
                     continue
                 try:
-                    mapping_path = Path(entry["inst_path"]).with_name(
-                        f"instance_segmentation_mapping_{entry['frame_id']}.json"
-                    )
-                    obj_id, gt_masks = select_target_object_and_masks(
-                        entry["inst_path"],
-                        str(mapping_path),
-                        seg_cache=seg_cache,
-                        mapping_cache=mapping_cache,
-                    )
-                except FileNotFoundError:
+                    if args.enable_pose:
+                        obj_id, gt_masks, pose_instances, pose_sample, pose_gt_indices = select_pose_target_and_masks(
+                            entry,
+                            pose_cache,
+                            require_pose_eligible=args.pose_stage == "head",
+                        )
+                        catalog_checksums.add(pose_sample.catalog_checksum)
+                        dataset_meta_checksums.add(pose_sample.dataset_meta_checksum)
+                        annotation_checksums.add(pose_sample.annotation_checksum)
+                        symmetry_pipeline_versions.update(pose_sample.symmetry_pipeline_versions)
+                    else:
+                        mapping_path = Path(entry["inst_path"]).with_name(
+                            f"instance_segmentation_mapping_{entry['frame_id']}.json"
+                        )
+                        obj_id, gt_masks = select_target_object_and_masks(
+                            entry["inst_path"],
+                            str(mapping_path),
+                            seg_cache=seg_cache,
+                            mapping_cache=mapping_cache,
+                        )
+                        pose_instances, pose_sample, pose_gt_indices = [], None, []
+                except (FileNotFoundError, ValueError):
+                    if args.enable_pose:
+                        raise
                     continue
                 if obj_id is None or not gt_masks:
                     continue
@@ -2352,7 +2859,10 @@ def main() -> None:
                     continue
                 gt_masks = select_top_gt_masks(gt_masks, max_instances=None)
 
-                image_bgr, gt_masks = data_augmentation(image_bgr, gt_masks)
+                if args.enable_pose:
+                    image_bgr = apply_random_color_distortion(image_bgr)
+                else:
+                    image_bgr, gt_masks = data_augmentation(image_bgr, gt_masks)
 
                 if obj_id not in ref_cache:
                     exemplar_ref = build_exemplar_tokens_for_object(
@@ -2376,6 +2886,9 @@ def main() -> None:
                         "image_bgr": image_bgr,
                         "gt_masks": gt_masks,
                         "exemplar_ref": exemplar_ref,
+                        "pose_instances": pose_instances,
+                        "pose_sample": pose_sample,
+                        "pose_gt_indices": pose_gt_indices,
                     }
                 )
 
@@ -2400,6 +2913,7 @@ def main() -> None:
 
             batch_losses: List[torch.Tensor] = []
             batch_top_ious: List[float] = []
+            batch_pose_components: List[object] = []
             for _, idxs in group_map.items():
                 img_batch = torch.cat([prepared[i]["img_tensor"] for i in idxs], dim=0)
                 with torch.no_grad():
@@ -2408,14 +2922,44 @@ def main() -> None:
 
                 exemplars_list = [prepared[i]["exemplar_ref"] for i in idxs]
                 exemplar_batch, padding_mask = pad_exemplar_batch(exemplars_list, device=device)
+                pose_kwargs = {}
+                if args.enable_pose:
+                    dimensions_batch = torch.stack(
+                        [
+                            torch.as_tensor(prepared[i]["pose_instances"][0].dimensions_m, device=device, dtype=img_batch.dtype)
+                            for i in idxs
+                        ]
+                    )
+                    adjusted_intrinsics = []
+                    for i in idxs:
+                        sample = prepared[i]["pose_sample"]
+                        pre_h, pre_w = prepared[i]["preencode_hw"]
+                        raw_k = torch.as_tensor(sample.frame.intrinsics, device=device, dtype=img_batch.dtype)
+                        adjusted_intrinsics.append(
+                            adjust_intrinsics_for_resize_and_pad(
+                                raw_k, sample.frame.image_size_wh, (pre_w, pre_h)
+                            )
+                        )
+                    pose_kwargs = {
+                        "cad_dimensions_m_b3": dimensions_batch,
+                        "adjusted_intrinsics_b33": torch.stack(adjusted_intrinsics),
+                        "model_image_size_wh": (img_batch.shape[-1], img_batch.shape[-2]),
+                        "return_pose": True,
+                    }
 
-                mask_preds, box_preds, det_scores, det_scores_logits, _ = generate_detections_train(
+                detection_outputs = generate_detections_train(
                     detmodel,
                     encoded_image_features_list,
                     exemplar_batch,
                     detection_filter_threshold=args.det_filter,
                     exemplar_padding_mask_bn=padding_mask,
+                    **pose_kwargs,
                 )
+                if args.enable_pose:
+                    mask_preds, box_preds, det_scores, det_scores_logits, _, pose_predictions = detection_outputs
+                else:
+                    mask_preds, box_preds, det_scores, det_scores_logits, _ = detection_outputs
+                    pose_predictions = None
                 if mask_preds.shape[1] == 0:
                     continue
 
@@ -2446,6 +2990,47 @@ def main() -> None:
                     )
                     if loss is None:
                         continue
+                    if args.enable_pose:
+                        sample = prepared[data_idx]["pose_sample"]
+                        pre_h, pre_w = preencode_hw
+                        raw_k = torch.as_tensor(sample.frame.intrinsics, device=device, dtype=logits_mhw.dtype)
+                        pose_targets = []
+                        for gt_index in prepared[data_idx]["pose_gt_indices"]:
+                            instance = prepared[data_idx]["pose_instances"][gt_index]
+                            pose_targets.append(
+                                make_pose_target(
+                                    instance,
+                                    sample.catalog[instance.cad_id],
+                                    raw_k,
+                                    sample.frame.image_size_wh,
+                                    (pre_w, pre_h),
+                                )
+                            )
+                        full_pose_matches, _ = match_pose_predictions_one_to_one(
+                            logits_mhw,
+                            gt_targets,
+                            eligible_gt_indices=prepared[data_idx]["pose_gt_indices"],
+                        )
+                        target_index = {
+                            gt_index: local_index
+                            for local_index, gt_index in enumerate(prepared[data_idx]["pose_gt_indices"])
+                        }
+                        pose_matches = [
+                            (target_index[gt_index], prediction_index)
+                            for gt_index, prediction_index in full_pose_matches
+                        ]
+                        pose_losses = compute_cad_pose_losses(
+                            pose_predictions,
+                            pose_targets,
+                            pose_matches,
+                            pose_config,
+                            batch_index=local_idx,
+                        )
+                        if pose_losses is not None:
+                            if not torch.isfinite(pose_losses.total):
+                                raise FloatingPointError("Non-finite CAD pose loss")
+                            loss = loss + pose_losses.total
+                            batch_pose_components.append(pose_losses)
                     batch_losses.append(loss)
 
                     scores = det_scores[local_idx]
@@ -2527,6 +3112,30 @@ def main() -> None:
                 loss=float(batch_loss.item()),
                 avg_loss=avg_loss,
                 avg_iou=avg_epoch_iou,
+                pose_center_loss=(
+                    float(np.mean([value.center.detach().float().item() for value in batch_pose_components]))
+                    if batch_pose_components else ""
+                ),
+                pose_depth_loss=(
+                    float(np.mean([value.depth.detach().float().item() for value in batch_pose_components]))
+                    if batch_pose_components else ""
+                ),
+                pose_rotation_loss=(
+                    float(np.mean([value.rotation.detach().float().item() for value in batch_pose_components]))
+                    if batch_pose_components else ""
+                ),
+                pose_quality_loss=(
+                    float(np.mean([value.quality.detach().float().item() for value in batch_pose_components]))
+                    if batch_pose_components else ""
+                ),
+                rotation_error_deg=(
+                    float(np.rad2deg(np.mean([value.mean_rotation_error_rad.detach().float().item() for value in batch_pose_components])))
+                    if batch_pose_components else ""
+                ),
+                translation_error_cm=(
+                    float(100.0 * np.mean([value.mean_translation_error_m.detach().float().item() for value in batch_pose_components]))
+                    if batch_pose_components else ""
+                ),
                 samples=len(batch_losses),
             )
 
@@ -2541,16 +3150,21 @@ def main() -> None:
                 )
                 save_path = os.path.join(args.output_dir, f"finetune.pth")
                 torch.save(
-                    {
-                        "epoch": epoch,
-                        "global_step": global_step,
-                        "batch_step": batch_step,
-                        "image_exemplar_fusion": detmodel.image_exemplar_fusion.state_dict(),
-                        "exemplar_detector": detmodel.exemplar_detector.state_dict(),
-                        "exemplar_segmentation": detmodel.exemplar_segmentation.state_dict(),
-                        "optimizer": optimizer.state_dict(),
-                        "args": vars(args),
-                    },
+                    build_finetune_checkpoint(
+                        detmodel,
+                        optimizer,
+                        args,
+                        epoch=epoch,
+                        global_step=global_step,
+                        batch_step=batch_step,
+                        pose_config=pose_config,
+                        catalog_checksums=catalog_checksums,
+                        dataset_meta_checksums=dataset_meta_checksums,
+                        annotation_checksums=annotation_checksums,
+                        symmetry_pipeline_versions=symmetry_pipeline_versions,
+                        schema_checksums=schema_checksums,
+                        schema_versions=schema_versions,
+                    ),
                     save_path,
                 )
         if epoch_count > 0:
@@ -2567,16 +3181,21 @@ def main() -> None:
         if args.save_every > 0 and epoch % args.save_every == 0:
             save_path = os.path.join(args.output_dir, f"finetune_epoch_{epoch:03d}.pth")
             torch.save(
-                {
-                    "epoch": epoch,
-                    "global_step": global_step,
-                    "batch_step": batch_step,
-                    "image_exemplar_fusion": detmodel.image_exemplar_fusion.state_dict(),
-                    "exemplar_detector": detmodel.exemplar_detector.state_dict(),
-                    "exemplar_segmentation": detmodel.exemplar_segmentation.state_dict(),
-                    "optimizer": optimizer.state_dict(),
-                    "args": vars(args),
-                },
+                build_finetune_checkpoint(
+                    detmodel,
+                    optimizer,
+                    args,
+                    epoch=epoch,
+                    global_step=global_step,
+                    batch_step=batch_step,
+                    pose_config=pose_config,
+                    catalog_checksums=catalog_checksums,
+                    dataset_meta_checksums=dataset_meta_checksums,
+                    annotation_checksums=annotation_checksums,
+                    symmetry_pipeline_versions=symmetry_pipeline_versions,
+                    schema_checksums=schema_checksums,
+                    schema_versions=schema_versions,
+                ),
                 save_path,
             )
             print(f"Saved checkpoint to {save_path}")
@@ -2606,6 +3225,45 @@ def main() -> None:
                 )
             else:
                 print(f"[eval] epoch={epoch}{loss_part} no valid samples")
+            if args.enable_pose and validation_pose_entries:
+                pose_metrics = run_cad_pose_eval(
+                    detmodel,
+                    validation_pose_entries,
+                    args,
+                    device,
+                    pose_config,
+                    calibrate_temperature=True,
+                )
+                append_metric(
+                    metrics_path,
+                    phase="validation_pose_calibrated",
+                    epoch=epoch,
+                    global_step=global_step,
+                    batch_step=batch_step,
+                    samples=int(pose_metrics.get("count", 0)),
+                    **{key: value for key, value in pose_metrics.items() if key != "count"},
+                )
+                calibrated_path = os.path.join(args.output_dir, "finetune_calibrated.pth")
+                torch.save(
+                    build_finetune_checkpoint(
+                        detmodel,
+                        optimizer,
+                        args,
+                        epoch=epoch,
+                        global_step=global_step,
+                        batch_step=batch_step,
+                        pose_config=pose_config,
+                        catalog_checksums=catalog_checksums,
+                        dataset_meta_checksums=dataset_meta_checksums,
+                        annotation_checksums=annotation_checksums,
+                        symmetry_pipeline_versions=symmetry_pipeline_versions,
+                        schema_checksums=schema_checksums,
+                        schema_versions=schema_versions,
+                    ),
+                    calibrated_path,
+                )
+                print(f"[eval:pose:calibrated] {json.dumps(pose_metrics, sort_keys=True)}")
+                print(f"Saved calibrated checkpoint to {calibrated_path}")
 
     print("Done.")
 
