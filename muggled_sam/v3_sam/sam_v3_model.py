@@ -780,6 +780,8 @@ class SAMV3DetectorModel(nn.Module):
             )
 
         if return_pose:
+            # Ensure pose_predictions is present when requested so return type matches
+            assert pose_predictions , "return_pose=True but pose_predictions is None"
             return mask_preds_bnhw, boxes_xy1xy2_bn22, det_scores_bn, pres_scores, pose_predictions
         return mask_preds_bnhw, boxes_xy1xy2_bn22, det_scores_bn, pres_scores
 

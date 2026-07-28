@@ -40,9 +40,12 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     device = torch.device(args.device)
+    # Start from the upstream SAM3 model, then add the detection/pose modules.
     _, base_model = make_sam_from_state_dict(str(args.base_model))
     detector = base_model.make_detector_model().to(device)
     checkpoint = torch.load(args.pose_checkpoint, map_location=device, weights_only=True)
+    # The pose checkpoint contains only the modules fine-tuned for CAD-conditioned
+    # detection and pose estimation; retain the remaining upstream SAM3 weights.
     for key, module in (
         ("image_exemplar_fusion", detector.image_exemplar_fusion),
         ("exemplar_detector", detector.exemplar_detector),
@@ -52,10 +55,12 @@ def main() -> None:
         module.load_state_dict(checkpoint[key])
     detector.eval()
 
+    # OpenCV returns BGR images, which is the format expected by the detector encoder.
     image = cv2.imread(str(args.image), cv2.IMREAD_COLOR)
     render = cv2.imread(str(args.cad_render), cv2.IMREAD_COLOR)
     if image is None or render is None:
         raise FileNotFoundError("Could not load target image or CAD render")
+    # Encode the CAD render once and use its normalized bounding box as the visual exemplar.
     encoded_render, _, _ = detector.encode_detection_image(render, args.max_side_length, True)
     x1, y1, x2, y2 = args.render_box
     exemplar = detector.encode_exemplars(
@@ -64,6 +69,8 @@ def main() -> None:
         box_xy1xy2_norm_list=[((x1, y1), (x2, y2))],
         include_coordinate_encodings=False,
     )
+    # Image encoding may resize and pad the input, so pose estimation must use
+    # intrinsics transformed into the encoded image's coordinate system.
     encoded_image, _, model_hw = detector.encode_detection_image(image, args.max_side_length, True)
     model_h, model_w = model_hw
     original_k = torch.tensor(args.camera_k, device=device, dtype=encoded_image[0].dtype).reshape(3, 3)
@@ -73,6 +80,7 @@ def main() -> None:
         (model_w, model_h),
     ).unsqueeze(0)
     dimensions = torch.tensor(args.dimensions_m, device=device, dtype=encoded_image[0].dtype).unsqueeze(0)
+    # Request segmentation, detection confidence, and metric 6-DoF pose jointly.
     masks, boxes, scores, _, poses = detector.generate_detections(
         encoded_image,
         exemplar,
@@ -81,9 +89,12 @@ def main() -> None:
         camera_intrinsics_b33=adjusted_k,
         return_pose=True,
     )
+    # Suppress duplicate mask proposals before associating the retained entries
+    # with their corresponding boxes, scores, and poses.
     retained = mask_nms_indices(masks[0], scores[0], args.nms_iou)
     masks, boxes, scores, poses = select_detection_candidates(masks[0], boxes[0], scores[0], poses, retained)
     results = format_cad_pose_results(masks, boxes, scores, poses, cad_id=args.cad_id)
+    # Detach tensors and convert them to built-in types so JSON can encode them.
     serializable = [
         {
             "box_xyxy": result["box_xyxy"].detach().float().cpu().tolist(),

@@ -11,12 +11,16 @@ from .types import CADPosePredictions
 
 
 class _PredictionBranch(nn.Sequential):
-    def __init__(self, hidden_dim: int, output_dim: int):
+    def __init__(self, hidden_dim: int, output_dim: int) -> None:
         super().__init__(nn.Linear(hidden_dim, hidden_dim), nn.GELU(), nn.Linear(hidden_dim, output_dim))
 
 
 class SAMV3CADPoseHead(nn.Module):
     """Predict center residual, log-depth, 6-D rotation, and pose quality."""
+
+    dimension_log_mean: Tensor
+    dimension_log_std: Tensor
+    pose_score_temperature: Tensor
 
     def __init__(
         self,
@@ -25,8 +29,12 @@ class SAMV3CADPoseHead(nn.Module):
         dimension_log_mean: tuple[float, float, float] = (0.0, 0.0, 0.0),
         dimension_log_std: tuple[float, float, float] = (1.0, 1.0, 1.0),
         pose_score_temperature: float = 1.0,
-    ):
+    ) -> None:
         super().__init__()
+        if any(std <= 0 for std in dimension_log_std):
+            raise ValueError("Dimension log standard deviations must be positive")
+        if pose_score_temperature <= 0:
+            raise ValueError("Pose-score calibration temperature must be positive")
         input_dim = token_dim + 4 + 3
         self.shared = nn.Sequential(
             nn.Linear(input_dim, hidden_dim),
