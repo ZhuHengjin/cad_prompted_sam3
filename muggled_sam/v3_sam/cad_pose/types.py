@@ -45,6 +45,7 @@ class CADPosePredictions:
         return CADPosePredictions(**values)
 
     def with_translation(self, intrinsics_b33: Tensor, image_size_wh: tuple[int, int]) -> "CADPosePredictions":
+        """Return a copy with metric camera-frame translations back-projected from center and log-depth."""
         centers_px = normalized_to_pixel(self.center_uv_norm_bn2, image_size_wh)
         translation = reconstruct_translation(centers_px, self.log_depth_bn, intrinsics_b33)
         values = {field.name: getattr(self, field.name) for field in fields(self)}
