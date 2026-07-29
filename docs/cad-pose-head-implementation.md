@@ -19,7 +19,7 @@ The implementation adds:
 
 The implementation is intentionally a baseline. It predicts rotation, translation,
 and a calibrated pose-quality score, while preserving the existing segmentation-only
-behavior and checkpoint compatibility.
+behavior and upstream/segmentation checkpoint compatibility.
 
 ## Architecture overview
 
@@ -29,16 +29,13 @@ The data flow is:
 RGB image ──> SAM3 image encoder ──> detector/fusion ──> detection tokens
 CAD render ─> SAM3 exemplar path ────────────────────────┤
                                                          │
-CAD dimensions ──────────────────────────────────────────┤
-                                                         v
-                                                  CAD pose head
-                                                         │
-                                    center residual, log depth,
-                                    6D rotation, pose-quality logit
-                                                         │
-camera intrinsics ───────────────────────────────────────┤
-                                                         v
-                                  rotation matrix + metric translation
+CAD aspect ratios ────────────────> shared pose features ─┼─> box-relative center
+                                                         ├─> 6D rotation
+                                                         └─> pose-quality logit
+effective CAD dimensions ─────────┐
+adjusted camera intrinsics ───────┴─> depth fusion ─────────> log depth
+                                                                    │
+predicted center + adjusted intrinsics ─────────────────────────────┴─> metric translation
 ```
 
 The segmentation detector remains responsible for masks, boxes, and detection
@@ -75,12 +72,21 @@ confidence and pose confidence remain separate quantities.
 - detector candidate tokens with shape `B x N x 256`;
 - normalized detector boxes in `xyxy` form with shape `B x N x 2 x 2`;
 - metric CAD dimensions with shape `B x 3`;
+- resize-adjusted camera intrinsics with shape `B x 3 x 3`;
+- the model input image size `(width, height)`;
 - an optional reserved CAD-geometry-token argument.
 
-Boxes are converted to normalized `(center_x, center_y, width, height)`. CAD
-dimensions are converted to log space and normalized with statistics fitted from the
-training split. The normalized box features and dimension features are broadcast over
-candidates and concatenated with each 256-dimensional detector token.
+Boxes are converted to normalized `(center_x, center_y, width, height)`. Log CAD
+dimensions are decomposed into scale-free aspect ratios and absolute log dimensions.
+Only the aspect ratios are concatenated with the box and 256-dimensional detection
+token in the shared pose trunk.
+
+The adjusted camera matrix is divided by the model raster width/height convention.
+For each candidate, the head derives normalized log focal lengths, principal point,
+the box-center camera ray, and angular box extent. These camera features and the
+training-statistic-normalized absolute log dimensions enter a depth-specific fusion
+layer. Absolute metric dimensions and camera features do not enter the center or
+rotation branches.
 
 The current baseline reserves the geometry-token input for future use but does not
 consume it. Conditioning is through the exact metric CAD dimensions required by the
@@ -88,11 +94,13 @@ dataset contract.
 
 ### Network outputs
 
-Two shared `Linear + LayerNorm + GELU` blocks feed four prediction branches:
+Two shared `Linear + LayerNorm + GELU` blocks encode scale-invariant candidate
+features. A depth-specific `Linear + LayerNorm + GELU` layer adds metric dimensions
+and camera features before the depth branch:
 
 | Branch | Size | Meaning |
 | --- | ---: | --- |
-| Center residual | 2 | Offset from the detector-box center in normalized image coordinates |
+| Center residual | 2 | Offset in detector-box width/height units |
 | Log depth | 1 | Metric camera-space depth in log form |
 | Rotation 6D | 6 | Continuous two-column rotation representation |
 | Pose-quality logit | 1 | Confidence that the pose meets the configured tolerances |
@@ -100,10 +108,13 @@ Two shared `Linear + LayerNorm + GELU` blocks feed four prediction branches:
 There is deliberately no scale or size prediction branch. The object dimensions are
 known CAD metadata, and per-instance uniform scale is already part of the dataset
 record. Predicting scale again would introduce an avoidable scale/depth ambiguity.
+Uniformly rescaling the dimension prompt can therefore change depth but cannot change
+the center or rotation outputs. Center is reconstructed as
+`box_center + center_residual * box_extent`.
 
 `CADPosePredictions` keeps the raw and derived values together:
 
-- center residual and normalized center;
+- box-relative center residual and normalized center;
 - log depth;
 - 6D rotation and its `3 x 3` rotation matrix;
 - pose-quality logits and calibrated probabilities;
@@ -122,7 +133,9 @@ axes, preventing NaNs while retaining differentiability in normal cases.
 ### Translation reconstruction
 
 The head predicts image center `(u, v)` and `log(z)`, not Cartesian translation
-directly. Metric translation is reconstructed as:
+directly. The adjusted intrinsics serve two roles: normalized camera and angular-box
+features condition the depth branch, and pixel-space intrinsics reconstruct metric
+translation:
 
 ```text
 z = exp(log_depth)
@@ -282,6 +295,7 @@ must therefore be transformed with separate `scale_x` and `scale_y` factors.
 `cad_pose/geometry.py` provides helpers for:
 
 - resize/pad intrinsic adjustment;
+- pixel-to-normalized intrinsic conversion;
 - normalized/pixel coordinate conversion;
 - camera-space translation reconstruction;
 - point projection;
@@ -292,7 +306,9 @@ invalidate the camera model and annotation geometry. Color distortion remains
 available. Segmentation-only training keeps the previous augmentation behavior.
 
 The low-level `generate_detections` pose path expects intrinsics already adjusted to
-the model input image. The example CLI performs this adjustment.
+the model input image. It passes the adjusted matrix and model raster size into the
+pose head, which normalizes the matrix and derives camera rays and angular box
+extents. The example CLI performs the initial resize adjustment.
 
 ## SAM3 model integration
 
@@ -415,6 +431,7 @@ checkpoint:
 | Field | Purpose |
 | --- | --- |
 | `cad_pose_head` | Pose-head parameters and calibrated temperature buffer |
+| `cad_pose_head_architecture_version` | Rejects incompatible pre-branch-routing pose heads |
 | optimizer state | Optimizer/scheduler continuation for a compatible training stage |
 | `pose_config` | Depth normalization statistics, loss weights, and tolerances |
 | `args` | Full CLI configuration, including the selected pose stage |
@@ -430,7 +447,10 @@ annotation and schema checksums are also retained for auditing, but are not curr
 resume-blocking comparisons. Optimizer state is restored only when compatible with
 the current trainable parameters; otherwise the script warns and starts a new
 optimizer. Older segmentation checkpoints without `cad_pose_head` remain valid and
-initialize a new pose head.
+initialize a new pose head; an incompatible untrained pose-head entry in a
+segmentation-only checkpoint is ignored. Trained pose-head checkpoints from
+architecture version 1 are not compatible with the branch-specific version 2 head
+and must be retrained.
 
 The final validation calibration is saved as `finetune_calibrated.pth` so inference
 and test evaluation use the fitted pose-score temperature.
@@ -570,8 +590,9 @@ The following plan items remain future work:
   Perseve data pipeline.
 
 The public low-level pose API requires camera intrinsics already transformed to the
-model input coordinates. The example CLI handles this, but custom callers must do the
-same.
+model input coordinates. The model raster size is used internally to normalize those
+intrinsics. The example CLI handles the resize adjustment, but custom callers must do
+the same.
 
 Finally, the repository-level checks do not replace an end-to-end run with real
 Perseve data, a SAM3 checkpoint, PyTorch/OpenCV, and a GPU. That integration run is

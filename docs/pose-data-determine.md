@@ -121,6 +121,8 @@ pose_predictions = pose_head(
     detection_tokens_bnc,
     boxes_xy1xy2_bn22,
     cad_dimensions_m_b3,
+    adjusted_camera_intrinsics_b33,
+    model_image_size_wh,
 )
 ```
 
@@ -128,6 +130,8 @@ At inference, the caller supplies the real dimensions of the prompted object,
 obtained from a metric CAD mesh, a CAD catalog, or explicit user input. Merely
 recording dimensions as ground truth is insufficient: they must be available
 to the model at both training and inference for metric translation.
+The adjusted camera intrinsics are normalized inside the head and condition
+depth together with dimensions and angular box extent.
 
 Random scaling across scenes is valid and useful augmentation. For example,
 the same CAD may be rendered at 8 cm in one scene and 15 cm in another, as long

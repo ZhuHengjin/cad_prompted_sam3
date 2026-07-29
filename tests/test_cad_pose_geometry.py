@@ -8,6 +8,7 @@ try:
 
     from muggled_sam.v3_sam.cad_pose.geometry import (
         adjust_intrinsics_for_resize_and_pad,
+        normalize_intrinsics,
         project_points,
         reconstruct_translation,
         rotation_6d_to_matrix,
@@ -47,15 +48,46 @@ class CADPoseGeometryTests(unittest.TestCase):
         resized = project_points(point, adjusted)
         torch.testing.assert_close(resized, original * torch.tensor([1008 / 640, 1008 / 480]))
 
-    def test_pose_head_uses_effective_dimensions_and_has_no_scale_branch(self):
+    def test_intrinsics_normalization_matches_normalized_image_coordinates(self):
+        intrinsics = torch.tensor([[500.0, 2.0, 320.0], [0, 510.0, 240.0], [0, 0, 1.0]])
+        normalized = normalize_intrinsics(intrinsics, (641, 481))
+        expected = torch.tensor([[500 / 640, 2 / 640, 0.5], [0, 510 / 480, 0.5], [0, 0, 1.0]])
+        torch.testing.assert_close(normalized, expected)
+
+    def test_pose_head_routes_absolute_size_and_intrinsics_to_depth_only(self):
         torch.manual_seed(3)
         head = SAMV3CADPoseHead(token_dim=8, hidden_dim=16)
         tokens = torch.zeros(1, 2, 8)
         boxes = torch.tensor([[[[0.1, 0.2], [0.4, 0.6]], [[0.2, 0.3], [0.5, 0.7]]]])
-        small = head(tokens, boxes, torch.tensor([[0.01, 0.02, 0.03]]))
-        large = head(tokens, boxes, torch.tensor([[0.10, 0.20, 0.30]]))
+        intrinsics = torch.tensor([[[500.0, 0, 320.0], [0, 500.0, 240.0], [0, 0, 1.0]]])
+        small = head(tokens, boxes, torch.tensor([[0.01, 0.02, 0.03]]), intrinsics, (640, 480))
+        large = head(tokens, boxes, torch.tensor([[0.10, 0.20, 0.30]]), intrinsics, (640, 480))
         self.assertFalse(torch.allclose(small.log_depth_bn, large.log_depth_bn))
+        torch.testing.assert_close(small.center_uv_norm_bn2, large.center_uv_norm_bn2)
+        torch.testing.assert_close(small.rotation_matrix_bn33, large.rotation_matrix_bn33)
+
+        wider_fov = intrinsics.clone()
+        wider_fov[:, 0, 0] = 250.0
+        wider_fov[:, 1, 1] = 250.0
+        changed_camera = head(tokens, boxes, torch.tensor([[0.01, 0.02, 0.03]]), wider_fov, (640, 480))
+        self.assertFalse(torch.allclose(small.log_depth_bn, changed_camera.log_depth_bn))
+        torch.testing.assert_close(small.center_uv_norm_bn2, changed_camera.center_uv_norm_bn2)
         self.assertFalse(any("scale" in name or "size" in name for name, _ in head.named_parameters()))
+
+    def test_pose_head_center_residual_is_box_relative(self):
+        torch.manual_seed(4)
+        head = SAMV3CADPoseHead(token_dim=8, hidden_dim=16)
+        tokens = torch.zeros(1, 1, 8)
+        boxes = torch.tensor([[[[0.1, 0.2], [0.5, 0.8]]]])
+        dimensions = torch.tensor([[0.01, 0.02, 0.03]])
+        intrinsics = torch.tensor([[[500.0, 0, 320.0], [0, 500.0, 240.0], [0, 0, 1.0]]])
+        predictions = head(tokens, boxes, dimensions, intrinsics, (640, 480))
+        box_center = torch.tensor([[[0.3, 0.5]]])
+        box_extent = torch.tensor([[[0.4, 0.6]]])
+        torch.testing.assert_close(
+            predictions.center_uv_norm_bn2,
+            box_center + predictions.center_residual_bn2 * box_extent,
+        )
 
     def test_discrete_and_continuous_symmetries(self):
         identity = torch.eye(3)

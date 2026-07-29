@@ -694,6 +694,11 @@ class SAMV3DetectorModel(nn.Module):
             exemplar_2 = [3,4,5,6,7]  -----> [3,4,5,6,7]                      [0,0,0,0,0]
         The padding mask prevents padded entries from affecting attention calculations.
 
+        Set ``return_pose=True`` to also predict CAD pose. This requires effective
+        physical CAD dimensions and camera intrinsics already adjusted to the encoded
+        model image. Metric dimensions, normalized intrinsics, and angular box extent
+        condition depth; the same pixel-space intrinsics reconstruct translation.
+
         Returns:
             mask_predictions, box_xy1xy2_predictions, detection_scores, presence_score
             -> Masks have shape: BxNxHxW (B batches, N masks, H & W are 4x the image tokens, 288 by default)
@@ -728,9 +733,15 @@ class SAMV3DetectorModel(nn.Module):
                     raise ValueError("cad_dimensions_m_b3 is required when return_pose=True")
                 if camera_intrinsics_b33 is None:
                     raise ValueError("Adjusted camera_intrinsics_b33 is required when return_pose=True")
-                pose_predictions = self.cad_pose_head(blk_tok, blk_box, cad_dimensions_m_b3)
                 patch_size = self.image_encoder.get_image_tiling_size_constraint()
                 image_size_wh = (lowres_imgenc_bchw.shape[-1] * patch_size, lowres_imgenc_bchw.shape[-2] * patch_size)
+                pose_predictions = self.cad_pose_head(
+                    blk_tok,
+                    blk_box,
+                    cad_dimensions_m_b3,
+                    camera_intrinsics_b33,
+                    image_size_wh,
+                )
                 pose_predictions = pose_predictions.with_translation(camera_intrinsics_b33, image_size_wh)
                 return blk_masks, blk_box, blk_score, blk_pres, pose_predictions
 
@@ -752,9 +763,15 @@ class SAMV3DetectorModel(nn.Module):
                     raise ValueError("cad_dimensions_m_b3 is required when return_pose=True")
                 if camera_intrinsics_b33 is None:
                     raise ValueError("Adjusted camera_intrinsics_b33 is required when return_pose=True")
-                pose_predictions = self.cad_pose_head(enc_det_tokens_bnc, boxes_xy1xy2_bn22, cad_dimensions_m_b3)
                 patch_size = self.image_encoder.get_image_tiling_size_constraint()
                 image_size_wh = (lowres_imgenc_bchw.shape[-1] * patch_size, lowres_imgenc_bchw.shape[-2] * patch_size)
+                pose_predictions = self.cad_pose_head(
+                    enc_det_tokens_bnc,
+                    boxes_xy1xy2_bn22,
+                    cad_dimensions_m_b3,
+                    camera_intrinsics_b33,
+                    image_size_wh,
+                )
                 pose_predictions = pose_predictions.with_translation(camera_intrinsics_b33, image_size_wh)
 
             # Special optimization: Filter out 'bad' detections before performing segmentation

@@ -798,11 +798,16 @@ def generate_detections_train(
         # Handle pose prediction when there are no exemplars.
         if cad_dimensions_m_b3 is None:
             raise ValueError("cad_dimensions_m_b3 is required for pose training")
-        pose_predictions = detmodel.cad_pose_head(blk_tok, blk_box, cad_dimensions_m_b3)
-        if adjusted_intrinsics_b33 is not None:
-            if model_image_size_wh is None:
-                raise ValueError("model_image_size_wh is required with adjusted intrinsics")
-            pose_predictions = pose_predictions.with_translation(adjusted_intrinsics_b33, model_image_size_wh)
+        if adjusted_intrinsics_b33 is None or model_image_size_wh is None:
+            raise ValueError("Adjusted intrinsics and model_image_size_wh are required for pose training")
+        pose_predictions = detmodel.cad_pose_head(
+            blk_tok,
+            blk_box,
+            cad_dimensions_m_b3,
+            adjusted_intrinsics_b33,
+            model_image_size_wh,
+        )
+        pose_predictions = pose_predictions.with_translation(adjusted_intrinsics_b33, model_image_size_wh)
         return blk_masks, blk_box, blk_score, blk_score_logits, blk_pres, pose_predictions
 
     fused_imgexm_tokens_bchw = detmodel.image_exemplar_fusion(
@@ -819,11 +824,16 @@ def generate_detections_train(
     if return_pose:
         if cad_dimensions_m_b3 is None:
             raise ValueError("cad_dimensions_m_b3 is required for pose training")
-        pose_predictions = detmodel.cad_pose_head(enc_det_tokens_bnc, boxes_xy1xy2_bn22, cad_dimensions_m_b3)
-        if adjusted_intrinsics_b33 is not None:
-            if model_image_size_wh is None:
-                raise ValueError("model_image_size_wh is required with adjusted intrinsics")
-            pose_predictions = pose_predictions.with_translation(adjusted_intrinsics_b33, model_image_size_wh)
+        if adjusted_intrinsics_b33 is None or model_image_size_wh is None:
+            raise ValueError("Adjusted intrinsics and model_image_size_wh are required for pose training")
+        pose_predictions = detmodel.cad_pose_head(
+            enc_det_tokens_bnc,
+            boxes_xy1xy2_bn22,
+            cad_dimensions_m_b3,
+            adjusted_intrinsics_b33,
+            model_image_size_wh,
+        )
+        pose_predictions = pose_predictions.with_translation(adjusted_intrinsics_b33, model_image_size_wh)
 
     if detection_filter_threshold > 1e-3:
         if det_scores_bn.shape[0] != 1:
@@ -1800,7 +1810,19 @@ def load_finetune_checkpoint(
             raise KeyError(f"Checkpoint missing '{key}' state.")
         module.load_state_dict(checkpoint[key])
     if "cad_pose_head" in checkpoint:
-        detmodel.cad_pose_head.load_state_dict(checkpoint["cad_pose_head"])
+        checkpoint_version = int(checkpoint.get("cad_pose_head_architecture_version", 1))
+        if checkpoint_version != detmodel.cad_pose_head.architecture_version:
+            checkpoint_args = checkpoint.get("args") or {}
+            checkpoint_pose_enabled = bool(checkpoint_args.get("enable_pose", False))
+            if checkpoint_pose_enabled or checkpoint.get("pose_config") is not None:
+                raise ValueError(
+                    "CAD pose-head checkpoint architecture version "
+                    f"{checkpoint_version} is incompatible with model version "
+                    f"{detmodel.cad_pose_head.architecture_version}; retrain the pose head"
+                )
+            warnings.warn("Ignoring an incompatible untrained pose head from a segmentation checkpoint")
+        else:
+            detmodel.cad_pose_head.load_state_dict(checkpoint["cad_pose_head"])
     if optimizer is not None and load_optimizer and "optimizer" in checkpoint:
         try:
             optimizer.load_state_dict(checkpoint["optimizer"])
@@ -1834,6 +1856,7 @@ def build_finetune_checkpoint(
         "exemplar_detector": detmodel.exemplar_detector.state_dict(),
         "exemplar_segmentation": detmodel.exemplar_segmentation.state_dict(),
         "cad_pose_head": detmodel.cad_pose_head.state_dict(),
+        "cad_pose_head_architecture_version": detmodel.cad_pose_head.architecture_version,
         "optimizer": optimizer.state_dict(),
         "pose_config": None if pose_config is None else pose_config.__dict__,
         "catalog_checksums": sorted(catalog_checksums),

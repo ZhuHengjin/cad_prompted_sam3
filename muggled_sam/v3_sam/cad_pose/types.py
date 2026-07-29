@@ -11,7 +11,11 @@ from .geometry import normalized_to_pixel, reconstruct_translation
 
 @dataclass(frozen=True)
 class CADPosePredictions:
-    """Per-candidate pose predictions. Tensor fields share leading ``B x N`` dimensions."""
+    """Per-candidate pose predictions.
+
+    Tensor fields share leading ``B x N`` dimensions.
+    ``center_residual_bn2`` is expressed in predicted-box width/height units.
+    """
 
     center_residual_bn2: Tensor
     center_uv_norm_bn2: Tensor

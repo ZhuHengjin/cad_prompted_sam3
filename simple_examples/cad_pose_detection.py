@@ -44,6 +44,13 @@ def main() -> None:
     _, base_model = make_sam_from_state_dict(str(args.base_model))
     detector = base_model.make_detector_model().to(device)
     checkpoint = torch.load(args.pose_checkpoint, map_location=device, weights_only=True)
+    checkpoint_version = int(checkpoint.get("cad_pose_head_architecture_version", 1))
+    if checkpoint_version != detector.cad_pose_head.architecture_version:
+        raise ValueError(
+            "CAD pose-head checkpoint architecture version "
+            f"{checkpoint_version} is incompatible with model version "
+            f"{detector.cad_pose_head.architecture_version}"
+        )
     # The pose checkpoint contains only the modules fine-tuned for CAD-conditioned
     # detection and pose estimation; retain the remaining upstream SAM3 weights.
     for key, module in (

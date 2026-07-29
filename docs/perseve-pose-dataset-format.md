@@ -519,6 +519,8 @@ pose_predictions = pose_head(
     detection_tokens_bnc,
     boxes_xy1xy2_bn22,
     cad_dimensions_m_b3,
+    adjusted_camera_intrinsics_b33,
+    model_image_size_wh,
 )
 ```
 

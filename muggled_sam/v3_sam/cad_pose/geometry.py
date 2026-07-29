@@ -105,6 +105,20 @@ def adjust_intrinsics_for_resize_and_pad(
     return adjusted
 
 
+def normalize_intrinsics(intrinsics: Tensor, image_size_wh: tuple[int, int]) -> Tensor:
+    """Express pixel-space pinhole intrinsics in normalized image coordinates."""
+
+    if intrinsics.shape[-2:] != (3, 3):
+        raise ValueError(f"Expected intrinsics ending in 3x3, got {tuple(intrinsics.shape)}")
+    width, height = image_size_wh
+    if width <= 0 or height <= 0:
+        raise ValueError("Image dimensions must be positive")
+    normalized = intrinsics.clone()
+    normalized[..., 0, :] /= max(width - 1, 1)
+    normalized[..., 1, :] /= max(height - 1, 1)
+    return normalized
+
+
 def normalized_to_pixel(center_uv_norm: Tensor, image_size_wh: tuple[int, int]) -> Tensor:
     """Map normalized coordinates to the top-left-pixel-center raster convention."""
 

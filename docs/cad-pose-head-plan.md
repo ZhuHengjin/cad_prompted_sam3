@@ -39,7 +39,9 @@ CAD render exemplars ─> exemplar encoding  ───┘
               detection tokens + boxes
                     /                \
                    v                  v
-       existing segmentation       new pose head <── effective prompted dimensions
+       existing segmentation       new pose head <── effective dimensions
+                                           ^
+                                           └──────── adjusted camera intrinsics
                    │                  │
                    └──── mask + box + R + t + pose score
 ```
@@ -55,7 +57,7 @@ translation coordinates:
 
 | Quantity | Output dimension | Representation |
 | --- | ---: | --- |
-| Projected object center | 2 | normalized image coordinates or residual from the predicted box center |
+| Projected object center | 2 | box-relative residual from the predicted box center |
 | Depth | 1 | log-depth |
 | Rotation | 6 | continuous 6-D rotation representation |
 | Pose quality | 1 | calibrated probability that the pose meets declared task tolerances |
@@ -108,6 +110,8 @@ pose_predictions = pose_head(
     detection_tokens_bnc,
     boxes_xy1xy2_bn22,
     cad_dimensions_m_b3,
+    adjusted_camera_intrinsics_b33,
+    model_image_size_wh,
     cad_geometry_tokens_bkc=None,
 )
 ```
@@ -115,16 +119,28 @@ pose_predictions = pose_head(
 The first version should remain small:
 
 1. Convert each box to normalized (cx, cy, w, h).
-2. Normalize `log(cad_dimensions_m_b3)` using training-split statistics and
-   broadcast it across that CAD prompt's candidate tokens.
-3. Concatenate the box and dimension features with the 256-D detection token.
-4. Pass the result through a shared two-layer MLP with LayerNorm and GELU.
-5. Use separate MLP branches for center residual, log-depth, 6-D rotation,
-   and pose confidence.
+2. Decompose `log(cad_dimensions_m_b3)` into scale-free aspect ratios and
+   absolute log dimensions normalized with training-split statistics.
+3. Concatenate the detection token, box features, and scale-free aspect ratios,
+   then pass them through a shared two-layer MLP with LayerNorm and GELU.
+4. Predict the center residual in detector-box width/height units:
+   $(u,v)=(c_x,c_y)+(\Delta_xw,\Delta_yh)$. Absolute metric dimensions and
+   camera intrinsics must not enter this branch.
+5. Normalize the already resize-adjusted camera intrinsics into model-image
+   coordinates. Derive log focal lengths, principal point, the candidate center
+   ray, and angular box extent.
+6. Fuse the shared candidate representation, normalized absolute log
+   dimensions, and camera features in a depth-specific MLP before predicting
+   log-depth.
+7. Predict 6-D rotation and pose confidence from the shared scale-invariant
+   candidate representation.
 
-The center branch predicts a residual from the detected box center. The depth
-branch is also box-conditioned, matching the useful dependency in YOPO's
-released configuration.
+This routing encodes the intended invariances. Uniformly changing the supplied
+physical size may change metric depth but cannot move the projected center or
+change rotation. Changing focal length may change depth through the angular-size
+relationship, while the center remains an image-space prediction. CAD aspect
+ratios remain available to center and rotation because canonical geometry can
+affect the offset between the visible box center and projected CAD origin.
 
 The dimension input is required in the baseline. It supplies the physical-size
 cue needed to disambiguate monocular translation under Perseve's random object
@@ -334,6 +350,8 @@ shared detection-token gradients.
   the versioned JSON Schemas.
 - Round-trip canonical CAD points through every annotated pose.
 - Reproject object centers and cuboid corners with adjusted intrinsics.
+- Verify normalized intrinsics, center rays, and angular box extents after every
+  supported model resize.
 - Overlay projected CAD geometry on RGB images and instance masks.
 - Recompute logical-RGBA mask joins and inclusive mask-derived boxes.
 - Check source-unit conversion, rigid source-to-canonical transforms, and
@@ -351,6 +369,8 @@ shared detection-token gradients.
 - Use one-to-one mask-based pose matching.
 - Consume the supplied effective prompted dimensions as a required pose-head
   input.
+- Condition depth on normalized adjusted intrinsics and angular box extent.
+- Keep center offsets box-relative and invariant to uniform metric rescaling.
 - Train the pose-confidence branch with the detached soft pose-quality target.
 
 ### Stage 2: detector adaptation
@@ -389,7 +409,9 @@ prediction.
 Pose prediction happens before filtering. NMS and thresholding must preserve
 candidate indices. Translation is reconstructed using intrinsics adjusted for
 the model's actual input geometry and reported in the declared camera
-coordinate system. `pose_score` is the validation-calibrated probability that the reported pose
+coordinate system. The same adjusted intrinsics are normalized inside the pose
+head to condition log-depth on focal length and angular box extent.
+`pose_score` is the validation-calibrated probability that the reported pose
 meets the declared task tolerances; it is separate from `detection_score`. A
 canonicalized rotation may be provided for display, but
 the raw pose and symmetry metadata remain available to downstream code.
@@ -415,7 +437,8 @@ Preserve an untouched test split following the existing manifest workflow.
 ## Implementation roadmap
 
 1. Add muggled_sam/v3_sam/cad_pose/head.py with typed prediction outputs,
-   required effective-dimension conditioning, and 6-D rotation conversion.
+   branch-specific effective-dimension and intrinsic conditioning, box-relative
+   center prediction, and 6-D rotation conversion.
 2. Add geometry and symmetry utilities with tests for rotation equivalence,
    translation reconstruction, projection, and continuous-axis losses.
 3. Register the pose head in the SAM3 detector wrapper and construction path.
@@ -444,8 +467,12 @@ The baseline is complete when:
 - existing segmentation inference and checkpoints remain usable;
 - a batch produces finite center, depth, rotation, and pose-confidence outputs
   for every detection token;
-- changing the supplied effective dimensions changes the pose-head conditioning,
-  while no scale or size prediction branch exists;
+- uniformly changing the supplied effective dimensions changes depth
+  conditioning but leaves center and rotation outputs unchanged, while no scale
+  or size prediction branch exists;
+- changing adjusted focal length changes depth conditioning but not the
+  image-space center branch;
+- center residuals are expressed in predicted-box width/height units;
 - one-to-one pose matching aligns each GT instance with the correct mask token;
 - schema, logical-RGBA mask, inclusive-box, scale-sharing, and effective-
   dimension validation pass for generated training data;
