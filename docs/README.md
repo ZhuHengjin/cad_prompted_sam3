@@ -14,4 +14,3 @@ This folder holds project-specific notes for CAD-prompted SAM3 work. Upstream Mu
 - [Label-free point-set pose supervision](point-set-pose-supervision-plan.md): active geometry-artifact, centroid, loss, compute, evaluation, and acceptance contract that replaces explicit symmetry labels.
 - [CAD pose-head implementation guide](cad-pose-head-implementation.md): the implemented point-set/centroid path, including architecture, dataset validation, training, inference, tests, and legacy v1 compatibility.
 - [Perseve pose-label and dataset format](perseve-pose-dataset-format.md): active v2 point-set sidecar contract; legacy v1 symmetry fields remain documented for compatibility.
-- [Pose data decisions](pose-data-determine.md): mask, box, scale, canonical-frame, centroid, and point-set supervision decisions.

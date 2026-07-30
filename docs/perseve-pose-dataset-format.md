@@ -15,10 +15,6 @@ loader also accepts the old v1 explicit-symmetry format, retained at the end of
 this document under
 [Superseded v1 compatibility: explicit symmetry labels](#superseded-v1-compatibility-explicit-symmetry-labels).
 
-[Pose data decisions](pose-data-determine.md) is the authority for choices made
-before this specification was frozen. This document incorporates those choices
-as format requirements.
-
 The main decisions are:
 
 - preserve Perseve's existing RGB, instance-segmentation, and scene-parameter
@@ -331,11 +327,19 @@ IDs are deliberately outside v1. The existing manifest's
 
 #### Mask and box semantics
 
-The mapping JSON key is the authoritative pose-to-mask join. V1 masks are
-four-channel PNGs whose mapping values are logical RGBA. An OpenCV loader reads
-the image unchanged, converts in-memory BGRA to RGBA, and then compares all four
-channels, including alpha. Three-channel and grayscale fallback behavior is
-outside v1.
+The mapping JSON key is the authoritative pose-to-mask join. V1 and v2 masks
+are four-channel PNGs whose mapping values are logical RGBA. An OpenCV loader
+reads the image unchanged, converts in-memory BGRA to RGBA, and then compares
+all four channels, including alpha.
+
+Perseve's existing segmentation loader has three-channel and grayscale fallback
+branches, but they do not define compatible pose-dataset encodings. The
+three-channel branch promotes BGR to BGRA without performing the four-channel
+path's BGRA-to-RGBA conversion. The grayscale branch promotes intensities to
+BGRA rather than interpreting them as instance IDs. Supporting RGB masks or
+single-channel instance-ID masks therefore requires a separately declared
+encoding and matching loader behavior; neither fallback is part of the v1 or
+v2 contract.
 
 `bbox_xyxy_px` is derived from the decoded binary mask and stores integer
 
@@ -352,6 +356,10 @@ pixel_height = y_max_inclusive - y_min + 1
 
 Replicator's tight box is not copied without explicit conversion and equality
 validation against the mask-derived box.
+
+Integrations that require half-open boxes convert the stored value by adding
+one to `x_max_inclusive` and `y_max_inclusive`. The dataset itself always
+retains inclusive endpoints.
 
 #### Invisible and invalid objects
 
@@ -492,6 +500,22 @@ dimension prompt used for all detections of that CAD in an image. The validator
 enforces equal `render_scale_xyz` and `dimensions_m` for repeated
 `(scene_id, cad_id)` pairs within the declared tolerances. Artificial
 anisotropic distortion is not required.
+
+Sampling separate scales for two occurrences of the same CAD in one image
+would make the shared CAD-and-dimensions prompt ambiguous: monocular appearance
+cannot uniquely distinguish a smaller nearby copy from a larger distant copy.
+The generator therefore maintains a scene-local cache keyed by the full stable
+`cad_id`:
+
+```python
+scale_by_cad = {}
+
+for cad in selected_cads:
+    if cad.cad_id not in scale_by_cad:
+        scale_by_cad[cad.cad_id] = sample_scale(cad)
+
+    place_object(cad, scale=scale_by_cad[cad.cad_id])
+```
 
 The baseline model call is
 
@@ -798,7 +822,6 @@ provenance were required to agree.
 
 ## References
 
-- [Pose data decisions](pose-data-determine.md)
 - [CAD-prompted SAM3 pose-head plan](cad-pose-head-plan.md)
 - [Label-free point-set pose supervision](point-set-pose-supervision-plan.md)
 - [Perseve synthetic generator](../../perseve/src/perseve/synthetic_data_generation/generate_dataset.py)
