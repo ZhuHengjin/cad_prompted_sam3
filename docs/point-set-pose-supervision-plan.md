@@ -262,6 +262,8 @@ until this floor is measured on representative CADs.
 
 ## Optional full-pose consistency loss
 
+(The loss that combines the both rotation and translation into a single nearest-neighbor term.)
+
 An optional auxiliary term compares complete camera-space placements:
 
 $$
