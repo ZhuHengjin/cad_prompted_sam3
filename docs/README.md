@@ -10,6 +10,8 @@ This folder holds project-specific notes for CAD-prompted SAM3 work. Upstream Mu
 
 ## Model Extensions
 
-- [CAD pose-head plan](cad-pose-head-plan.md): architecture, representation, symmetry-aware supervision, data contract, training stages, evaluation, and implementation roadmap for a YOPO-inspired 9-DoF head.
-- [CAD pose-head implementation guide](cad-pose-head-implementation.md): architecture, dataset validation, training stages, losses, provenance, evaluation, inference, tests, and current limitations.
-- [Perseve pose-label and dataset format](perseve-pose-dataset-format.md): canonical frames, camera-space pose capture, versioned sidecars, scale modes, mask identity, validation, and optional BOP export for Perseve synthetic data.
+- [CAD pose-head plan](cad-pose-head-plan.md): target architecture, AABB-frame centroid representation, label-free point-set supervision, training stages, evaluation, and migration roadmap.
+- [Label-free point-set pose supervision](point-set-pose-supervision-plan.md): active geometry-artifact, centroid, loss, compute, evaluation, and acceptance contract that replaces explicit symmetry labels.
+- [CAD pose-head implementation guide](cad-pose-head-implementation.md): the implemented point-set/centroid path, including architecture, dataset validation, training, inference, tests, and legacy v1 compatibility.
+- [Perseve pose-label and dataset format](perseve-pose-dataset-format.md): active v2 point-set sidecar contract; legacy v1 symmetry fields remain documented for compatibility.
+- [Pose data decisions](pose-data-determine.md): mask, box, scale, canonical-frame, centroid, and point-set supervision decisions.

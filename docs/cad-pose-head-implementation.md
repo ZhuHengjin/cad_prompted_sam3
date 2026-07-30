@@ -2,15 +2,24 @@
 
 ## Status and scope
 
-This document describes the implementation of the CAD-conditioned 6D pose baseline
-defined in [the pose-head plan](cad-pose-head-plan.md), using the dataset contract in
-[the Perseve pose dataset format](perseve-pose-dataset-format.md).
+This document records the implemented CAD-conditioned 6D pose baseline. New
+datasets use the schema-v2 label-free point-set design in
+[the point-set supervision plan](point-set-pose-supervision-plan.md). The
+public pose remains AABB-origin `T_cam_from_cad`; the model's internal
+translation target is the known CAD surface centroid in camera coordinates.
+
+The v1 explicit-symmetry implementation remains supported for old datasets.
+Trained pose-head checkpoints from architecture versions 1 and 2 are
+intentionally incompatible with the new centroid interface and must be
+retrained. The legacy fields and behavior are isolated under
+[Superseded implementation details: explicit symmetry labels](#superseded-implementation-details-explicit-symmetry-labels).
 
 The implementation adds:
 
 - strict Perseve pose-dataset loading and validation;
 - a CAD-dimension-conditioned pose head attached to SAM3 detection tokens;
-- symmetry-aware pose losses and deterministic mask-based assignment;
+- deterministic point-set artifacts and schema-v2 dataset validation;
+- centroid-centered label-free rotation loss and deterministic mask assignment;
 - head-only and joint training stages;
 - checkpoint provenance and resume validation;
 - validation/test metrics and validation-only score calibration;
@@ -29,13 +38,13 @@ The data flow is:
 RGB image ──> SAM3 image encoder ──> detector/fusion ──> detection tokens
 CAD render ─> SAM3 exemplar path ────────────────────────┤
                                                          │
-CAD aspect ratios ────────────────> shared pose features ─┼─> box-relative center
+CAD aspect ratios ────────────────> shared pose features ─┼─> box-relative surface centroid
                                                          ├─> 6D rotation
                                                          └─> pose-quality logit
 effective CAD dimensions ─────────┐
-adjusted camera intrinsics ───────┴─> depth fusion ─────────> log depth
+adjusted camera intrinsics ───────┴─> depth fusion ─────────> centroid log depth
                                                                     │
-predicted center + adjusted intrinsics ─────────────────────────────┴─> metric translation
+predicted centroid + R + scaled CAD centroid ───────────────────────┴─> AABB-origin translation
 ```
 
 The segmentation detector remains responsible for masks, boxes, and detection
@@ -50,7 +59,7 @@ confidence and pose confidence remain separate quantities.
 | Pose head | [`muggled_sam/v3_sam/cad_pose/head.py`](../muggled_sam/v3_sam/cad_pose/head.py) |
 | Prediction and target data contracts | [`muggled_sam/v3_sam/cad_pose/types.py`](../muggled_sam/v3_sam/cad_pose/types.py) |
 | Camera and rotation geometry | [`muggled_sam/v3_sam/cad_pose/geometry.py`](../muggled_sam/v3_sam/cad_pose/geometry.py) |
-| Symmetry-aware rotation error | [`muggled_sam/v3_sam/cad_pose/symmetry.py`](../muggled_sam/v3_sam/cad_pose/symmetry.py) |
+| Point-set preprocessing and loading | [`muggled_sam/v3_sam/cad_pose/point_sets.py`](../muggled_sam/v3_sam/cad_pose/point_sets.py), [`preprocess_cad_point_set.py`](../preprocess_cad_point_set.py) |
 | Mask-based one-to-one assignment | [`muggled_sam/v3_sam/cad_pose/matching.py`](../muggled_sam/v3_sam/cad_pose/matching.py) |
 | Pose losses | [`muggled_sam/v3_sam/cad_pose/losses.py`](../muggled_sam/v3_sam/cad_pose/losses.py) |
 | Evaluation and score calibration | [`muggled_sam/v3_sam/cad_pose/evaluation.py`](../muggled_sam/v3_sam/cad_pose/evaluation.py) |
@@ -60,7 +69,7 @@ confidence and pose confidence remain separate quantities.
 | Training, validation, and checkpoints | [`finetune_image_exemplar_multi_gt.py`](../finetune_image_exemplar_multi_gt.py) |
 | Dataset manifest integration | [`dataset_manifest.py`](../dataset_manifest.py) |
 | Standalone dataset validator | [`validate_perseve_pose_dataset.py`](../validate_perseve_pose_dataset.py) |
-| JSON schemas | [`schemas/perseve-pose-v1/`](../schemas/perseve-pose-v1/) |
+| JSON schemas | [`schemas/perseve-pose-v2/`](../schemas/perseve-pose-v2/), legacy [`schemas/perseve-pose-v1/`](../schemas/perseve-pose-v1/) |
 | Inference example | [`simple_examples/cad_pose_detection.py`](../simple_examples/cad_pose_detection.py) |
 
 ## Pose representation and head
@@ -72,6 +81,7 @@ confidence and pose confidence remain separate quantities.
 - detector candidate tokens with shape `B x N x 256`;
 - normalized detector boxes in `xyxy` form with shape `B x N x 2 x 2`;
 - metric CAD dimensions with shape `B x 3`;
+- the uniformly scaled CAD surface centroid with shape `B x 3`;
 - resize-adjusted camera intrinsics with shape `B x 3 x 3`;
 - the model input image size `(width, height)`;
 - an optional reserved CAD-geometry-token argument.
@@ -88,9 +98,11 @@ training-statistic-normalized absolute log dimensions enter a depth-specific fus
 layer. Absolute metric dimensions and camera features do not enter the center or
 rotation branches.
 
-The current baseline reserves the geometry-token input for future use but does not
-consume it. Conditioning is through the exact metric CAD dimensions required by the
-dataset contract.
+The surface centroid is fixed CAD metadata used after head prediction to
+convert centroid pose to the public AABB pose; it is not a learned feature or a
+network conditioning signal. The current baseline reserves the geometry-token
+input for future use but does not consume it. Network conditioning is through
+the exact metric CAD dimensions required by the dataset contract.
 
 ### Network outputs
 
@@ -100,8 +112,8 @@ and camera features before the depth branch:
 
 | Branch | Size | Meaning |
 | --- | ---: | --- |
-| Center residual | 2 | Offset in detector-box width/height units |
-| Log depth | 1 | Metric camera-space depth in log form |
+| Centroid residual | 2 | Projected surface-centroid offset in detector-box width/height units |
+| Log depth | 1 | Metric camera-space surface-centroid depth in log form |
 | Rotation 6D | 6 | Continuous two-column rotation representation |
 | Pose-quality logit | 1 | Confidence that the pose meets the configured tolerances |
 
@@ -109,17 +121,17 @@ There is deliberately no scale or size prediction branch. The object dimensions 
 known CAD metadata, and per-instance uniform scale is already part of the dataset
 record. Predicting scale again would introduce an avoidable scale/depth ambiguity.
 Uniformly rescaling the dimension prompt can therefore change depth but cannot change
-the center or rotation outputs. Center is reconstructed as
-`box_center + center_residual * box_extent`.
+the centroid projection or rotation outputs. The projection is reconstructed as
+`box_center + centroid_residual * box_extent`.
 
 `CADPosePredictions` keeps the raw and derived values together:
 
-- box-relative center residual and normalized center;
+- box-relative centroid residual and normalized projected centroid;
 - log depth;
 - 6D rotation and its `3 x 3` rotation matrix;
 - pose-quality logits and calibrated probabilities;
 - reconstructed translation when intrinsics are available;
-- the effective CAD dimensions used for the prediction.
+- the effective CAD dimensions and surface centroid used for the prediction.
 
 It also provides batch/candidate indexing helpers so detector filtering, NMS, and
 matching can apply exactly the same indices to the pose values.
@@ -130,20 +142,23 @@ The 6D representation is converted to a proper rotation matrix with Gram-Schmidt
 orthogonalization. Degenerate or nearly collinear vectors use deterministic fallback
 axes, preventing NaNs while retaining differentiability in normal cases.
 
-### Translation reconstruction
+### Centroid and translation reconstruction
 
-The head predicts image center `(u, v)` and `log(z)`, not Cartesian translation
-directly. The adjusted intrinsics serve two roles: normalized camera and angular-box
-features condition the depth branch, and pixel-space intrinsics reconstruct metric
-translation:
+The head predicts projected surface centroid `(u_c, v_c)` and `log(z_c)`, not
+Cartesian AABB-origin translation directly. The adjusted intrinsics serve two
+roles: normalized camera and angular-box features condition the depth branch,
+and pixel-space intrinsics reconstruct the camera-space centroid:
 
 ```text
-z = exp(log_depth)
-[x, y, z]^T = z * K^-1 [u, v, 1]^T
+z_c = exp(log_depth)
+c = z_c * K^-1 [u_c, v_c, 1]^T
+t = c - R(s * mu)
 ```
 
-The camera solve runs in `float32` for half-precision inputs and converts back
-afterward. This avoids unsupported or unstable low-precision linear solves.
+Here `mu` is the canonical AABB-frame surface centroid and `s` is uniform
+rendering scale. The returned `t` therefore retains the original public AABB
+origin. The camera solve runs in `float32` for half-precision inputs and
+converts back afterward.
 
 ## Dataset integration and validation
 
@@ -155,21 +170,28 @@ manifest row, so the manifest format does not need pose-specific columns.
 
 The loader returns typed records:
 
-- `SymmetryMetadata`;
 - `CADCatalogObject`;
 - `PoseInstance`;
 - `PoseFrame`;
 - `PersevePoseSample`.
 
+V2 catalog records include `PointSetMetadata`; v1 records instead carry the
+superseded symmetry metadata described at the end of this guide.
+
 ### Schema version
 
-The implementation supports Perseve pose schema major version 1. Dataset copies of
-the JSON schemas are required and are validated against the repository schemas in
-[`schemas/perseve-pose-v1/`](../schemas/perseve-pose-v1/):
+The implementation supports Perseve pose schema majors 2 and 1. Dataset copies
+of the JSON schemas are required and validated against the corresponding
+repository schemas:
 
-- `dataset-meta.schema.json`;
-- `objects.schema.json`;
-- `pose-annotations.schema.json`.
+- [`schemas/perseve-pose-v2/`](../schemas/perseve-pose-v2/) for active
+  point-set data;
+- [`schemas/perseve-pose-v1/`](../schemas/perseve-pose-v1/) for legacy
+  symmetry-labeled data.
+
+Dataset metadata, catalog, and frame annotations must use the same major
+version. V2 requires a checksummed point-set artifact and does not require a
+`symmetry` object.
 
 Unknown fields are rejected unless placed in the documented `extensions` objects.
 This keeps accidental format drift visible while retaining an explicit extension
@@ -183,13 +205,14 @@ express by itself:
 - intrinsic matrices and image dimensions are valid;
 - camera/world and object/camera transforms have the expected shape and valid SO(3)
   rotations;
-- discrete symmetry transforms are closed under the declared group;
-- continuous symmetry axes are unit length;
 - catalog base dimensions equal the declared CAD bounds;
 - dimensions and per-instance scale are positive;
 - effective dimensions equal `base_dimensions * uniform_scale`;
-- pose eligibility agrees with the annotation state, verified symmetry status, and
-  valid depth;
+- v2 point artifacts stay within the dataset root and match their checksum,
+  declared point count, and catalog centroid;
+- v2 pose eligibility requires a valid point artifact, uniform scale, and
+  positive surface-centroid depth;
+- v1 pose eligibility retains its verified-symmetry rules;
 - logical-instance images are exact RGBA images, including the alpha channel;
 - annotation mapping keys and pixel values agree;
 - logical-instance image dimensions match the RGB image;
@@ -198,10 +221,6 @@ express by itself:
 - visible-pixel counts exactly match the logical-instance image;
 - no nonzero logical-instance value is missing from the annotation mapping;
 - repeated occurrences of a CAD object in a scene share the same declared scale.
-
-The supported pose-eligible symmetry states are `verified_auto` and
-`verified_manual`. Objects marked `needs_review` are retained for segmentation when
-possible but are never used as pose supervision.
 
 ### Standalone validation
 
@@ -248,16 +267,27 @@ segmentation loss. The original segmentation loss is unchanged.
 
 For each matched eligible pair, the total pose loss contains:
 
-- Smooth L1 normalized-center loss;
-- Smooth L1 normalized-log-depth loss;
-- symmetry-aware rotation loss;
+- Smooth L1 normalized projected-centroid loss;
+- Smooth L1 normalized centroid-log-depth loss;
+- a one-sided centroid-centered nearest-neighbor point-set rotation loss;
+- an optional complete-placement point-set loss, disabled by default;
 - binary cross-entropy pose-quality loss.
 
-The pose-quality target is soft and detached from the regression graph. It is based
-on whether rotation and translation errors fall near configurable tolerances, with
-configurable transition widths. Translation error is normalized by the effective
-object diagonal by default, so the same setting is meaningful across differently
-sized CAD objects. An absolute metric tolerance can be selected explicitly.
+Query and dense target points are centered on the exact area-weighted canonical
+surface centroid and uniformly scaled. The predicted and target rotations are
+applied before a chunked `torch.cdist` nearest-neighbor reduction. Per-point
+distances are normalized by the effective AABB diagonal and passed through
+Smooth L1 before averaging. The rotation-only term uses a common ground-truth
+centroid, so translation cannot compensate for rotation.
+
+Transforms and distances run in float32 under half-precision training. With
+the optional full-placement loss disabled, its distance is still evaluated for
+the detached quality target but does not retain an autograd graph.
+
+The pose-quality target is soft and detached from the regression graph. It
+combines normalized camera-space centroid error and normalized full-placement
+point-set error. This uses the same geometric equivalence as the main v2
+evaluation. The v1 angular target remains only in the compatibility path.
 
 The training objective is:
 
@@ -266,25 +296,14 @@ L_total = L_detection + pose_weight * (
     center_weight   * L_center
   + depth_weight    * L_depth
   + rotation_weight * L_rotation
+  + full_pose_weight * L_full_set
   + quality_weight  * L_quality
 )
 ```
 
 The trainer rejects non-finite pose or total losses instead of silently continuing.
-
-### Symmetry-aware rotation error
-
-Discrete and continuous symmetries use the same implementation in training,
-evaluation, and calibration:
-
-- without symmetry, use the SO(3) geodesic angle between prediction and target;
-- for discrete symmetry, minimize the angle over all equivalent
-  `R_target * S` rotations;
-- for continuous axial symmetry, compare the transformed symmetry-axis directions
-  rather than penalizing rotation about that axis.
-
-Geodesic angles are computed with an `atan2` formulation for better numerical
-behavior near zero and 180 degrees.
+`full_pose_weight` defaults to zero while the disentangled centroid and
+rotation objective is established.
 
 ## Image geometry and intrinsics
 
@@ -330,19 +349,20 @@ four values.
 Pose inference is enabled with:
 
 ```python
-boxes, masks, scores, presence, poses = detector.generate_detections(
+masks, boxes, scores, presence, poses = detector.generate_detections(
     encoded_image,
     encoded_prompts,
     cad_dimensions_m_b3=dimensions,
+    cad_effective_surface_centroid_m_b3=effective_surface_centroid,
     camera_intrinsics_b33=adjusted_k,
     return_pose=True,
 )
 ```
 
-When `return_pose=True`, both CAD dimensions and camera intrinsics are required. The
-pose head runs before detector filtering, and every subsequent detector candidate
-index is applied to `CADPosePredictions` as well. Blank-exemplar behavior follows the
-same contract.
+When `return_pose=True`, CAD dimensions, the consistently scaled surface
+centroid, and camera intrinsics are required. The pose head runs before detector
+filtering, and every subsequent detector candidate index is applied to
+`CADPosePredictions` as well.
 
 ## Training
 
@@ -370,9 +390,10 @@ segmentation-only behavior.
 ### Preflight
 
 Before optimization, pose training validates all train and validation records,
-including schemas, catalog joins, annotations, and pixel masks. It also verifies that
-the splits use the same catalog/symmetry pipeline and enforces scene-level scale
-sharing.
+including schemas, catalog joins, annotations, point artifacts, and pixel
+masks. It verifies catalog compatibility, enforces scene-level scale sharing,
+and rejects a run that mixes v1 and v2 pose supervision. V2 runs require one
+sampling pipeline version and record every point and parameter checksum.
 
 The preflight pass fits:
 
@@ -392,7 +413,20 @@ The pose loss and target can be configured with:
 --pose_center_weight
 --pose_depth_weight
 --pose_rotation_weight
+--pose_full_set_weight
 --pose_quality_weight
+--centroid_tolerance
+--point_set_tolerance
+--centroid_soft_width
+--point_set_soft_width
+--point_loss_beta
+--point_distance_chunk_size
+```
+
+The following options are retained only for schema-v1/checkpoint
+compatibility:
+
+```text
 --rotation_tolerance_deg
 --translation_tolerance
 --rotation_soft_width_deg
@@ -431,26 +465,28 @@ checkpoint:
 | Field | Purpose |
 | --- | --- |
 | `cad_pose_head` | Pose-head parameters and calibrated temperature buffer |
-| `cad_pose_head_architecture_version` | Rejects incompatible pre-branch-routing pose heads |
+| `cad_pose_head_architecture_version` | Rejects pose heads with incompatible prediction semantics |
 | optimizer state | Optimizer/scheduler continuation for a compatible training stage |
 | `pose_config` | Depth normalization statistics, loss weights, and tolerances |
 | `args` | Full CLI configuration, including the selected pose stage |
 | dataset metadata checksum | Detects dataset-level contract changes |
-| catalog checksum | Detects CAD dimension or symmetry changes |
+| catalog checksum | Detects CAD catalog changes |
 | aggregate annotation checksum | Detects pose-label changes |
 | schema checksums and versions | Records the exact schema inputs and supported format version |
-| symmetry-pipeline versions | Ensures symmetry interpretation is reproducible |
+| point-set checksums | Detects canonical geometry-artifact changes |
+| sampling pipeline and parameter checksums | Detects preprocessing changes |
 
-Resume verifies catalog checksums, dataset-metadata checksums, symmetry-pipeline
-versions, and schema versions against the current dataset before continuing. The
-annotation and schema checksums are also retained for auditing, but are not currently
-resume-blocking comparisons. Optimizer state is restored only when compatible with
-the current trainable parameters; otherwise the script warns and starts a new
-optimizer. Older segmentation checkpoints without `cad_pose_head` remain valid and
-initialize a new pose head; an incompatible untrained pose-head entry in a
-segmentation-only checkpoint is ignored. Trained pose-head checkpoints from
-architecture version 1 are not compatible with the branch-specific version 2 head
-and must be retrained.
+Resume verifies catalog, dataset metadata, schema major, point-set, sampling
+pipeline, and sampling-parameter provenance against the current dataset. The
+annotation and schema-file checksums are retained for auditing but are not
+currently resume-blocking comparisons. Additional v1 provenance behavior is
+preserved in the superseded-details section.
+Optimizer state is restored only when compatible with the current trainable
+parameters; otherwise the script warns and starts a new optimizer. Older
+segmentation checkpoints without `cad_pose_head` remain valid and initialize a
+new pose head; an incompatible untrained pose-head entry in a segmentation-only
+checkpoint is ignored. Architecture version 3 identifies the surface-centroid
+interface; trained pose heads from versions 1 or 2 must be retrained.
 
 The final validation calibration is saved as `finetune_calibrated.pth` so inference
 and test evaluation use the fitted pose-score temperature.
@@ -459,14 +495,17 @@ and test evaluation use the fitted pose-score temperature.
 
 Evaluation reports:
 
-- symmetry-aware rotation error in degrees;
+- normalized mean and p95 full-placement surface-set distance;
+- camera-space centroid error in centimeters;
 - translation error in centimeters;
-- normalized center error;
-- metric depth error;
-- 5-degree/5-centimeter accuracy;
-- 10-degree/10-centimeter accuracy;
+- normalized projected-centroid error;
+- metric centroid-depth error;
+- geometric pose success at the configured centroid/set thresholds;
 - Brier score;
 - expected calibration error.
+
+The current v1 rotation and joint-threshold metrics are listed in the
+superseded-details section.
 
 Evaluation uses the same detection filtering, NMS candidate indices, and one-to-one
 mask assignment as the training/inference path.
@@ -511,6 +550,7 @@ python simple_examples/cad_pose_detection.py \
   /path/to/cad_render.png \
   example_cad_id \
   --dimensions_m 0.12 0.08 0.04 \
+  --effective_surface_centroid_m 0.0012 -0.0004 0.0031 \
   --camera_k fx 0 cx 0 fy cy 0 0 1 \
   --output pose_results.json
 ```
@@ -526,9 +566,13 @@ The added tests cover:
 
 - 6D rotation conversion and degenerate fallbacks;
 - metric translation reconstruction and projection;
+- surface-centroid/AABB-origin translation round trips;
+- deterministic area-weighted point-set artifacts and checksum validation;
+- label-free symmetry-equivalent nearest-neighbor matching and finite gradients;
+- v2 schema and point-set target derivation;
+- geometric point-set evaluation;
 - resize-adjusted camera intrinsics;
 - absence of a learned scale branch;
-- discrete and continuous symmetry errors;
 - deterministic one-to-one mask matching;
 - JSON schema acceptance/rejection;
 - exact RGBA logical-instance joins and inclusive bounding boxes;
@@ -536,7 +580,8 @@ The added tests cover:
 
 Relevant test modules are:
 
-- [`tests/test_cad_pose/geometry.py`](../tests/test_cad_pose/geometry.py);
+- [`tests/test_cad_pose_geometry.py`](../tests/test_cad_pose_geometry.py);
+- [`tests/test_cad_pose_point_sets.py`](../tests/test_cad_pose_point_sets.py);
 - [`tests/test_perseve_pose_dataset.py`](../tests/test_perseve_pose_dataset.py);
 - [`tests/test_perseve_pose_schema.py`](../tests/test_perseve_pose_schema.py);
 - [`tests/test_dataset_manifest.py`](../tests/test_dataset_manifest.py).
@@ -547,16 +592,10 @@ Run the complete unit-test discovery with:
 python -m unittest discover -s tests -v
 ```
 
-The implementation was also checked with Python bytecode compilation, JSON schema
-parsing, `git diff --check`, and `uv lock --check`.
-
-In the implementation environment, 15 tests were discovered: 7 passed and 8
-tensor/image tests were skipped because the system Python lacked PyTorch and OpenCV.
-Those skipped tests must be run in the project's full training environment before
-relying on the GPU/runtime path.
-
-`jsonschema` was added to `pyproject.toml`, `requirements.txt`, and `uv.lock` for
-schema validation.
+The implementation was checked with Python bytecode compilation, JSON schema
+parsing, `git diff --check`, and the complete local unit suite. A real
+GPU-training benchmark remains required to characterize nearest-neighbor loss
+time and peak memory.
 
 ## Backward compatibility
 
@@ -573,21 +612,53 @@ The only intentional stricter behavior is inside pose-enabled workflows, where
 camera geometry, CAD metadata, schemas, and pixel joins must be reproducible and
 internally consistent.
 
-## Current limitations and next steps
+## Superseded implementation details: explicit symmetry labels
 
-The following plan items remain future work:
+These details remain necessary for existing v1 datasets and checkpoints. They
+describe the implementation being replaced, not the target design.
 
-- CAD mesh/point-cloud geometry tokens;
-- detector ROI feature pooling;
-- CAD-render viewpoint embeddings;
-- reprojection or silhouette losses;
-- Hungarian matching with additional non-pose costs;
-- learned scale prediction, which is intentionally excluded from the current data
-  contract;
-- 3D IoU, ADD/ADD-S, and VSD evaluation;
-- BOP-format export;
-- dataset generation and symmetry labeling, which remain responsibilities of the
-  Perseve data pipeline.
+The v1 loader exposes `SymmetryMetadata`, and
+[`cad_pose/symmetry.py`](../muggled_sam/v3_sam/cad_pose/symmetry.py) implements
+the catalog-aware rotation error. Dataset validation requires discrete
+transforms to form the declared closed group and continuous axes to be unit
+length. The supported pose-eligible statuses are `verified_auto` and
+`verified_manual`; `needs_review` objects may contribute segmentation but not
+pose supervision.
+
+Discrete and continuous symmetry metadata is applied consistently in training,
+evaluation, and pose-score calibration:
+
+- without declared symmetry, use the SO(3) geodesic angle between prediction
+  and target;
+- for discrete symmetry, minimize over all catalog rotations
+  `R_target * S`; and
+- for continuous axial symmetry, compare transformed axis directions without
+  penalizing rotation about that axis.
+
+Geodesic angles use an `atan2` formulation for numerical behavior near zero and
+180 degrees. The corresponding evaluation reports symmetry-aware rotation in
+degrees plus 5-degree/5-centimeter and 10-degree/10-centimeter accuracy. Unit
+tests cover discrete and continuous cases.
+
+V1 preflight requires train and validation splits to use the same catalog and
+symmetry pipeline. Checkpoints store the symmetry-pipeline version, and resume
+verifies it alongside dataset, catalog, and schema provenance. These fields and
+checks remain until the point-set architecture and schema version intentionally
+drop v1 compatibility.
+
+## Remaining validation
+
+The code migration to point-set supervision is complete in this repository.
+Before removing v1 support, generate representative v2 data from Perseve,
+benchmark the chunked distance calculation during real GPU training, measure
+finite-sampling floors, and compare held-out results with the old
+explicit-symmetry pipeline.
+
+The active design intentionally continues to exclude learned scale prediction.
+Later refinements may add CAD geometry tokens, detector ROI features, render
+viewpoint embeddings, point-to-mesh or signed-distance losses, silhouette
+consistency, or pose-aware Hungarian costs after the point-set baseline is
+stable.
 
 The public low-level pose API requires camera intrinsics already transformed to the
 model input coordinates. The model raster size is used internally to normalize those

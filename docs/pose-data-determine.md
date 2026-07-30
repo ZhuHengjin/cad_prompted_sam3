@@ -7,7 +7,7 @@
 
 The pose dataset will inherit the conventions implemented by Perseve's existing segmentation loader instead of defining an unrelated encoding.
 
-For dataset format v1, segmentation masks must be four-channel PNG images. Colors in the accompanying mapping JSON are logical RGBA values. A loader using OpenCV must read the image unchanged and convert its in-memory BGRA channel order to RGBA before comparing it with a mapping key. Equality includes all four channels, including alpha.
+For dataset formats v1 and v2, segmentation masks must be four-channel PNG images. Colors in the accompanying mapping JSON are logical RGBA values. A loader using OpenCV must read the image unchanged and convert its in-memory BGRA channel order to RGBA before comparing it with a mapping key. Equality includes all four channels, including alpha.
 
 The mapping JSON color key is the authoritative association between a rendered mask region and its object label. A pose annotation may repeat the parsed value for validation, for example:
 
@@ -27,7 +27,7 @@ Perseve currently contains fallback branches for three-channel and grayscale seg
 - the three-channel branch promotes BGR to BGRA without performing the four-channel path's BGRA-to-RGBA conversion;
 - the grayscale branch promotes intensity values to BGRA and does not interpret them as instance IDs.
 
-These fallback branches are therefore outside the pose dataset v1 contract. Supporting RGB masks or single-channel instance-ID masks later requires a distinct, explicitly declared encoding and corresponding loader behavior.
+These fallback branches are therefore outside the pose dataset v1/v2 contract. Supporting RGB masks or single-channel instance-ID masks later requires a distinct, explicitly declared encoding and corresponding loader behavior.
 
 For boxes derived from a binary mask, the dataset inherits Perseve's current `sample_prompts()` convention:
 
@@ -121,15 +121,21 @@ pose_predictions = pose_head(
     detection_tokens_bnc,
     boxes_xy1xy2_bn22,
     cad_dimensions_m_b3,
+    cad_effective_surface_centroid_m_b3,
     adjusted_camera_intrinsics_b33,
     model_image_size_wh,
 )
 ```
 
-At inference, the caller supplies the real dimensions of the prompted object,
-obtained from a metric CAD mesh, a CAD catalog, or explicit user input. Merely
-recording dimensions as ground truth is insufficient: they must be available
-to the model at both training and inference for metric translation.
+In `cad_effective_surface_centroid_m_b3`, the loader supplies the effective
+centroid $s\mu$, where $\mu$ is the catalog surface centroid, rather than the
+unscaled catalog value.
+
+At inference, the caller supplies the real dimensions of the prompted object
+and the consistently scaled catalog surface centroid, obtained from a metric
+CAD mesh, a CAD catalog, or explicit user input. Merely recording dimensions as
+ground truth is insufficient: they must be available to the model at both
+training and inference for metric translation.
 The adjusted camera intrinsics are normalized inside the head and condition
 depth together with dimensions and angular box extent.
 
@@ -184,7 +190,87 @@ the declared floating-point tolerance.
 - CAD dimensions become a required baseline pose-head input, not an optional
   later geometry feature.
 - No learned scale branch or scale loss is required.
-- Metric translation is supported only when physical dimensions are supplied
-  at inference.
+- Metric translation is supported only when physical dimensions and the
+  consistently scaled surface centroid are supplied at inference.
 - A BOP export of scaled instances must include matching scaled model geometry;
   otherwise the exporter must reject those instances.
+
+## Canonical AABB frame and label-free point-set pose supervision
+
+### Decision
+
+Keep the existing AABB-centered canonical CAD frame for storage, rendering,
+dimensions, transforms, overlays, and public inference results. Do not move
+the canonical origin to a symmetry center, and do not require symmetry labels
+for pose supervision.
+
+Preprocess every canonical mesh into a deterministic, uniformly
+surface-area-sampled point set and store its area-weighted surface centroid
+$\mu$ in the AABB frame. The model predicts the projected camera-space surface
+centroid, centroid depth, and rotation. The training loss compares transformed
+point sets with nearest-neighbor correspondence rather than comparing
+same-index points or enumerating labeled symmetry transforms.
+
+The detailed artifact and loss contract is in
+[Label-free point-set pose supervision](point-set-pose-supervision-plan.md).
+
+### Geometry
+
+For uniform render scale $s$, the dataset continues to store
+`T_cam_from_cad = [R | t]`, where $t$ is the AABB-origin translation. The
+camera-space surface centroid is
+
+$$
+c=R(s\mu)+t.
+$$
+
+Train center and depth against $c$. At inference, back-project the predicted
+centroid $\hat c$ and recover the unchanged public translation:
+
+$$
+\hat t=\hat c-\hat R(s\mu).
+$$
+
+For rotation-only supervision, use the same ground-truth centroid on both
+sides, or omit the common translation:
+
+$$
+L_{R,set}=
+\operatorname{NNSetDistance}
+\left(
+\hat R\,s(P-\mu),
+R_{gt}\,s(P-\mu)
+\right).
+$$
+
+Centering at the surface centroid is internal to target derivation and loss
+calculation; it does not redefine the CAD frame the model reports.
+
+### Consequences
+
+- The AABB origin remains intuitive and stable for humans and downstream code.
+- The surface centroid is supplied as CAD metadata; the model does not infer a
+  hidden symmetry center from RGB alone.
+- Asymmetric, discrete, continuous, and off-origin rigid symmetries are handled
+  by geometric equivalence without a symmetry-labeling pipeline.
+- Rotation is isolated by using ground-truth centroid translation on both
+  point sets; predicted translation cannot compensate for a wrong rotation.
+- Translation training still benefits from the known CAD surface centroid, and
+  an optional full-pose point-set loss may be added after the disentangled
+  baseline is stable.
+- The rigid point transforms are inexpensive; nearest-neighbor lookup is the
+  significant cost and must be benchmarked with sampled query/target sets.
+- Geometry-only equivalence cannot distinguish texture markings or
+  task-semantic sides that have identical shape. Those cases require a separate
+  appearance- or task-aware objective.
+
+## Superseded alternative: explicit symmetry labels
+
+The earlier design proposed generating per-CAD discrete or continuous symmetry
+labels, possibly through a self-made pipeline or KASAL, and changing the
+rotation loss according to those labels. It is retained here as design history
+only. It was rejected as the target because off-origin symmetries complicate
+the SE(3) representation, moving the canonical origin would weaken the
+otherwise intuitive AABB-frame contract, and label status would unnecessarily
+gate pose supervision. The repository retains that implementation only as the
+compatibility path for old schema-v1 datasets.
