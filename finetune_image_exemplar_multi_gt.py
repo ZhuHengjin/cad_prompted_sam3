@@ -31,7 +31,7 @@ from collections import defaultdict, deque
 from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Tuple, Union
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple, Union
 
 import cv2
 import numpy as np
@@ -51,15 +51,21 @@ from dataset_manifest import (
 from muggled_sam.make_sam import make_sam_from_state_dict
 from muggled_sam.v3_sam.cad_pose.geometry import adjust_intrinsics_for_resize_and_pad
 from muggled_sam.v3_sam.cad_pose.evaluation import (
+    PoseEvaluation,
     evaluate_pose_matches,
     expected_calibration_error,
     fit_pose_score_temperature,
 )
 from muggled_sam.v3_sam.cad_pose.inference import mask_nms_indices
-from muggled_sam.v3_sam.cad_pose.losses import CADPoseLossConfig, compute_cad_pose_losses
+from muggled_sam.v3_sam.cad_pose.losses import (
+    CADPoseLossConfig,
+    compute_cad_pose_losses,
+    point_set_pose_errors,
+)
 from muggled_sam.v3_sam.cad_pose.matching import match_pose_predictions_one_to_one
 from muggled_sam.v3_sam.cad_pose.symmetry import symmetry_aware_rotation_error
 from muggled_sam.v3_sam.cad_pose.dataset import (
+    effective_surface_centroid_m,
     instance_mask_rgba,
     load_perseve_pose_sample,
     make_pose_target,
@@ -77,10 +83,18 @@ METRIC_FIELDS = (
     "avg_loss",
     "avg_iou",
     "correct_rate",
+    "mask_loss",
+    "bbox_loss",
+    "objectness_loss",
     "pose_center_loss",
     "pose_depth_loss",
     "pose_rotation_loss",
+    "pose_full_set_loss",
     "pose_quality_loss",
+    "mean_surface_distance_norm",
+    "p95_surface_distance_norm",
+    "centroid_error_cm",
+    "pose_success_rate",
     "rotation_error_deg",
     "translation_error_cm",
     "center_error_norm",
@@ -90,6 +104,14 @@ METRIC_FIELDS = (
     "brier_score",
     "expected_calibration_error",
     "pose_score_temperature",
+    "pose_match_iou_threshold",
+    "pose_assignment_coverage",
+    "pose_match_coverage",
+    "pose_match_acceptance_rate",
+    "pose_end_to_end_success_rate",
+    "eligible_samples",
+    "pose_accepted_matches",
+    "pose_total_matches",
     "samples",
 )
 
@@ -115,6 +137,28 @@ class EvalConfig:
     no_object_weight: float = 0.45
     shuffle: bool = False
     max_batches: int = 0
+
+
+@dataclass(frozen=True)
+class MultiGTDetectionLosses:
+    """Separately weighted mask, box, and objectness supervision."""
+
+    mask: torch.Tensor
+    bbox: torch.Tensor
+    objectness: torch.Tensor
+
+    def total(
+        self,
+        *,
+        mask_weight: float = 2.0,
+        bbox_weight: float = 1.0,
+        objectness_weight: float = 1.0,
+    ) -> torch.Tensor:
+        return (
+            mask_weight * self.mask
+            + bbox_weight * self.bbox
+            + objectness_weight * self.objectness
+        )
 
 
 def parse_color_key(key: str) -> Tuple[int, ...]:
@@ -316,6 +360,26 @@ def select_pose_target_and_masks(
         raise ValueError(f"Instances for CAD {cad_id!r} do not share one effective dimension prompt")
     eligible_gt_indices = [index for index, instance in enumerate(instances) if instance.pose_training_eligible]
     return cad_id, masks, instances, sample, eligible_gt_indices
+
+
+def pose_prompt_surface_centroid_m(
+    instances: Sequence[object],
+    eligible_gt_indices: Sequence[int],
+    catalog_object: object,
+) -> np.ndarray:
+    """Return valid centroid metadata for a mixed detection/pose training item.
+
+    Joint stages retain visible, pose-ineligible instances as detector anchors.
+    If none of the selected instances is pose eligible, the pose prediction is
+    discarded and a zero centroid keeps that detection-only forward pass valid.
+    """
+
+    if not eligible_gt_indices:
+        return np.zeros(3, dtype=np.float64)
+    prompt_index = int(eligible_gt_indices[0])
+    if prompt_index < 0 or prompt_index >= len(instances):
+        raise IndexError(f"Pose-eligible GT index {prompt_index} is outside the selected instances")
+    return effective_surface_centroid_m(instances[prompt_index], catalog_object)
 
 
 def load_bgr(path: str) -> np.ndarray:
@@ -547,6 +611,33 @@ def unique_object_entries(entries: Sequence[Dict[str, str]]) -> List[Dict[str, s
     return list(unique_entries.values())
 
 
+def _partition_unresolved_pose_frames(
+    camera_root: Path, frame_ids: Sequence[str]
+) -> Tuple[List[str], List[str]]:
+    """Separate valid no-supervision pose frames from genuinely unresolved rows.
+
+    A manifest describes every captured frame, including valid captures with no
+    visible instances. The legacy segmentation parser intentionally omits those
+    frames because they cannot produce a supervised sample. Keep that behavior,
+    but do not confuse a valid empty pose sidecar with a missing or corrupt
+    label join. Sidecars with any visible instance remain hard failures.
+    """
+
+    empty_frames: List[str] = []
+    unresolved_frames: List[str] = []
+    for frame_id in frame_ids:
+        sidecar_path = camera_root / f"pose_annotations_{frame_id}.json"
+        if not sidecar_path.is_file():
+            unresolved_frames.append(frame_id)
+            continue
+        sample = load_perseve_pose_sample(camera_root, frame_id, validate_pixels=True)
+        if any(instance.annotation_state == "visible" for instance in sample.frame.instances):
+            unresolved_frames.append(frame_id)
+        else:
+            empty_frames.append(frame_id)
+    return empty_frames, unresolved_frames
+
+
 def entries_from_manifest_rows(
     rows: Sequence[ManifestRow], data_root: Path, *, object_level: bool
 ) -> List[Dict[str, str]]:
@@ -574,9 +665,18 @@ def entries_from_manifest_rows(
             resolved.append(enriched)
             found_frames.add(entry["frame_id"])
         missing = sorted(set(frame_rows) - found_frames)
-        if missing:
+        empty_pose_frames, unresolved = _partition_unresolved_pose_frames(
+            Path(camera_root), missing
+        )
+        if empty_pose_frames:
+            print(
+                f"Skipping {len(empty_pose_frames)} valid pose frames with no visible supervision "
+                f"under {camera_root}: {empty_pose_frames[:10]}"
+            )
+        if unresolved:
             raise RuntimeError(
-                f"Manifest rows under {camera_root} yielded no usable labeled entries for frames: {missing[:10]}"
+                f"Manifest rows under {camera_root} yielded no usable labeled entries for frames: "
+                f"{unresolved[:10]}"
             )
     return resolved
 
@@ -763,6 +863,34 @@ def parse_ref_view_ids(value: str) -> List[str]:
     return ids
 
 
+def reference_view_id_candidates(ref_id: str) -> List[str]:
+    """Return compatible padded and unpadded spellings for a numeric view ID."""
+
+    candidates = [str(ref_id)]
+    try:
+        numeric_id = int(ref_id)
+    except ValueError:
+        return candidates
+    for candidate in (str(numeric_id), f"{numeric_id:02d}"):
+        if candidate not in candidates:
+            candidates.append(candidate)
+    return candidates
+
+
+def resolve_reference_pair(
+    reference_dir: Path, object_id: str, ref_id: str
+) -> Optional[Tuple[Path, Path]]:
+    """Resolve one render/mask pair across legacy and unpadded view names."""
+
+    for candidate_ref_id in reference_view_id_candidates(ref_id):
+        ref_stub = f"{object_id}_stl_base_{candidate_ref_id}"
+        image_path = reference_dir / f"{ref_stub}.png"
+        mask_path = reference_dir / f"{ref_stub}_mask.png"
+        if image_path.is_file() and mask_path.is_file():
+            return image_path, mask_path
+    return None
+
+
 def freeze_module(module: torch.nn.Module) -> None:
     module.eval()
     for param in module.parameters():
@@ -782,6 +910,7 @@ def generate_detections_train(
     detection_filter_threshold: float = 0.0,
     exemplar_padding_mask_bn: Optional[torch.Tensor] = None,
     cad_dimensions_m_b3: Optional[torch.Tensor] = None,
+    cad_effective_surface_centroid_m_b3: Optional[torch.Tensor] = None,
     adjusted_intrinsics_b33: Optional[torch.Tensor] = None,
     model_image_size_wh: Optional[Tuple[int, int]] = None,
     return_pose: bool = False,
@@ -798,12 +927,15 @@ def generate_detections_train(
         # Handle pose prediction when there are no exemplars.
         if cad_dimensions_m_b3 is None:
             raise ValueError("cad_dimensions_m_b3 is required for pose training")
+        if cad_effective_surface_centroid_m_b3 is None:
+            raise ValueError("cad_effective_surface_centroid_m_b3 is required for pose training")
         if adjusted_intrinsics_b33 is None or model_image_size_wh is None:
             raise ValueError("Adjusted intrinsics and model_image_size_wh are required for pose training")
         pose_predictions = detmodel.cad_pose_head(
             blk_tok,
             blk_box,
             cad_dimensions_m_b3,
+            cad_effective_surface_centroid_m_b3,
             adjusted_intrinsics_b33,
             model_image_size_wh,
         )
@@ -824,12 +956,15 @@ def generate_detections_train(
     if return_pose:
         if cad_dimensions_m_b3 is None:
             raise ValueError("cad_dimensions_m_b3 is required for pose training")
+        if cad_effective_surface_centroid_m_b3 is None:
+            raise ValueError("cad_effective_surface_centroid_m_b3 is required for pose training")
         if adjusted_intrinsics_b33 is None or model_image_size_wh is None:
             raise ValueError("Adjusted intrinsics and model_image_size_wh are required for pose training")
         pose_predictions = detmodel.cad_pose_head(
             enc_det_tokens_bnc,
             boxes_xy1xy2_bn22,
             cad_dimensions_m_b3,
+            cad_effective_surface_centroid_m_b3,
             adjusted_intrinsics_b33,
             model_image_size_wh,
         )
@@ -1185,24 +1320,23 @@ def greedy_unique_k_assign(cost: np.ndarray, max_per_gt: int = 1) -> List[Tuple[
     return matches
 
 
-def compute_multi_gt_detection_loss(
+def compute_multi_gt_detection_losses(
     logits_mhw: torch.Tensor,
     box_preds_n22: torch.Tensor,
     det_scores_logits_n: torch.Tensor,
     gt_targets_hw: Sequence[torch.Tensor],
     bce_weight: float,
     dice_weight: float,
-    bbox_weight: float,
     score_weight: float,
     no_object_weight: float,
     max_per_gt: int = 12,
-) -> Optional[torch.Tensor]:
-    """Compute the same multi-GT objective used by the training loop.
+) -> Optional[MultiGTDetectionLosses]:
+    """Return separable multi-GT mask, box, and objectness losses.
 
     Validation uses this helper under ``torch.no_grad()`` so it can report loss
-    without changing model state. The helper intentionally mirrors the existing
-    training objective, including the hard-coded mask multiplier and the
-    one-to-many matching setting used for loss assignment.
+    without changing model state. The one-to-many matching setting mirrors the
+    historical training objective. Callers decide how strongly to anchor each
+    component.
     """
     if logits_mhw.numel() == 0 or not gt_targets_hw:
         return None
@@ -1241,7 +1375,7 @@ def compute_multi_gt_detection_loss(
         gt_targets,
         o2m_matches,
     )
-    loss_presence = compute_presence_loss_logits(
+    loss_objectness = compute_presence_loss_logits(
         det_scores_logits_n,
         o2m_matches,
         o2m_iou,
@@ -1253,7 +1387,61 @@ def compute_multi_gt_detection_loss(
         focal_gamma=4.0,
         focal_weight=300.0,
     )
-    return loss_mask * 2.0 + loss_presence + bbox_weight * loss_bbox
+    return MultiGTDetectionLosses(
+        mask=loss_mask,
+        bbox=loss_bbox,
+        objectness=loss_objectness,
+    )
+
+
+def compute_multi_gt_detection_loss(
+    logits_mhw: torch.Tensor,
+    box_preds_n22: torch.Tensor,
+    det_scores_logits_n: torch.Tensor,
+    gt_targets_hw: Sequence[torch.Tensor],
+    bce_weight: float,
+    dice_weight: float,
+    bbox_weight: float,
+    score_weight: float,
+    no_object_weight: float,
+    max_per_gt: int = 12,
+) -> Optional[torch.Tensor]:
+    """Compute the historical combined objective with backward-compatible weights."""
+
+    losses = compute_multi_gt_detection_losses(
+        logits_mhw,
+        box_preds_n22,
+        det_scores_logits_n,
+        gt_targets_hw,
+        bce_weight=bce_weight,
+        dice_weight=dice_weight,
+        score_weight=score_weight,
+        no_object_weight=no_object_weight,
+        max_per_gt=max_per_gt,
+    )
+    if losses is None:
+        return None
+    return losses.total(mask_weight=2.0, bbox_weight=bbox_weight)
+
+
+def filter_pose_matches_by_iou(
+    matches: Sequence[Tuple[int, int]],
+    iou_gt_prediction: torch.Tensor,
+    min_iou: float,
+) -> List[Tuple[int, int]]:
+    """Keep one-to-one pose matches whose detached mask IoU meets ``min_iou``."""
+
+    if not 0.0 <= min_iou <= 1.0:
+        raise ValueError(f"min_iou must be in [0, 1], got {min_iou}")
+    filtered: List[Tuple[int, int]] = []
+    for gt_index, prediction_index in matches:
+        if gt_index < 0 or gt_index >= iou_gt_prediction.shape[0]:
+            raise IndexError(f"GT index {gt_index} is outside the IoU matrix")
+        if prediction_index < 0 or prediction_index >= iou_gt_prediction.shape[1]:
+            raise IndexError(f"Prediction index {prediction_index} is outside the IoU matrix")
+        if float(iou_gt_prediction[gt_index, prediction_index].detach()) >= min_iou:
+            filtered.append((gt_index, prediction_index))
+    return filtered
 
 
 def pad_exemplar_batch(
@@ -1391,10 +1579,13 @@ def load_reference_images(
             break
         ref_img_path = None
         for lookup_id in lookup_ids:
-            ref_stub = f"{lookup_id}_stl_base_{ref_id}"
-            candidate = reference_dir / f"{ref_stub}.png"
-            if candidate.is_file():
-                ref_img_path = candidate
+            for candidate_ref_id in reference_view_id_candidates(ref_id):
+                ref_stub = f"{lookup_id}_stl_base_{candidate_ref_id}"
+                candidate = reference_dir / f"{ref_stub}.png"
+                if candidate.is_file():
+                    ref_img_path = candidate
+                    break
+            if ref_img_path is not None:
                 break
         if ref_img_path is None:
             continue
@@ -1530,11 +1721,10 @@ def build_exemplar_tokens_for_object(
     lookup_id = object_id.upper() if upper_object_id else object_id
     feats: List[torch.Tensor] = []
     for ref_id in ref_view_ids:
-        ref_stub = f"{lookup_id}_stl_base_{ref_id}"
-        ref_img_path = reference_dir / f"{ref_stub}.png"
-        ref_mask_path = reference_dir / f"{ref_stub}_mask.png"
-        if not (ref_img_path.is_file() and ref_mask_path.is_file()):
+        reference_pair = resolve_reference_pair(reference_dir, lookup_id, ref_id)
+        if reference_pair is None:
             continue
+        ref_img_path, ref_mask_path = reference_pair
         try:
             ref_image = load_bgr(str(ref_img_path))
             ref_mask = load_mask_gray(str(ref_mask_path))
@@ -1631,6 +1821,11 @@ def parse_args() -> argparse.Namespace:
         help="Manifest split evaluated by --eval_only.",
     )
     parser.add_argument(
+        "--validate_before_training",
+        action="store_true",
+        help="Record validation and conditional pose baselines before the first resumed training epoch.",
+    )
+    parser.add_argument(
         "--split_dir",
         type=str,
         default="",
@@ -1691,20 +1886,71 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--bbox_weight", type=float, default=1.0)
     parser.add_argument("--score_weight", type=float, default=0.3)
     parser.add_argument("--no_object_weight", type=float, default=0.45)
-    parser.add_argument("--enable_pose", action="store_true", help="Train from validated Perseve pose-v1 sidecars.")
+    parser.add_argument(
+        "--enable_pose",
+        action="store_true",
+        help="Train from validated Perseve point-set pose-v2 or legacy pose-v1 sidecars.",
+    )
     parser.add_argument(
         "--pose_stage",
-        choices=["head", "joint"],
+        choices=["head", "joint", "joint_lite"],
         default="head",
-        help="Train only the new pose head (stage 1) or jointly adapt detector/fusion/mask modules (stage 2).",
+        help=(
+            "Train only the pose head, fully adapt fusion/detector/mask modules, or use pose-first "
+            "joint-lite adaptation with a frozen mask decoder and lower shared-module LR."
+        ),
+    )
+    parser.add_argument(
+        "--pose_train_min_match_iou",
+        type=float,
+        default=0.0,
+        help="Minimum mask IoU for a matched candidate to receive pose loss (default: 0, historical behavior).",
+    )
+    parser.add_argument(
+        "--pose_eval_min_match_iou",
+        type=float,
+        default=0.0,
+        help="Also report conditional pose metrics above this match IoU (default: 0 disables the extra row).",
+    )
+    parser.add_argument(
+        "--joint_shared_lr_scale",
+        type=float,
+        default=0.1,
+        help="Fusion/detector LR multiplier relative to --lr in pose_stage=joint_lite.",
+    )
+    parser.add_argument(
+        "--joint_bbox_weight",
+        type=float,
+        default=0.25,
+        help="Bounding-box anchor weight in pose_stage=joint_lite.",
+    )
+    parser.add_argument(
+        "--joint_objectness_weight",
+        type=float,
+        default=0.25,
+        help="Objectness anchor weight in pose_stage=joint_lite.",
+    )
+    parser.add_argument(
+        "--joint_mask_weight",
+        type=float,
+        default=0.10,
+        help="Mask anchor weight in pose_stage=joint_lite; applies after BCE/Dice weighting.",
     )
     parser.add_argument("--pose_weight", type=float, default=1.0)
     parser.add_argument("--pose_center_weight", type=float, default=1.0)
     parser.add_argument("--pose_depth_weight", type=float, default=1.0)
     parser.add_argument("--pose_rotation_weight", type=float, default=1.0)
+    parser.add_argument("--pose_full_set_weight", type=float, default=0.0)
     parser.add_argument("--pose_quality_weight", type=float, default=1.0)
     parser.add_argument("--log_depth_mean", type=float, default=0.0)
     parser.add_argument("--log_depth_std", type=float, default=1.0)
+    parser.add_argument("--centroid_tolerance", type=float, default=0.1)
+    parser.add_argument("--point_set_tolerance", type=float, default=0.1)
+    parser.add_argument("--centroid_soft_width", type=float, default=0.02)
+    parser.add_argument("--point_set_soft_width", type=float, default=0.02)
+    parser.add_argument("--point_loss_beta", type=float, default=0.01)
+    parser.add_argument("--point_distance_chunk_size", type=int, default=512)
+    # Legacy v1 quality flags remain accepted for checkpoint/config compatibility.
     parser.add_argument("--rotation_tolerance_deg", type=float, default=5.0)
     parser.add_argument("--translation_tolerance", type=float, default=0.1)
     parser.add_argument("--rotation_soft_width_deg", type=float, default=1.0)
@@ -1749,7 +1995,7 @@ def parse_args() -> argparse.Namespace:
         "--resume_path",
         type=str,
         default="",
-        help="Path to a finetune checkpoint (.pth) to resume from.",
+        help="Path to a trusted local finetune checkpoint (.pth) to resume from.",
     )
     parser.add_argument(
         "--no_resume_optimizer",
@@ -1780,16 +2026,110 @@ def create_run_dir(base_dir: str) -> str:
 
 
 def initialize_metrics_log(metrics_path: Path) -> None:
-    if metrics_path.is_file() and metrics_path.stat().st_size > 0:
+    """Create a metrics log or migrate an older compatible header by name."""
+
+    if not metrics_path.is_file() or metrics_path.stat().st_size == 0:
+        with metrics_path.open("w", newline="") as handle:
+            csv.DictWriter(handle, fieldnames=METRIC_FIELDS).writeheader()
         return
-    with metrics_path.open("w", newline="") as handle:
-        csv.DictWriter(handle, fieldnames=METRIC_FIELDS).writeheader()
+
+    with metrics_path.open(newline="") as handle:
+        reader = csv.DictReader(handle)
+        existing_fields = tuple(reader.fieldnames or ())
+        if existing_fields == METRIC_FIELDS:
+            return
+        if not existing_fields or len(existing_fields) != len(set(existing_fields)):
+            raise ValueError(f"Metrics CSV has an invalid header: {metrics_path}")
+        unknown_fields = sorted(set(existing_fields) - set(METRIC_FIELDS))
+        if unknown_fields:
+            raise ValueError(
+                f"Metrics CSV has unsupported columns {unknown_fields}: {metrics_path}"
+            )
+        rows = list(reader)
+    if any(None in row for row in rows):
+        raise ValueError(
+            f"Metrics CSV contains rows wider than its header and cannot be migrated safely: {metrics_path}"
+        )
+
+    temporary = metrics_path.with_name(f".{metrics_path.name}.schema-migration.tmp")
+    try:
+        with temporary.open("w", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=METRIC_FIELDS)
+            writer.writeheader()
+            for row in rows:
+                writer.writerow({field: row.get(field, "") for field in METRIC_FIELDS})
+        os.replace(temporary, metrics_path)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
 
 
 def append_metric(metrics_path: Path, **values: object) -> None:
     row = {field: values.get(field, "") for field in METRIC_FIELDS}
     with metrics_path.open("a", newline="") as handle:
         csv.DictWriter(handle, fieldnames=METRIC_FIELDS).writerow(row)
+
+
+def finite_mean(values: Sequence[float]) -> float:
+    array = np.asarray(values, dtype=np.float64)
+    finite = array[np.isfinite(array)]
+    return float(finite.mean()) if finite.size else float("nan")
+
+
+def surface_distance_percentile(
+    chunks: Sequence[torch.Tensor], quantile: float = 0.95
+) -> float:
+    """Compute a true percentile over every retained point distance."""
+
+    if not 0.0 <= quantile <= 1.0:
+        raise ValueError(f"quantile must be in [0, 1], got {quantile}")
+    finite_chunks = [chunk.detach().float().cpu().flatten() for chunk in chunks if chunk.numel()]
+    if not finite_chunks:
+        return float("nan")
+    values = torch.cat(finite_chunks)
+    values = values[torch.isfinite(values)]
+    return float(torch.quantile(values, quantile)) if values.numel() else float("nan")
+
+
+def pose_iou_phase(base_phase: str, min_iou: float) -> str:
+    """Build a stable CSV phase name for conditional pose evaluation."""
+
+    return f"{base_phase}_iou_{int(round(min_iou * 100)):03d}"
+
+
+def append_pose_metric_rows(
+    metrics_path: Path,
+    *,
+    phase: str,
+    epoch: int,
+    global_step: int,
+    batch_step: int,
+    metrics: Dict[str, float],
+    conditional_metrics: Optional[Dict[str, float]],
+) -> None:
+    """Write unconditional and optional IoU-conditioned pose metric rows."""
+
+    append_metric(
+        metrics_path,
+        phase=phase,
+        epoch=epoch,
+        global_step=global_step,
+        batch_step=batch_step,
+        samples=int(metrics.get("count", 0)),
+        **{key: value for key, value in metrics.items() if key != "count"},
+    )
+    if conditional_metrics is None:
+        return
+    threshold = float(conditional_metrics["pose_match_iou_threshold"])
+    append_metric(
+        metrics_path,
+        phase=pose_iou_phase(phase, threshold),
+        epoch=epoch,
+        global_step=global_step,
+        batch_step=batch_step,
+        samples=int(conditional_metrics.get("count", 0)),
+        **{key: value for key, value in conditional_metrics.items() if key != "count"},
+    )
 
 
 def load_finetune_checkpoint(
@@ -1799,7 +2139,11 @@ def load_finetune_checkpoint(
     device: torch.device,
     load_optimizer: bool = True,
 ) -> Dict[str, object]:
-    checkpoint = torch.load(str(checkpoint_path), map_location=device)
+    # Finetune checkpoints are full, trusted training-state files produced by
+    # this script (modules, optimizer, arguments, provenance, and NumPy scalar
+    # configuration values), not tensor-only weight bundles. PyTorch 2.6+
+    # defaults to weights_only=True, which rejects that intentional metadata.
+    checkpoint = torch.load(str(checkpoint_path), map_location=device, weights_only=False)
     required = {
         "image_exemplar_fusion": detmodel.image_exemplar_fusion,
         "exemplar_detector": detmodel.exemplar_detector,
@@ -1840,14 +2184,18 @@ def build_finetune_checkpoint(
     global_step: int,
     batch_step: int,
     pose_config: Optional[CADPoseLossConfig],
+    manifest_checksum: str,
     catalog_checksums: set,
     dataset_meta_checksums: set,
     annotation_checksums: set,
     symmetry_pipeline_versions: set,
+    point_set_checksums: set,
+    sampling_pipeline_versions: set,
+    sampling_parameter_checksums: set,
     schema_checksums: set,
     schema_versions: set,
 ) -> Dict[str, object]:
-    annotation_digest = hashlib.sha256("\n".join(sorted(annotation_checksums)).encode("utf-8")).hexdigest()
+    annotation_digest = checksum_set_digest(annotation_checksums)
     return {
         "epoch": epoch,
         "global_step": global_step,
@@ -1859,15 +2207,81 @@ def build_finetune_checkpoint(
         "cad_pose_head_architecture_version": detmodel.cad_pose_head.architecture_version,
         "optimizer": optimizer.state_dict(),
         "pose_config": None if pose_config is None else pose_config.__dict__,
+        "manifest_sha256": manifest_checksum,
         "catalog_checksums": sorted(catalog_checksums),
         "dataset_meta_checksums": sorted(dataset_meta_checksums),
         "annotation_checksums": sorted(annotation_checksums),
         "annotation_checksum_sha256": annotation_digest,
         "symmetry_pipeline_versions": sorted(symmetry_pipeline_versions),
+        "point_set_checksums": sorted(point_set_checksums),
+        "sampling_pipeline_versions": sorted(sampling_pipeline_versions),
+        "sampling_parameter_checksums": sorted(sampling_parameter_checksums),
         "schema_checksums": sorted(schema_checksums),
         "schema_versions": sorted(schema_versions),
         "args": vars(args),
     }
+
+
+def checksum_set_digest(values: Iterable[str]) -> str:
+    """Return a stable digest for an unordered collection of checksums."""
+
+    return hashlib.sha256("\n".join(sorted(set(values))).encode("utf-8")).hexdigest()
+
+
+def validate_resume_manifest_checksum(
+    checkpoint: Dict[str, object], current_manifest_checksum: str
+) -> None:
+    """Reject resumes that change the persisted manifest or split assignment."""
+
+    if "manifest_sha256" not in checkpoint:
+        return
+    expected = str(checkpoint.get("manifest_sha256") or "")
+    if expected != current_manifest_checksum:
+        raise ValueError("Resume checkpoint manifest checksum differs from the current manifest")
+
+
+def validate_pose_resume_provenance(
+    checkpoint: Dict[str, object],
+    *,
+    catalog_checksums: set,
+    dataset_meta_checksums: set,
+    annotation_checksums: set,
+    symmetry_pipeline_versions: set,
+    point_set_checksums: set,
+    sampling_pipeline_versions: set,
+    sampling_parameter_checksums: set,
+    schema_checksums: set,
+    schema_versions: set,
+) -> None:
+    """Reject a pose resume when any persisted data contract has changed."""
+
+    comparisons = (
+        ("catalog_checksums", catalog_checksums, "object catalog"),
+        ("dataset_meta_checksums", dataset_meta_checksums, "dataset metadata"),
+        ("symmetry_pipeline_versions", symmetry_pipeline_versions, "symmetry pipeline"),
+        ("point_set_checksums", point_set_checksums, "point-set artifacts"),
+        ("sampling_pipeline_versions", sampling_pipeline_versions, "point-set sampling version"),
+        (
+            "sampling_parameter_checksums",
+            sampling_parameter_checksums,
+            "point-set sampling parameters",
+        ),
+        ("schema_checksums", schema_checksums, "pose schema files"),
+        ("schema_versions", schema_versions, "pose schema version"),
+    )
+    for field, current_values, label in comparisons:
+        expected_values = set(checkpoint.get(field, []) or [])
+        if expected_values and expected_values != set(current_values):
+            raise ValueError(f"Resume checkpoint {label} differs from the current dataset")
+
+    current_annotation_digest = checksum_set_digest(annotation_checksums)
+    expected_annotation_digest = str(checkpoint.get("annotation_checksum_sha256") or "")
+    if not expected_annotation_digest:
+        expected_annotations = set(checkpoint.get("annotation_checksums", []) or [])
+        if expected_annotations:
+            expected_annotation_digest = checksum_set_digest(expected_annotations)
+    if expected_annotation_digest and expected_annotation_digest != current_annotation_digest:
+        raise ValueError("Resume checkpoint pose annotations differ from the current dataset")
 
 
 def _capture_training_state(module: torch.nn.Module) -> List[Tuple[torch.nn.Module, bool]]:
@@ -2170,8 +2584,8 @@ def run_cad_pose_eval(
     pose_config: CADPoseLossConfig,
     *,
     calibrate_temperature: bool,
-) -> Dict[str, float]:
-    """Evaluate retained validation candidates with the training symmetry contract."""
+) -> Tuple[Dict[str, float], Optional[Dict[str, float]]]:
+    """Evaluate all pose matches and an optional IoU-conditioned subset in one pass."""
 
     reference_dir = Path(args.reference_dir).expanduser().resolve()
     ref_view_ids = parse_ref_view_ids(args.ref_view_ids)
@@ -2179,9 +2593,45 @@ def run_cad_pose_eval(
     pose_cache: Dict[Tuple[str, str], object] = {}
     ref_cache: Dict[str, torch.Tensor] = {}
     metric_sums: Dict[str, float] = defaultdict(float)
+    metric_counts: Dict[str, int] = defaultdict(int)
+    conditional_metric_sums: Dict[str, float] = defaultdict(float)
+    conditional_metric_counts: Dict[str, int] = defaultdict(int)
+    surface_distance_chunks: List[torch.Tensor] = []
+    conditional_surface_distance_chunks: List[torch.Tensor] = []
+    evaluated_fields = (
+        "mean_surface_distance_norm",
+        "centroid_error_cm",
+        "rotation_error_deg",
+        "translation_error_cm",
+        "center_error_norm",
+        "depth_error_m",
+        "pose_success_rate",
+        "accuracy_5deg_5cm",
+        "accuracy_10deg_10cm",
+    )
     calibration_logits: List[torch.Tensor] = []
     calibration_targets: List[torch.Tensor] = []
+    conditional_calibration_logits: List[torch.Tensor] = []
+    conditional_calibration_targets: List[torch.Tensor] = []
     total_count = 0
+    conditional_count = 0
+    eligible_count = 0
+    conditional_threshold = float(args.pose_eval_min_match_iou)
+
+    def accumulate_evaluation(
+        evaluation: PoseEvaluation,
+        sums: Dict[str, float],
+        counts: Dict[str, int],
+        distance_chunks: List[torch.Tensor],
+    ) -> None:
+        for field in evaluated_fields:
+            value = float(getattr(evaluation, field))
+            if np.isfinite(value):
+                sums[field] += value * evaluation.count
+                counts[field] += evaluation.count
+        if evaluation.surface_distances_norm is not None:
+            distance_chunks.append(evaluation.surface_distances_norm)
+
     training_state = _capture_training_state(detmodel)
     detmodel.eval()
     try:
@@ -2198,6 +2648,7 @@ def run_cad_pose_eval(
                 for instance in sample.frame.eligible_instances():
                     grouped[instance.cad_id].append(instance)
                 for cad_id, instances in sorted(grouped.items()):
+                    eligible_count += len(instances)
                     masks = [instance_mask_rgba(Path(entry["inst_path"]), instance).astype(np.float32) for instance in instances]
                     if not masks:
                         continue
@@ -2231,12 +2682,18 @@ def run_cad_pose_eval(
                     dimensions = torch.as_tensor(
                         instances[0].dimensions_m, device=device, dtype=model_dtype
                     ).unsqueeze(0)
+                    effective_centroid = torch.as_tensor(
+                        effective_surface_centroid_m(instances[0], sample.catalog[cad_id]),
+                        device=device,
+                        dtype=model_dtype,
+                    ).unsqueeze(0)
                     outputs = generate_detections_train(
                         detmodel,
                         features,
                         ref_cache[cad_id].to(device),
                         detection_filter_threshold=args.det_filter,
                         cad_dimensions_m_b3=dimensions,
+                        cad_effective_surface_centroid_m_b3=effective_centroid,
                         adjusted_intrinsics_b33=adjusted_k,
                         model_image_size_wh=(pre_w, pre_h),
                         return_pose=True,
@@ -2253,7 +2710,12 @@ def run_cad_pose_eval(
                         logits_nhw.shape[-2:],
                         device,
                     )
-                    matches, _ = match_pose_predictions_one_to_one(logits_nhw, gt_targets)
+                    matches, match_iou = match_pose_predictions_one_to_one(logits_nhw, gt_targets)
+                    conditional_matches = (
+                        filter_pose_matches_by_iou(matches, match_iou, conditional_threshold)
+                        if conditional_threshold > 0.0
+                        else []
+                    )
                     pose_targets = [
                         make_pose_target(
                             instance,
@@ -2264,53 +2726,159 @@ def run_cad_pose_eval(
                         )
                         for instance in instances
                     ]
-                    evaluation = evaluate_pose_matches(pose_predictions, pose_targets, matches)
+                    evaluation = evaluate_pose_matches(
+                        pose_predictions,
+                        pose_targets,
+                        matches,
+                        centroid_tolerance=pose_config.centroid_tolerance,
+                        point_set_tolerance=pose_config.point_set_tolerance,
+                        point_distance_chunk_size=pose_config.point_distance_chunk_size,
+                        rotation_tolerance_rad=pose_config.rotation_tolerance_rad,
+                        translation_tolerance=pose_config.translation_tolerance,
+                        normalize_translation_error=pose_config.normalize_translation_error,
+                    )
                     if evaluation.count == 0:
                         continue
                     total_count += evaluation.count
-                    for field in (
-                        "rotation_error_deg",
-                        "translation_error_cm",
-                        "center_error_norm",
-                        "depth_error_m",
-                        "accuracy_5deg_5cm",
-                        "accuracy_10deg_10cm",
-                    ):
-                        metric_sums[field] += float(getattr(evaluation, field)) * evaluation.count
+                    accumulate_evaluation(
+                        evaluation,
+                        metric_sums,
+                        metric_counts,
+                        surface_distance_chunks,
+                    )
+                    if conditional_matches:
+                        conditional_evaluation = evaluate_pose_matches(
+                            pose_predictions,
+                            pose_targets,
+                            conditional_matches,
+                            centroid_tolerance=pose_config.centroid_tolerance,
+                            point_set_tolerance=pose_config.point_set_tolerance,
+                            point_distance_chunk_size=pose_config.point_distance_chunk_size,
+                            rotation_tolerance_rad=pose_config.rotation_tolerance_rad,
+                            translation_tolerance=pose_config.translation_tolerance,
+                            normalize_translation_error=pose_config.normalize_translation_error,
+                        )
+                        conditional_count += conditional_evaluation.count
+                        accumulate_evaluation(
+                            conditional_evaluation,
+                            conditional_metric_sums,
+                            conditional_metric_counts,
+                            conditional_surface_distance_chunks,
+                        )
+                    conditional_match_set = set(conditional_matches)
                     for gt_index, prediction_index in matches:
                         target = pose_targets[gt_index]
-                        if not target.rotation_eligible:
+                        if not target.rotation_eligible and not target.point_set_eligible:
                             continue
                         predicted_rotation = pose_predictions.rotation_matrix_bn33[0, prediction_index]
-                        rotation_error = symmetry_aware_rotation_error(
-                            predicted_rotation,
-                            target.rotation_matrix.to(predicted_rotation),
-                            symmetry_type=target.symmetry_type,
-                            symmetry_transforms=(
-                                target.symmetry_transforms.to(predicted_rotation)
-                                if target.symmetry_transforms is not None else None
-                            ),
-                            axis_cad=(target.axis_cad.to(predicted_rotation) if target.axis_cad is not None else None),
-                        )
-                        translation = pose_predictions.translation_m_bn3[0, prediction_index]
-                        translation_error = torch.linalg.vector_norm(translation - target.translation_m.to(translation))
-                        if pose_config.normalize_translation_error:
-                            translation_error = translation_error / torch.linalg.vector_norm(
-                                target.dimensions_m.to(translation_error)
-                            ).clamp_min(1e-8)
-                        success = (
-                            (rotation_error <= pose_config.rotation_tolerance_rad)
-                            & (translation_error <= pose_config.translation_tolerance)
-                        ).float()
+                        if target.point_set_eligible:
+                            if pose_predictions.centroid_m_bn3 is None:
+                                raise ValueError("Point-set calibration requires predicted centroids")
+                            _, full_error, centroid_error, _, _, _ = point_set_pose_errors(
+                                predicted_rotation,
+                                pose_predictions.centroid_m_bn3[0, prediction_index],
+                                target,
+                                chunk_size=pose_config.point_distance_chunk_size,
+                            )
+                            success = (
+                                (centroid_error <= pose_config.centroid_tolerance)
+                                & (full_error <= pose_config.point_set_tolerance)
+                            ).float()
+                        else:
+                            rotation_error = symmetry_aware_rotation_error(
+                                predicted_rotation,
+                                target.rotation_matrix.to(predicted_rotation),
+                                symmetry_type=target.symmetry_type,
+                                symmetry_transforms=(
+                                    target.symmetry_transforms.to(predicted_rotation)
+                                    if target.symmetry_transforms is not None
+                                    else None
+                                ),
+                                axis_cad=(
+                                    target.axis_cad.to(predicted_rotation)
+                                    if target.axis_cad is not None
+                                    else None
+                                ),
+                            )
+                            translation = pose_predictions.translation_m_bn3[0, prediction_index]
+                            translation_error = torch.linalg.vector_norm(
+                                translation - target.translation_m.to(translation)
+                            )
+                            if pose_config.normalize_translation_error:
+                                translation_error = translation_error / torch.linalg.vector_norm(
+                                    target.dimensions_m.to(translation_error)
+                                ).clamp_min(1e-8)
+                            success = (
+                                (rotation_error <= pose_config.rotation_tolerance_rad)
+                                & (translation_error <= pose_config.translation_tolerance)
+                            ).float()
                         calibration_logits.append(pose_predictions.pose_score_logits_bn[0, prediction_index].float())
                         calibration_targets.append(success.float())
+                        if (gt_index, prediction_index) in conditional_match_set:
+                            conditional_calibration_logits.append(
+                                pose_predictions.pose_score_logits_bn[0, prediction_index].float()
+                            )
+                            conditional_calibration_targets.append(success.float())
     finally:
         _restore_training_state(training_state)
 
     if total_count == 0:
-        return {"count": 0.0}
-    metrics = {name: value / total_count for name, value in metric_sums.items()}
+        empty = {
+            "count": 0.0,
+            "eligible_samples": float(eligible_count),
+            "pose_assignment_coverage": 0.0,
+            "pose_match_iou_threshold": 0.0,
+        }
+        conditional_empty = None
+        if conditional_threshold > 0.0:
+            conditional_empty = {
+                **empty,
+                "pose_match_iou_threshold": conditional_threshold,
+                "pose_match_coverage": 0.0,
+                "pose_end_to_end_success_rate": 0.0,
+            }
+        return empty, conditional_empty
+    metrics = {
+        name: (
+            metric_sums[name] / metric_counts[name]
+            if metric_counts[name]
+            else float("nan")
+        )
+        for name in evaluated_fields
+    }
+    metrics["p95_surface_distance_norm"] = surface_distance_percentile(
+        surface_distance_chunks
+    )
     metrics["count"] = float(total_count)
+    metrics["eligible_samples"] = float(eligible_count)
+    metrics["pose_match_iou_threshold"] = 0.0
+    metrics["pose_assignment_coverage"] = total_count / max(1, eligible_count)
+    conditional_metrics: Optional[Dict[str, float]] = None
+    if conditional_threshold > 0.0:
+        conditional_metrics = {
+            name: (
+                conditional_metric_sums[name] / conditional_metric_counts[name]
+                if conditional_metric_counts[name]
+                else float("nan")
+            )
+            for name in evaluated_fields
+        }
+        conditional_metrics["p95_surface_distance_norm"] = surface_distance_percentile(
+            conditional_surface_distance_chunks
+        )
+        conditional_metrics["count"] = float(conditional_count)
+        conditional_metrics["eligible_samples"] = float(eligible_count)
+        conditional_metrics["pose_match_iou_threshold"] = conditional_threshold
+        conditional_metrics["pose_assignment_coverage"] = total_count / max(
+            1, eligible_count
+        )
+        conditional_metrics["pose_match_coverage"] = conditional_count / max(1, eligible_count)
+        conditional_success = conditional_metrics.get("pose_success_rate", float("nan"))
+        conditional_metrics["pose_end_to_end_success_rate"] = (
+            float(conditional_success) * conditional_count / max(1, eligible_count)
+            if np.isfinite(conditional_success)
+            else float("nan")
+        )
     if calibration_logits:
         logits = torch.stack(calibration_logits)
         targets = torch.stack(calibration_targets)
@@ -2323,7 +2891,20 @@ def run_cad_pose_eval(
         metrics["pose_score_temperature"] = temperature
         metrics["brier_score"] = float(((probabilities - targets) ** 2).mean())
         metrics["expected_calibration_error"] = float(expected_calibration_error(probabilities, targets))
-    return metrics
+        if conditional_metrics is not None and conditional_calibration_logits:
+            conditional_logits = torch.stack(conditional_calibration_logits)
+            conditional_targets = torch.stack(conditional_calibration_targets)
+            conditional_probabilities = torch.sigmoid(
+                conditional_logits / max(temperature, 1e-6)
+            )
+            conditional_metrics["pose_score_temperature"] = temperature
+            conditional_metrics["brier_score"] = float(
+                ((conditional_probabilities - conditional_targets) ** 2).mean()
+            )
+            conditional_metrics["expected_calibration_error"] = float(
+                expected_calibration_error(conditional_probabilities, conditional_targets)
+            )
+    return metrics, conditional_metrics
 
 
 def main() -> None:
@@ -2335,6 +2916,22 @@ def main() -> None:
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(args.seed)
     print(f"Using random seed {args.seed}")
+
+    for name in ("pose_train_min_match_iou", "pose_eval_min_match_iou"):
+        value = float(getattr(args, name))
+        if not 0.0 <= value <= 1.0:
+            raise ValueError(f"--{name} must be in [0, 1], got {value}")
+    for name in (
+        "joint_shared_lr_scale",
+        "joint_bbox_weight",
+        "joint_objectness_weight",
+        "joint_mask_weight",
+    ):
+        value = float(getattr(args, name))
+        if value < 0.0:
+            raise ValueError(f"--{name} must be nonnegative, got {value}")
+    if args.pose_stage == "joint_lite" and not args.enable_pose:
+        raise ValueError("--pose_stage joint_lite requires --enable_pose")
 
     manifest_path = Path(args.dataset_manifest).expanduser().resolve() if args.dataset_manifest else None
     data_root = Path(args.data_root).expanduser().resolve() if args.data_root else None
@@ -2349,10 +2946,12 @@ def main() -> None:
         if data_root is None:
             raise ValueError("--data_root is required with --dataset_manifest.")
         manifest_rows, manifest_summary = load_manifest(manifest_path, data_root, validate_files=True)
+        manifest_checksum = manifest_sha256(manifest_path)
         dataset_roots: List[Tuple[str, float, bool]] = []
-        print(f"Loaded manifest {manifest_path} (sha256={manifest_sha256(manifest_path)})")
+        print(f"Loaded manifest {manifest_path} (sha256={manifest_checksum})")
         print(json.dumps(manifest_summary, indent=2, sort_keys=True))
     else:
+        manifest_checksum = ""
         manifest_rows = []
         manifest_summary = {}
         dataset_roots = normalize_dataset_roots(args.dataset_root)
@@ -2401,6 +3000,12 @@ def main() -> None:
         freeze_module(detmodel.image_exemplar_fusion)
         freeze_module(detmodel.exemplar_detector)
         freeze_module(detmodel.exemplar_segmentation)
+    elif args.enable_pose and args.pose_stage == "joint_lite":
+        unfreeze_module(detmodel.image_exemplar_fusion)
+        unfreeze_module(detmodel.exemplar_detector)
+        # Keep the fixed decoder in the differentiable forward path. Mask loss
+        # still anchors its input tokens while decoder parameters remain fixed.
+        freeze_module(detmodel.exemplar_segmentation)
     else:
         unfreeze_module(detmodel.image_exemplar_fusion)
         unfreeze_module(detmodel.exemplar_detector)
@@ -2420,8 +3025,34 @@ def main() -> None:
     trainable_params_count = sum(p.numel() for p in detmodel.parameters() if p.requires_grad)
     print(f"Parameter counts: total={total_params:,} trainable={trainable_params_count:,}")
 
-    optimizer = torch.optim.AdamW(trainable_params, lr=args.lr, weight_decay=args.weight_decay)
-    start_epoch = 1 
+    if args.enable_pose and args.pose_stage == "joint_lite":
+        shared_params = [
+            p
+            for module in (detmodel.image_exemplar_fusion, detmodel.exemplar_detector)
+            for p in module.parameters()
+            if p.requires_grad
+        ]
+        pose_params = [p for p in detmodel.cad_pose_head.parameters() if p.requires_grad]
+        optimizer = torch.optim.AdamW(
+            [
+                {
+                    "params": shared_params,
+                    "lr": args.lr * args.joint_shared_lr_scale,
+                    "name": "fusion_detector",
+                },
+                {"params": pose_params, "lr": args.lr, "name": "pose_head"},
+            ],
+            lr=args.lr,
+            weight_decay=args.weight_decay,
+        )
+        print(
+            "Joint-lite optimizer: "
+            f"fusion/detector_lr={args.lr * args.joint_shared_lr_scale:.3g} "
+            f"pose_head_lr={args.lr:.3g}; segmentation decoder frozen"
+        )
+    else:
+        optimizer = torch.optim.AdamW(trainable_params, lr=args.lr, weight_decay=args.weight_decay)
+    start_epoch = 1
     global_step = 0
     batch_step = 0
     resume_checkpoint = None
@@ -2441,6 +3072,7 @@ def main() -> None:
             load_optimizer=not args.no_resume_optimizer,
         )
         resume_checkpoint = checkpoint
+        validate_resume_manifest_checksum(checkpoint, manifest_checksum)
         ckpt_epoch = int(checkpoint.get("epoch", 0))
         start_epoch = max(1, ckpt_epoch + 1)
         global_step = int(checkpoint.get("global_step", 0))
@@ -2454,24 +3086,17 @@ def main() -> None:
     else:
         run_dir = create_run_dir(args.output_dir)
     args.output_dir = run_dir
-    debug_dir = os.path.join(run_dir, "debug_boxes")
-    os.makedirs(debug_dir, exist_ok=True)
-    metrics_path = Path(run_dir) / "metrics.csv"
-    initialize_metrics_log(metrics_path)
-    if manifest_path is not None:
+    if manifest_path is not None and args.resume_in_place:
         manifest_copy = Path(run_dir) / "dataset_manifest.csv"
-        shutil.copy2(manifest_path, manifest_copy)
-        provenance = {
-            "manifest_source": str(manifest_path),
-            "manifest_copy": str(manifest_copy),
-            "manifest_sha256": manifest_sha256(manifest_path),
-            "data_root": str(data_root),
-            "sampling_policy": "equal_domain_with_replacement",
-            "manifest_summary": manifest_summary,
-            "args": vars(args),
-        }
-        with (Path(run_dir) / "run_config.json").open("w") as handle:
-            json.dump(provenance, handle, indent=2, sort_keys=True, default=str)
+        if os.path.lexists(manifest_copy):
+            if not manifest_copy.is_file():
+                raise ValueError(
+                    f"Existing run manifest snapshot is not a regular file: {manifest_copy}"
+                )
+            if manifest_sha256(manifest_copy) != manifest_checksum:
+                raise ValueError(
+                    "In-place resume manifest differs from the run's existing dataset_manifest.csv"
+                )
 
     # Split handling is frame-level. Build or load split CSVs before training
     # entries are multiplied so duplicate sampling cannot move data across
@@ -2614,6 +3239,9 @@ def main() -> None:
     dataset_meta_checksums: set = set()
     annotation_checksums: set = set()
     symmetry_pipeline_versions: set = set()
+    point_set_checksums: set = set()
+    sampling_pipeline_versions: set = set()
+    sampling_parameter_checksums: set = set()
     schema_checksums: set = set()
     schema_versions: set = set()
     pose_config = None
@@ -2622,10 +3250,17 @@ def main() -> None:
             center_weight=args.pose_center_weight,
             depth_weight=args.pose_depth_weight,
             rotation_weight=args.pose_rotation_weight,
+            full_pose_weight=args.pose_full_set_weight,
             quality_weight=args.pose_quality_weight,
             pose_weight=args.pose_weight,
             log_depth_mean=args.log_depth_mean,
             log_depth_std=args.log_depth_std,
+            centroid_tolerance=args.centroid_tolerance,
+            point_set_tolerance=args.point_set_tolerance,
+            centroid_soft_width=args.centroid_soft_width,
+            point_set_soft_width=args.point_set_soft_width,
+            point_loss_beta=args.point_loss_beta,
+            point_distance_chunk_size=args.point_distance_chunk_size,
             rotation_tolerance_rad=np.deg2rad(args.rotation_tolerance_deg),
             translation_tolerance=args.translation_tolerance,
             rotation_soft_width_rad=np.deg2rad(args.rotation_soft_width_deg),
@@ -2641,6 +3276,7 @@ def main() -> None:
         preflight_samples = []
         training_log_dimensions = []
         training_log_depths = []
+        training_cad_ids: set[str] = set()
         for entry in preflight_entries:
             camera_root = Path(entry["inst_path"]).parent
             key = (str(camera_root), entry["frame_id"])
@@ -2653,35 +3289,66 @@ def main() -> None:
             dataset_meta_checksums.add(sample.dataset_meta_checksum)
             annotation_checksums.add(sample.annotation_checksum)
             symmetry_pipeline_versions.update(sample.symmetry_pipeline_versions)
+            point_set_checksums.update(sample.point_set_checksums)
+            sampling_pipeline_versions.update(sample.sampling_pipeline_versions)
+            sampling_parameter_checksums.update(sample.sampling_parameter_checksums)
             schema_checksums.update(sample.schema_checksums.values())
             schema_versions.add(sample.frame.schema_version)
             if entry.get("split", "train") == "train":
                 for instance in sample.frame.eligible_instances():
+                    training_cad_ids.add(instance.cad_id)
                     training_log_dimensions.append(np.log(instance.dimensions_m))
-                    training_log_depths.append(np.log(instance.translation_m[2]))
+                    catalog_object = sample.catalog[instance.cad_id]
+                    effective_centroid = effective_surface_centroid_m(instance, catalog_object)
+                    centroid_camera = (
+                        instance.rotation_matrix @ effective_centroid + instance.translation_m
+                    )
+                    training_log_depths.append(np.log(centroid_camera[2]))
         validate_scale_sharing(preflight_samples)
         if len(catalog_checksums) != 1:
             raise ValueError(f"Pose training requires one object-catalog checksum, got {sorted(catalog_checksums)}")
-        if len(symmetry_pipeline_versions) != 1:
+        if point_set_checksums and symmetry_pipeline_versions:
+            raise ValueError("Do not mix point-set pose-v2 and legacy symmetry pose-v1 data in one run")
+        if sampling_pipeline_versions and len(sampling_pipeline_versions) != 1:
             raise ValueError(
-                "Pose training requires one symmetry-pipeline version, got "
+                "Pose training requires one point-set sampling-pipeline version, got "
+                f"{sorted(sampling_pipeline_versions)}"
+            )
+        if not sampling_pipeline_versions and len(symmetry_pipeline_versions) != 1:
+            raise ValueError(
+                "Legacy pose-v1 training requires one symmetry-pipeline version, got "
                 f"{sorted(symmetry_pipeline_versions)}"
             )
         if resume_checkpoint is not None:
-            expected_catalogs = set(resume_checkpoint.get("catalog_checksums", []))
-            expected_metadata = set(resume_checkpoint.get("dataset_meta_checksums", []))
-            expected_symmetry = set(resume_checkpoint.get("symmetry_pipeline_versions", []))
-            expected_schemas = set(resume_checkpoint.get("schema_versions", []))
-            if expected_catalogs and expected_catalogs != catalog_checksums:
-                raise ValueError("Resume checkpoint object-catalog checksum differs from the current dataset")
-            if expected_metadata and expected_metadata != dataset_meta_checksums:
-                raise ValueError("Resume checkpoint dataset-metadata checksums differ from the current dataset")
-            if expected_symmetry and expected_symmetry != symmetry_pipeline_versions:
-                raise ValueError("Resume checkpoint symmetry-pipeline version differs from the current dataset")
-            if expected_schemas and expected_schemas != schema_versions:
-                raise ValueError("Resume checkpoint pose schema version differs from the current dataset")
+            validate_pose_resume_provenance(
+                resume_checkpoint,
+                catalog_checksums=catalog_checksums,
+                dataset_meta_checksums=dataset_meta_checksums,
+                annotation_checksums=annotation_checksums,
+                symmetry_pipeline_versions=symmetry_pipeline_versions,
+                point_set_checksums=point_set_checksums,
+                sampling_pipeline_versions=sampling_pipeline_versions,
+                sampling_parameter_checksums=sampling_parameter_checksums,
+                schema_checksums=schema_checksums,
+                schema_versions=schema_versions,
+            )
         if not training_log_dimensions or not training_log_depths:
             raise ValueError("Pose training split contains no eligible pose instances")
+        missing_reference_pairs = [
+            (cad_id, ref_id)
+            for cad_id in sorted(training_cad_ids)
+            for ref_id in ref_view_ids
+            if resolve_reference_pair(reference_dir, cad_id, ref_id) is None
+        ]
+        if missing_reference_pairs:
+            raise FileNotFoundError(
+                "Pose reference preflight found missing render/mask pairs: "
+                f"{missing_reference_pairs[:10]}"
+            )
+        print(
+            "Reference preflight passed: "
+            f"cad_ids={len(training_cad_ids)} views_per_cad={len(ref_view_ids)}"
+        )
         dimension_values = np.stack(training_log_dimensions)
         dimension_mean = torch.as_tensor(dimension_values.mean(axis=0), device=device, dtype=dtype)
         dimension_std = torch.as_tensor(dimension_values.std(axis=0).clip(min=1e-6), device=device, dtype=dtype)
@@ -2689,10 +3356,9 @@ def main() -> None:
         depth_mean = float(np.mean(training_log_depths))
         depth_std = float(max(np.std(training_log_depths), 1e-6))
         pose_config = replace(pose_config, log_depth_mean=depth_mean, log_depth_std=depth_std)
-        annotation_digest = hashlib.sha256(
-            "\n".join(sorted(annotation_checksums)).encode("utf-8")
-        ).hexdigest()
+        annotation_digest = checksum_set_digest(annotation_checksums)
         pose_provenance = {
+            "manifest_sha256": manifest_checksum,
             "schema_versions": sorted(schema_versions),
             "schema_checksums": sorted(schema_checksums),
             "catalog_checksums": sorted(catalog_checksums),
@@ -2700,6 +3366,9 @@ def main() -> None:
             "annotation_checksums": sorted(annotation_checksums),
             "annotation_checksum_sha256": annotation_digest,
             "symmetry_pipeline_versions": sorted(symmetry_pipeline_versions),
+            "point_set_checksums": sorted(point_set_checksums),
+            "sampling_pipeline_versions": sorted(sampling_pipeline_versions),
+            "sampling_parameter_checksums": sorted(sampling_parameter_checksums),
             "pose_config": pose_config.__dict__,
             "dimension_log_mean": detmodel.cad_pose_head.dimension_log_mean.detach().float().cpu().tolist(),
             "dimension_log_std": detmodel.cad_pose_head.dimension_log_std.detach().float().cpu().tolist(),
@@ -2712,6 +3381,32 @@ def main() -> None:
             f"frames={len(preflight_samples)} eligible_instances={len(training_log_depths)} "
             f"log_depth_mean={depth_mean:.6f} log_depth_std={depth_std:.6f}"
         )
+
+    debug_dir = os.path.join(run_dir, "debug_boxes")
+    os.makedirs(debug_dir, exist_ok=True)
+    metrics_path = Path(run_dir) / "metrics.csv"
+    initialize_metrics_log(metrics_path)
+    if manifest_path is not None:
+        manifest_copy = Path(run_dir) / "dataset_manifest.csv"
+        if os.path.lexists(manifest_copy):
+            if not manifest_copy.is_file() or manifest_sha256(manifest_copy) != manifest_checksum:
+                raise ValueError(
+                    f"Refusing to replace a different run manifest snapshot: {manifest_copy}"
+                )
+        else:
+            shutil.copy2(manifest_path, manifest_copy)
+        provenance = {
+            "manifest_source": str(manifest_path),
+            "manifest_copy": str(manifest_copy),
+            "manifest_sha256": manifest_checksum,
+            "data_root": str(data_root),
+            "sampling_policy": "equal_domain_with_replacement",
+            "manifest_summary": manifest_summary,
+            "args": vars(args),
+        }
+        with (Path(run_dir) / "run_config.json").open("w") as handle:
+            json.dump(provenance, handle, indent=2, sort_keys=True, default=str)
+
     running_losses: deque[float] = deque(maxlen=5)
     running_top_ious: deque[float] = deque(maxlen=5)
 
@@ -2756,7 +3451,7 @@ def main() -> None:
         )
         if args.enable_pose:
             pose_eval_entries = entries_from_manifest_rows(eval_rows, data_root, object_level=False)
-            pose_metrics = run_cad_pose_eval(
+            pose_metrics, conditional_pose_metrics = run_cad_pose_eval(
                 detmodel,
                 pose_eval_entries,
                 args,
@@ -2764,21 +3459,74 @@ def main() -> None:
                 pose_config,
                 calibrate_temperature=args.eval_split == "validation",
             )
-            append_metric(
+            append_pose_metric_rows(
                 metrics_path,
                 phase=f"eval_{args.eval_split}_pose",
                 epoch=start_epoch - 1,
                 global_step=global_step,
                 batch_step=batch_step,
-                samples=int(pose_metrics.get("count", 0)),
-                **{key: value for key, value in pose_metrics.items() if key != "count"},
+                metrics=pose_metrics,
+                conditional_metrics=conditional_pose_metrics,
             )
             print(f"[eval:{args.eval_split}:pose] {json.dumps(pose_metrics, sort_keys=True)}")
+            if conditional_pose_metrics is not None:
+                print(
+                    f"[eval:{args.eval_split}:pose:iou] "
+                    f"{json.dumps(conditional_pose_metrics, sort_keys=True)}"
+                )
         return
 
     if start_epoch > args.epochs:
         print(f"Resume epoch {start_epoch - 1} exceeds requested --epochs={args.epochs}. Nothing to do.")
         return
+
+    if args.validate_before_training and validation_config is not None:
+        baseline_epoch = start_epoch - 1
+        eval_avg, eval_count, eval_correct, eval_loss = run_exemplar_eval(
+            detmodel, validation_config, device=device
+        )
+        append_metric(
+            metrics_path,
+            phase="validation",
+            epoch=baseline_epoch,
+            global_step=global_step,
+            batch_step=batch_step,
+            loss=eval_loss,
+            avg_iou=eval_avg,
+            correct_rate=eval_correct,
+            samples=eval_count,
+        )
+        print(
+            f"[eval:baseline] epoch={baseline_epoch} loss={eval_loss:.4f} "
+            f"avg_iou={eval_avg:.4f} correct_rate={eval_correct:.3f} samples={eval_count}"
+        )
+        if args.enable_pose and validation_pose_entries:
+            pose_metrics, conditional_pose_metrics = run_cad_pose_eval(
+                detmodel,
+                validation_pose_entries,
+                args,
+                device,
+                pose_config,
+                calibrate_temperature=False,
+            )
+            append_pose_metric_rows(
+                metrics_path,
+                phase="validation_pose",
+                epoch=baseline_epoch,
+                global_step=global_step,
+                batch_step=batch_step,
+                metrics=pose_metrics,
+                conditional_metrics=conditional_pose_metrics,
+            )
+            print(
+                f"[eval:pose:baseline] epoch={baseline_epoch} "
+                f"{json.dumps(pose_metrics, sort_keys=True)}"
+            )
+            if conditional_pose_metrics is not None:
+                print(
+                    f"[eval:pose:baseline:iou] epoch={baseline_epoch} "
+                    f"{json.dumps(conditional_pose_metrics, sort_keys=True)}"
+                )
 
     for epoch in range(start_epoch, args.epochs + 1):
         if epoch != start_epoch and validation_config is not None:
@@ -2806,7 +3554,7 @@ def main() -> None:
                 loss_part = f" val_loss={eval_loss:.4f}" if np.isfinite(eval_loss) else ""
                 print(f"[eval] epoch={epoch}{loss_part} no valid samples")
             if args.enable_pose and validation_pose_entries:
-                pose_metrics = run_cad_pose_eval(
+                pose_metrics, conditional_pose_metrics = run_cad_pose_eval(
                     detmodel,
                     validation_pose_entries,
                     args,
@@ -2814,16 +3562,21 @@ def main() -> None:
                     pose_config,
                     calibrate_temperature=False,
                 )
-                append_metric(
+                append_pose_metric_rows(
                     metrics_path,
                     phase="validation_pose",
                     epoch=epoch - 1,
                     global_step=global_step,
                     batch_step=batch_step,
-                    samples=int(pose_metrics.get("count", 0)),
-                    **{key: value for key, value in pose_metrics.items() if key != "count"},
+                    metrics=pose_metrics,
+                    conditional_metrics=conditional_pose_metrics,
                 )
                 print(f"[eval:pose] epoch={epoch - 1} {json.dumps(pose_metrics, sort_keys=True)}")
+                if conditional_pose_metrics is not None:
+                    print(
+                        f"[eval:pose:iou] epoch={epoch - 1} "
+                        f"{json.dumps(conditional_pose_metrics, sort_keys=True)}"
+                    )
 
         if entries_by_dataset:
             epoch_entries = balanced_epoch_entries(
@@ -2856,6 +3609,11 @@ def main() -> None:
                         dataset_meta_checksums.add(pose_sample.dataset_meta_checksum)
                         annotation_checksums.add(pose_sample.annotation_checksum)
                         symmetry_pipeline_versions.update(pose_sample.symmetry_pipeline_versions)
+                        point_set_checksums.update(pose_sample.point_set_checksums)
+                        sampling_pipeline_versions.update(pose_sample.sampling_pipeline_versions)
+                        sampling_parameter_checksums.update(
+                            pose_sample.sampling_parameter_checksums
+                        )
                     else:
                         mapping_path = Path(entry["inst_path"]).with_name(
                             f"instance_segmentation_mapping_{entry['frame_id']}.json"
@@ -2937,6 +3695,11 @@ def main() -> None:
             batch_losses: List[torch.Tensor] = []
             batch_top_ious: List[float] = []
             batch_pose_components: List[object] = []
+            batch_detection_components: List[MultiGTDetectionLosses] = []
+            batch_pose_match_ious: List[float] = []
+            batch_pose_eligible_targets = 0
+            batch_pose_total_matches = 0
+            batch_pose_accepted_matches = 0
             for _, idxs in group_map.items():
                 img_batch = torch.cat([prepared[i]["img_tensor"] for i in idxs], dim=0)
                 with torch.no_grad():
@@ -2953,6 +3716,22 @@ def main() -> None:
                             for i in idxs
                         ]
                     )
+                    effective_centroid_batch = torch.stack(
+                        [
+                            torch.as_tensor(
+                                pose_prompt_surface_centroid_m(
+                                    prepared[i]["pose_instances"],
+                                    prepared[i]["pose_gt_indices"],
+                                    prepared[i]["pose_sample"].catalog[
+                                        prepared[i]["pose_instances"][0].cad_id
+                                    ],
+                                ),
+                                device=device,
+                                dtype=img_batch.dtype,
+                            )
+                            for i in idxs
+                        ]
+                    )
                     adjusted_intrinsics = []
                     for i in idxs:
                         sample = prepared[i]["pose_sample"]
@@ -2965,6 +3744,7 @@ def main() -> None:
                         )
                     pose_kwargs = {
                         "cad_dimensions_m_b3": dimensions_batch,
+                        "cad_effective_surface_centroid_m_b3": effective_centroid_batch,
                         "adjusted_intrinsics_b33": torch.stack(adjusted_intrinsics),
                         "model_image_size_wh": (img_batch.shape[-1], img_batch.shape[-2]),
                         "return_pose": True,
@@ -3000,19 +3780,30 @@ def main() -> None:
                         continue
 
                     logits_mhw = mask_preds[local_idx].float()
-                    loss = compute_multi_gt_detection_loss(
+                    detection_losses = compute_multi_gt_detection_losses(
                         logits_mhw,
                         box_preds[local_idx],
                         det_scores_logits[local_idx],
                         gt_targets,
                         bce_weight=args.bce_weight,
                         dice_weight=args.dice_weight,
-                        bbox_weight=args.bbox_weight,
                         score_weight=args.score_weight,
                         no_object_weight=args.no_object_weight,
                     )
-                    if loss is None:
+                    if detection_losses is None:
                         continue
+                    batch_detection_components.append(detection_losses)
+                    if args.enable_pose and args.pose_stage == "joint_lite":
+                        loss = detection_losses.total(
+                            mask_weight=args.joint_mask_weight,
+                            bbox_weight=args.joint_bbox_weight,
+                            objectness_weight=args.joint_objectness_weight,
+                        )
+                    else:
+                        loss = detection_losses.total(
+                            mask_weight=2.0,
+                            bbox_weight=args.bbox_weight,
+                        )
                     if args.enable_pose:
                         sample = prepared[data_idx]["pose_sample"]
                         pre_h, pre_w = preencode_hw
@@ -3029,10 +3820,22 @@ def main() -> None:
                                     (pre_w, pre_h),
                                 )
                             )
-                        full_pose_matches, _ = match_pose_predictions_one_to_one(
+                        batch_pose_eligible_targets += len(pose_targets)
+                        full_pose_matches, pose_match_iou = match_pose_predictions_one_to_one(
                             logits_mhw,
                             gt_targets,
                             eligible_gt_indices=prepared[data_idx]["pose_gt_indices"],
+                        )
+                        batch_pose_total_matches += len(full_pose_matches)
+                        full_pose_matches = filter_pose_matches_by_iou(
+                            full_pose_matches,
+                            pose_match_iou,
+                            args.pose_train_min_match_iou,
+                        )
+                        batch_pose_accepted_matches += len(full_pose_matches)
+                        batch_pose_match_ious.extend(
+                            float(pose_match_iou[gt_index, prediction_index].detach())
+                            for gt_index, prediction_index in full_pose_matches
                         )
                         target_index = {
                             gt_index: local_index
@@ -3054,6 +3857,11 @@ def main() -> None:
                                 raise FloatingPointError("Non-finite CAD pose loss")
                             loss = loss + pose_losses.total
                             batch_pose_components.append(pose_losses)
+                    # Head-only training can have no accepted pose match after
+                    # IoU gating. Its frozen detection anchor then has no
+                    # trainable graph, so omit that image from backward.
+                    if not loss.requires_grad:
+                        continue
                     batch_losses.append(loss)
 
                     scores = det_scores[local_idx]
@@ -3135,6 +3943,18 @@ def main() -> None:
                 loss=float(batch_loss.item()),
                 avg_loss=avg_loss,
                 avg_iou=avg_epoch_iou,
+                mask_loss=(
+                    float(np.mean([value.mask.detach().float().item() for value in batch_detection_components]))
+                    if batch_detection_components else ""
+                ),
+                bbox_loss=(
+                    float(np.mean([value.bbox.detach().float().item() for value in batch_detection_components]))
+                    if batch_detection_components else ""
+                ),
+                objectness_loss=(
+                    float(np.mean([value.objectness.detach().float().item() for value in batch_detection_components]))
+                    if batch_detection_components else ""
+                ),
                 pose_center_loss=(
                     float(np.mean([value.center.detach().float().item() for value in batch_pose_components]))
                     if batch_pose_components else ""
@@ -3147,18 +3967,66 @@ def main() -> None:
                     float(np.mean([value.rotation.detach().float().item() for value in batch_pose_components]))
                     if batch_pose_components else ""
                 ),
+                pose_full_set_loss=(
+                    float(np.mean([value.full_pose.detach().float().item() for value in batch_pose_components]))
+                    if batch_pose_components else ""
+                ),
                 pose_quality_loss=(
                     float(np.mean([value.quality.detach().float().item() for value in batch_pose_components]))
                     if batch_pose_components else ""
                 ),
                 rotation_error_deg=(
-                    float(np.rad2deg(np.mean([value.mean_rotation_error_rad.detach().float().item() for value in batch_pose_components])))
+                    float(
+                        np.rad2deg(
+                            finite_mean(
+                                [
+                                    value.mean_rotation_error_rad.detach().float().item()
+                                    for value in batch_pose_components
+                                ]
+                            )
+                        )
+                    )
+                    if batch_pose_components else ""
+                ),
+                mean_surface_distance_norm=(
+                    finite_mean(
+                        [
+                            value.mean_point_set_error_norm.detach().float().item()
+                            for value in batch_pose_components
+                        ]
+                    )
+                    if batch_pose_components else ""
+                ),
+                centroid_error_cm=(
+                    100.0
+                    * finite_mean(
+                        [
+                            value.mean_centroid_error_m.detach().float().item()
+                            for value in batch_pose_components
+                        ]
+                    )
                     if batch_pose_components else ""
                 ),
                 translation_error_cm=(
                     float(100.0 * np.mean([value.mean_translation_error_m.detach().float().item() for value in batch_pose_components]))
                     if batch_pose_components else ""
                 ),
+                pose_match_iou_threshold=(args.pose_train_min_match_iou if args.enable_pose else ""),
+                pose_assignment_coverage=(
+                    batch_pose_total_matches / batch_pose_eligible_targets
+                    if batch_pose_eligible_targets else ""
+                ),
+                pose_match_coverage=(
+                    batch_pose_accepted_matches / batch_pose_eligible_targets
+                    if batch_pose_eligible_targets else ""
+                ),
+                pose_match_acceptance_rate=(
+                    batch_pose_accepted_matches / batch_pose_total_matches
+                    if batch_pose_total_matches else ""
+                ),
+                pose_accepted_matches=(batch_pose_accepted_matches if args.enable_pose else ""),
+                pose_total_matches=(batch_pose_total_matches if args.enable_pose else ""),
+                eligible_samples=(batch_pose_eligible_targets if args.enable_pose else ""),
                 samples=len(batch_losses),
             )
 
@@ -3170,6 +4038,11 @@ def main() -> None:
                     f"loss={batch_loss.item():.4f} avg_loss={avg_loss:.4f} "
                     f"avg_iou={avg_epoch_iou:.4f} "
                     f"run5_loss={running_avg:.4f} run5_iou={running_iou:.4f}"
+                    + (
+                        f" pose_matches={batch_pose_accepted_matches}/{batch_pose_total_matches} "
+                        f"accepted_iou={float(np.mean(batch_pose_match_ious)):.3f}"
+                        if batch_pose_match_ious else ""
+                    )
                 )
                 save_path = os.path.join(args.output_dir, f"finetune.pth")
                 torch.save(
@@ -3181,26 +4054,34 @@ def main() -> None:
                         global_step=global_step,
                         batch_step=batch_step,
                         pose_config=pose_config,
+                        manifest_checksum=manifest_checksum,
                         catalog_checksums=catalog_checksums,
                         dataset_meta_checksums=dataset_meta_checksums,
                         annotation_checksums=annotation_checksums,
                         symmetry_pipeline_versions=symmetry_pipeline_versions,
+                        point_set_checksums=point_set_checksums,
+                        sampling_pipeline_versions=sampling_pipeline_versions,
+                        sampling_parameter_checksums=sampling_parameter_checksums,
                         schema_checksums=schema_checksums,
                         schema_versions=schema_versions,
                     ),
                     save_path,
                 )
-        if epoch_count > 0:
-            append_metric(
-                metrics_path,
-                phase="train_epoch",
-                epoch=epoch,
-                global_step=global_step,
-                batch_step=batch_step,
-                avg_loss=epoch_loss / epoch_count,
-                avg_iou=epoch_iou_sum / max(1, epoch_iou_count),
-                samples=epoch_count,
+        if epoch_count == 0:
+            raise RuntimeError(
+                f"Epoch {epoch} produced zero optimization steps; refusing to write an untrained "
+                "checkpoint. Check exemplar render/mask resolution and supervised masks."
             )
+        append_metric(
+            metrics_path,
+            phase="train_epoch",
+            epoch=epoch,
+            global_step=global_step,
+            batch_step=batch_step,
+            avg_loss=epoch_loss / epoch_count,
+            avg_iou=epoch_iou_sum / max(1, epoch_iou_count),
+            samples=epoch_count,
+        )
         if args.save_every > 0 and epoch % args.save_every == 0:
             save_path = os.path.join(args.output_dir, f"finetune_epoch_{epoch:03d}.pth")
             torch.save(
@@ -3212,10 +4093,14 @@ def main() -> None:
                     global_step=global_step,
                     batch_step=batch_step,
                     pose_config=pose_config,
+                    manifest_checksum=manifest_checksum,
                     catalog_checksums=catalog_checksums,
                     dataset_meta_checksums=dataset_meta_checksums,
                     annotation_checksums=annotation_checksums,
                     symmetry_pipeline_versions=symmetry_pipeline_versions,
+                    point_set_checksums=point_set_checksums,
+                    sampling_pipeline_versions=sampling_pipeline_versions,
+                    sampling_parameter_checksums=sampling_parameter_checksums,
                     schema_checksums=schema_checksums,
                     schema_versions=schema_versions,
                 ),
@@ -3249,7 +4134,7 @@ def main() -> None:
             else:
                 print(f"[eval] epoch={epoch}{loss_part} no valid samples")
             if args.enable_pose and validation_pose_entries:
-                pose_metrics = run_cad_pose_eval(
+                pose_metrics, conditional_pose_metrics = run_cad_pose_eval(
                     detmodel,
                     validation_pose_entries,
                     args,
@@ -3257,14 +4142,14 @@ def main() -> None:
                     pose_config,
                     calibrate_temperature=True,
                 )
-                append_metric(
+                append_pose_metric_rows(
                     metrics_path,
                     phase="validation_pose_calibrated",
                     epoch=epoch,
                     global_step=global_step,
                     batch_step=batch_step,
-                    samples=int(pose_metrics.get("count", 0)),
-                    **{key: value for key, value in pose_metrics.items() if key != "count"},
+                    metrics=pose_metrics,
+                    conditional_metrics=conditional_pose_metrics,
                 )
                 calibrated_path = os.path.join(args.output_dir, "finetune_calibrated.pth")
                 torch.save(
@@ -3276,16 +4161,25 @@ def main() -> None:
                         global_step=global_step,
                         batch_step=batch_step,
                         pose_config=pose_config,
+                        manifest_checksum=manifest_checksum,
                         catalog_checksums=catalog_checksums,
                         dataset_meta_checksums=dataset_meta_checksums,
                         annotation_checksums=annotation_checksums,
                         symmetry_pipeline_versions=symmetry_pipeline_versions,
+                        point_set_checksums=point_set_checksums,
+                        sampling_pipeline_versions=sampling_pipeline_versions,
+                        sampling_parameter_checksums=sampling_parameter_checksums,
                         schema_checksums=schema_checksums,
                         schema_versions=schema_versions,
                     ),
                     calibrated_path,
                 )
                 print(f"[eval:pose:calibrated] {json.dumps(pose_metrics, sort_keys=True)}")
+                if conditional_pose_metrics is not None:
+                    print(
+                        "[eval:pose:calibrated:iou] "
+                        f"{json.dumps(conditional_pose_metrics, sort_keys=True)}"
+                    )
                 print(f"Saved calibrated checkpoint to {calibrated_path}")
 
     print("Done.")

@@ -672,6 +672,7 @@ class SAMV3DetectorModel(nn.Module):
         exemplar_padding_mask_bn: Tensor | None = None,
         blank_no_exemplar_outputs: bool = True,
         cad_dimensions_m_b3: Tensor | None = None,
+        cad_effective_surface_centroid_m_b3: Tensor | None = None,
         camera_intrinsics_b33: Tensor | None = None,
         return_pose: bool = False,
     ) -> tuple[Tensor, Tensor, Tensor, Tensor] | tuple[Tensor, Tensor, Tensor, Tensor, CADPosePredictions]:
@@ -695,9 +696,8 @@ class SAMV3DetectorModel(nn.Module):
         The padding mask prevents padded entries from affecting attention calculations.
 
         Set ``return_pose=True`` to also predict CAD pose. This requires effective
-        physical CAD dimensions and camera intrinsics already adjusted to the encoded
-        model image. Metric dimensions, normalized intrinsics, and angular box extent
-        condition depth; the same pixel-space intrinsics reconstruct translation.
+        physical CAD dimensions, the consistently scaled CAD surface centroid,
+        and camera intrinsics already adjusted to the encoded model image.
 
         Returns:
             mask_predictions, box_xy1xy2_predictions, detection_scores, presence_score
@@ -731,6 +731,10 @@ class SAMV3DetectorModel(nn.Module):
                     return blk_masks, blk_box, blk_score, blk_pres
                 if cad_dimensions_m_b3 is None:
                     raise ValueError("cad_dimensions_m_b3 is required when return_pose=True")
+                if cad_effective_surface_centroid_m_b3 is None:
+                    raise ValueError(
+                        "cad_effective_surface_centroid_m_b3 is required when return_pose=True"
+                    )
                 if camera_intrinsics_b33 is None:
                     raise ValueError("Adjusted camera_intrinsics_b33 is required when return_pose=True")
                 patch_size = self.image_encoder.get_image_tiling_size_constraint()
@@ -739,6 +743,7 @@ class SAMV3DetectorModel(nn.Module):
                     blk_tok,
                     blk_box,
                     cad_dimensions_m_b3,
+                    cad_effective_surface_centroid_m_b3,
                     camera_intrinsics_b33,
                     image_size_wh,
                 )
@@ -761,6 +766,10 @@ class SAMV3DetectorModel(nn.Module):
             if return_pose:
                 if cad_dimensions_m_b3 is None:
                     raise ValueError("cad_dimensions_m_b3 is required when return_pose=True")
+                if cad_effective_surface_centroid_m_b3 is None:
+                    raise ValueError(
+                        "cad_effective_surface_centroid_m_b3 is required when return_pose=True"
+                    )
                 if camera_intrinsics_b33 is None:
                     raise ValueError("Adjusted camera_intrinsics_b33 is required when return_pose=True")
                 patch_size = self.image_encoder.get_image_tiling_size_constraint()
@@ -769,6 +778,7 @@ class SAMV3DetectorModel(nn.Module):
                     enc_det_tokens_bnc,
                     boxes_xy1xy2_bn22,
                     cad_dimensions_m_b3,
+                    cad_effective_surface_centroid_m_b3,
                     camera_intrinsics_b33,
                     image_size_wh,
                 )

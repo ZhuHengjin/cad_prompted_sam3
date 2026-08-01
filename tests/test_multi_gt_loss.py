@@ -13,6 +13,8 @@ try:
 
     from finetune_image_exemplar_multi_gt import (
         compute_multi_gt_detection_loss,
+        compute_multi_gt_detection_losses,
+        filter_pose_matches_by_iou,
         match_predictions_to_gts_greedy_k,
     )
     from loss_fns import compute_bbox_l1_loss_from_matches, compute_matched_mask_losses, compute_presence_loss_logits
@@ -61,6 +63,46 @@ class MultiGtLossEquivalenceTests(unittest.TestCase):
         )
         self.assertIsNotNone(actual)
         torch.testing.assert_close(actual, expected)
+
+    def test_joint_lite_components_can_be_reweighted_independently(self):
+        torch.manual_seed(11)
+        logits = torch.randn(3, 6, 6)
+        boxes = torch.rand(3, 2, 2)
+        score_logits = torch.randn(3)
+        targets = [(torch.rand(6, 6) > 0.6).float()]
+
+        losses = compute_multi_gt_detection_losses(
+            logits,
+            boxes,
+            score_logits,
+            targets,
+            bce_weight=2.0,
+            dice_weight=2.0,
+            score_weight=0.3,
+            no_object_weight=0.45,
+        )
+
+        self.assertIsNotNone(losses)
+        actual = losses.total(mask_weight=0.10, bbox_weight=0.25, objectness_weight=0.25)
+        expected = 0.10 * losses.mask + 0.25 * losses.bbox + 0.25 * losses.objectness
+        torch.testing.assert_close(actual, expected)
+
+    def test_pose_match_iou_filter_keeps_only_qualified_assignments(self):
+        iou = torch.tensor(
+            [
+                [0.49, 0.80, 0.10],
+                [0.20, 0.30, 0.50],
+            ]
+        )
+        matches = [(0, 1), (1, 2)]
+
+        self.assertEqual(filter_pose_matches_by_iou(matches, iou, 0.5), matches)
+        self.assertEqual(filter_pose_matches_by_iou(matches, iou, 0.7), [(0, 1)])
+        self.assertEqual(filter_pose_matches_by_iou(matches, iou, 0.9), [])
+
+    def test_pose_match_iou_filter_rejects_invalid_threshold(self):
+        with self.assertRaisesRegex(ValueError, "min_iou"):
+            filter_pose_matches_by_iou([], torch.zeros(0, 0), 1.1)
 
 
 if __name__ == "__main__":

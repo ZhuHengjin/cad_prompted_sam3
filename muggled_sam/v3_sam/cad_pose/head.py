@@ -16,9 +16,9 @@ class _PredictionBranch(nn.Sequential):
 
 
 class SAMV3CADPoseHead(nn.Module):
-    """Predict box-relative center residual, log-depth, 6-D rotation, and pose quality."""
+    """Predict surface-centroid projection/depth, 6-D rotation, and pose quality."""
 
-    architecture_version = 2
+    architecture_version = 3
     dimension_log_mean: Tensor
     dimension_log_std: Tensor
     pose_score_temperature: Tensor
@@ -82,6 +82,7 @@ class SAMV3CADPoseHead(nn.Module):
         detection_tokens_bnc: Tensor,
         boxes_xy1xy2_bn22: Tensor,
         cad_dimensions_m_b3: Tensor,
+        cad_effective_surface_centroid_m_b3: Tensor,
         camera_intrinsics_b33: Tensor,
         image_size_wh: tuple[int, int],
         cad_geometry_tokens_bkc: Tensor | None = None,
@@ -104,12 +105,21 @@ class SAMV3CADPoseHead(nn.Module):
             raise ValueError(f"cad_dimensions_m_b3 must have shape ({batch}, 3)")
         if not torch.isfinite(cad_dimensions_m_b3).all() or torch.any(cad_dimensions_m_b3 <= 0):
             raise ValueError("Effective CAD dimensions must be finite and strictly positive")
+        if cad_effective_surface_centroid_m_b3.shape != (batch, 3):
+            raise ValueError(
+                f"cad_effective_surface_centroid_m_b3 must have shape ({batch}, 3)"
+            )
+        if not torch.isfinite(cad_effective_surface_centroid_m_b3).all():
+            raise ValueError("Effective CAD surface centroids must be finite")
         if camera_intrinsics_b33.shape != (batch, 3, 3):
             raise ValueError(f"camera_intrinsics_b33 must have shape ({batch}, 3, 3)")
         if not torch.isfinite(camera_intrinsics_b33).all():
             raise ValueError("Camera intrinsics must be finite")
         boxes_xy1xy2_bn22 = boxes_xy1xy2_bn22.to(detection_tokens_bnc)
         cad_dimensions_m_b3 = cad_dimensions_m_b3.to(detection_tokens_bnc)
+        cad_effective_surface_centroid_m_b3 = cad_effective_surface_centroid_m_b3.to(
+            detection_tokens_bnc
+        )
         camera_intrinsics_b33 = camera_intrinsics_b33.to(detection_tokens_bnc)
 
         # Flatten the two box corners, then express the box as center and extent.
@@ -184,4 +194,5 @@ class SAMV3CADPoseHead(nn.Module):
             pose_score_logits,
             pose_score,
             cad_dimensions_m_b3=cad_dimensions_m_b3,
+            cad_effective_surface_centroid_m_b3=cad_effective_surface_centroid_m_b3,
         )

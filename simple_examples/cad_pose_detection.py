@@ -27,6 +27,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("cad_render", type=Path)
     parser.add_argument("cad_id")
     parser.add_argument("--dimensions_m", type=float, nargs=3, required=True)
+    parser.add_argument(
+        "--effective_surface_centroid_m",
+        type=float,
+        nargs=3,
+        required=True,
+        help="Catalog surface centroid after applying the same uniform physical scale as dimensions_m.",
+    )
     parser.add_argument("--camera_k", type=float, nargs=9, required=True, metavar=("K00", "K01", "K02", "K10", "K11", "K12", "K20", "K21", "K22"))
     parser.add_argument("--render_box", type=float, nargs=4, default=(0.0, 0.0, 1.0, 1.0), metavar=("X1", "Y1", "X2", "Y2"))
     parser.add_argument("--score_threshold", type=float, default=0.5)
@@ -87,12 +94,18 @@ def main() -> None:
         (model_w, model_h),
     ).unsqueeze(0)
     dimensions = torch.tensor(args.dimensions_m, device=device, dtype=encoded_image[0].dtype).unsqueeze(0)
+    effective_centroid = torch.tensor(
+        args.effective_surface_centroid_m,
+        device=device,
+        dtype=encoded_image[0].dtype,
+    ).unsqueeze(0)
     # Request segmentation, detection confidence, and metric 6-DoF pose jointly.
     masks, boxes, scores, _, poses = detector.generate_detections(
         encoded_image,
         exemplar,
         detection_filter_threshold=args.score_threshold,
         cad_dimensions_m_b3=dimensions,
+        cad_effective_surface_centroid_m_b3=effective_centroid,
         camera_intrinsics_b33=adjusted_k,
         return_pose=True,
     )
