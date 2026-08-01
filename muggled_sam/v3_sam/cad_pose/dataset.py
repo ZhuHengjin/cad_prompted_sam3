@@ -1,4 +1,4 @@
-"""Versioned loader and validator for Perseve pose sidecars (schema v1)."""
+"""Versioned loader for point-set pose schema v2 and legacy symmetry schema v1."""
 
 from __future__ import annotations
 
@@ -6,6 +6,7 @@ import hashlib
 import json
 import math
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
@@ -14,12 +15,18 @@ import numpy as np
 import torch
 from torch import Tensor
 
-from .geometry import adjust_intrinsics_for_resize_and_pad, pixel_to_normalized, project_points
+from .geometry import (
+    adjust_intrinsics_for_resize_and_pad,
+    pixel_to_normalized,
+    project_points,
+    surface_centroid_camera,
+)
+from .point_sets import LoadedPointSet, load_point_set_artifact
 from .symmetry import VERIFIED_SYMMETRY_STATUSES
 from .types import CADPoseTarget
 
 
-SUPPORTED_SCHEMA_MAJOR = 1
+SUPPORTED_SCHEMA_MAJORS = frozenset((1, 2))
 ANNOTATION_STATES = frozenset(("visible", "fully_occluded", "out_of_frame", "invalid_geometry", "capture_error"))
 SYMMETRY_TYPES = frozenset(("none", "discrete", "continuous_axis"))
 
@@ -40,6 +47,17 @@ class SymmetryMetadata:
 
 
 @dataclass(frozen=True)
+class PointSetMetadata:
+    path: Path
+    sha256: str
+    point_count: int
+    sampling_method: str
+    sampling_parameters_sha256: str
+    surface_centroid_m: np.ndarray
+    loaded: LoadedPointSet
+
+
+@dataclass(frozen=True)
 class CADCatalogObject:
     cad_id: str
     base_dimensions_m: np.ndarray
@@ -47,7 +65,16 @@ class CADCatalogObject:
     bbox_max_m: np.ndarray
     source_to_meters: float
     T_cad_from_source_meters: np.ndarray
-    symmetry: SymmetryMetadata
+    point_set: PointSetMetadata | None = None
+    symmetry: SymmetryMetadata | None = None
+
+    @property
+    def point_set_eligible(self) -> bool:
+        return self.point_set is not None
+
+    @property
+    def legacy_rotation_eligible(self) -> bool:
+        return self.symmetry is not None and self.symmetry.rotation_eligible
 
 
 @dataclass(frozen=True)
@@ -107,7 +134,63 @@ class PersevePoseSample:
 
     @property
     def symmetry_pipeline_versions(self) -> tuple[str, ...]:
-        return tuple(sorted({obj.symmetry.pipeline_version for obj in self.catalog.values()}))
+        return tuple(
+            sorted(
+                {
+                    obj.symmetry.pipeline_version
+                    for obj in self.catalog.values()
+                    if obj.symmetry is not None
+                }
+            )
+        )
+
+    @property
+    def point_set_checksums(self) -> tuple[str, ...]:
+        return tuple(
+            sorted(
+                {
+                    obj.point_set.sha256
+                    for obj in self.catalog.values()
+                    if obj.point_set is not None
+                }
+            )
+        )
+
+    @property
+    def sampling_pipeline_versions(self) -> tuple[str, ...]:
+        return tuple(
+            sorted(
+                {
+                    obj.point_set.sampling_method
+                    for obj in self.catalog.values()
+                    if obj.point_set is not None
+                }
+            )
+        )
+
+    @property
+    def sampling_parameter_checksums(self) -> tuple[str, ...]:
+        return tuple(
+            sorted(
+                {
+                    obj.point_set.sampling_parameters_sha256
+                    for obj in self.catalog.values()
+                    if obj.point_set is not None
+                }
+            )
+        )
+
+
+@dataclass(frozen=True)
+class _DatasetContract:
+    dataset_meta: Mapping[str, Any]
+    catalog: Mapping[str, CADCatalogObject]
+    schema_paths: Mapping[str, Path]
+    annotation_validator: Any
+    schema_major: int
+    dataset_meta_checksum: str
+    catalog_checksum: str
+    schema_checksums: Mapping[str, str]
 
 
 def sha256_file(path: Path) -> str:
@@ -128,14 +211,29 @@ def load_perseve_pose_sample(camera_root: Path, frame_id: str, *, validate_pixel
     for path in (annotation_path, meta_path, catalog_path):
         if not path.is_file():
             raise FileNotFoundError(path)
-    meta_raw, catalog_raw, annotation_raw = _load_json(meta_path), _load_json(catalog_path), _load_json(annotation_path)
-    schema_paths = _resolve_schema_paths(dataset_root, meta_raw)
-    _validate_json_schemas(meta_raw, catalog_raw, annotation_raw, schema_paths)
-    _require_supported_version(str(meta_raw.get("schema_version", "")), "dataset metadata")
-    _require_supported_version(str(catalog_raw.get("schema_version", "")), "object catalog")
+    meta_stat, catalog_stat = meta_path.stat(), catalog_path.stat()
+    contract = _load_dataset_contract_cached(
+        str(dataset_root),
+        meta_stat.st_mtime_ns,
+        meta_stat.st_size,
+        catalog_stat.st_mtime_ns,
+        catalog_stat.st_size,
+    )
+    annotation_raw = _load_json(annotation_path)
+    contract.annotation_validator.validate(annotation_raw)
     _require_supported_version(str(annotation_raw.get("schema_version", "")), "pose annotation")
-    catalog = _parse_catalog(catalog_raw, meta_raw)
-    frame = _parse_frame(annotation_raw, annotation_path, catalog, meta_raw)
+    annotation_major = int(str(annotation_raw["schema_version"]).split(".", 1)[0])
+    if annotation_major != contract.schema_major:
+        raise ValueError(
+            "Dataset metadata, catalog, and annotation schema majors differ: "
+            f"dataset={contract.schema_major}, annotation={annotation_major}"
+        )
+    frame = _parse_frame(
+        annotation_raw,
+        annotation_path,
+        contract.catalog,
+        contract.dataset_meta,
+    )
     if frame.frame_id != str(frame_id):
         raise ValueError(f"Sidecar frame_id {frame.frame_id!r} does not match manifest frame {frame_id!r}")
     if validate_pixels:
@@ -143,12 +241,12 @@ def load_perseve_pose_sample(camera_root: Path, frame_id: str, *, validate_pixel
     return PersevePoseSample(
         frame,
         dataset_root,
-        catalog,
-        meta_raw,
-        sha256_file(meta_path),
-        sha256_file(catalog_path),
+        contract.catalog,
+        contract.dataset_meta,
+        contract.dataset_meta_checksum,
+        contract.catalog_checksum,
         sha256_file(annotation_path),
-        {name: sha256_file(path) for name, path in schema_paths.items()},
+        contract.schema_checksums,
     )
 
 
@@ -177,7 +275,7 @@ def instance_mask_rgba(instance_image_path: Path, instance: PoseInstance) -> np.
     if image is None:
         raise FileNotFoundError(instance_image_path)
     if image.ndim != 3 or image.shape[2] != 4:
-        raise ValueError(f"Perseve v1 requires a four-channel instance PNG: {instance_image_path}")
+        raise ValueError(f"Perseve pose v1/v2 requires a four-channel instance PNG: {instance_image_path}")
     rgba = cv2.cvtColor(image, cv2.COLOR_BGRA2RGBA)
     target = np.asarray(instance.mask_rgba, dtype=np.uint8).reshape(1, 1, 4)
     return np.all(rgba == target, axis=-1)
@@ -200,6 +298,24 @@ def parse_logical_rgba_key(mapping_key: str) -> tuple[int, int, int, int]:
     return channels
 
 
+def effective_surface_centroid_m(
+    instance: PoseInstance,
+    catalog_object: CADCatalogObject,
+) -> np.ndarray:
+    """Return ``s * mu`` for point-set data, or zero for legacy AABB targets."""
+
+    if catalog_object.point_set is None:
+        return np.zeros(3, dtype=np.float64)
+    if instance.render_scale_xyz is None or not np.allclose(
+        instance.render_scale_xyz,
+        instance.render_scale_xyz[0],
+        atol=1e-8,
+        rtol=1e-6,
+    ):
+        raise ValueError(f"Instance {instance.instance_id} does not have a valid uniform scale")
+    return float(instance.render_scale_xyz[0]) * catalog_object.point_set.surface_centroid_m
+
+
 def make_pose_target(
     instance: PoseInstance,
     catalog_object: CADCatalogObject,
@@ -207,24 +323,79 @@ def make_pose_target(
     source_size_wh: tuple[int, int],
     model_size_wh: tuple[int, int],
 ) -> CADPoseTarget:
-    """Derive normalized projected-center, log-depth, and rotation targets."""
+    """Derive centroid/depth and point-set targets, with a v1 legacy fallback."""
 
     if not instance.pose_training_eligible or instance.T_cam_from_cad is None or instance.dimensions_m is None:
         raise ValueError(f"Instance {instance.instance_id} is not eligible for pose training")
     adjusted_k = adjust_intrinsics_for_resize_and_pad(intrinsics, source_size_wh, model_size_wh)
     translation = torch.as_tensor(instance.translation_m, dtype=intrinsics.dtype, device=intrinsics.device)
+    rotation = torch.as_tensor(instance.rotation_matrix, dtype=intrinsics.dtype, device=intrinsics.device)
+    dimensions = torch.as_tensor(instance.dimensions_m, dtype=intrinsics.dtype, device=intrinsics.device)
+    if catalog_object.point_set is not None:
+        if instance.render_scale_xyz is None or not np.allclose(
+            instance.render_scale_xyz,
+            instance.render_scale_xyz[0],
+            atol=1e-8,
+            rtol=1e-6,
+        ):
+            raise ValueError(f"Instance {instance.instance_id} requires uniform scale for point-set supervision")
+        scale = float(instance.render_scale_xyz[0])
+        point_set = catalog_object.point_set
+        effective_centroid = torch.as_tensor(
+            scale * point_set.surface_centroid_m,
+            dtype=intrinsics.dtype,
+            device=intrinsics.device,
+        )
+        centroid = surface_centroid_camera(rotation, translation, effective_centroid)
+        if centroid[2] <= 0:
+            raise ValueError(f"Instance {instance.instance_id} has non-positive surface-centroid depth")
+        center_norm = pixel_to_normalized(project_points(centroid, adjusted_k), model_size_wh)
+        centered_dense = torch.as_tensor(
+            scale * (point_set.loaded.points_m - point_set.surface_centroid_m),
+            dtype=intrinsics.dtype,
+            device=intrinsics.device,
+        )
+        query_indices = torch.tensor(
+            np.asarray(point_set.loaded.query_indices).copy(),
+            dtype=torch.long,
+            device=intrinsics.device,
+        )
+        return CADPoseTarget(
+            center_uv_norm=center_norm,
+            log_depth=centroid[2].log(),
+            rotation_matrix=rotation,
+            translation_m=translation,
+            dimensions_m=dimensions,
+            centroid_m=centroid,
+            effective_surface_centroid_m=effective_centroid,
+            point_query_m=centered_dense[query_indices],
+            point_target_m=centered_dense,
+            point_set_eligible=True,
+            rotation_eligible=True,
+        )
+
     if translation[2] <= 0:
         raise ValueError(f"Instance {instance.instance_id} has non-positive camera-axis depth")
     center_norm = pixel_to_normalized(project_points(translation, adjusted_k), model_size_wh)
     symmetry = catalog_object.symmetry
-    transforms = torch.as_tensor(np.stack(symmetry.transforms), dtype=intrinsics.dtype, device=intrinsics.device)
-    axis = None if symmetry.axis_cad is None else torch.as_tensor(symmetry.axis_cad, dtype=intrinsics.dtype, device=intrinsics.device)
+    if symmetry is None:
+        raise ValueError(f"CAD {catalog_object.cad_id} has neither point-set nor legacy symmetry metadata")
+    transforms = torch.as_tensor(
+        np.stack(symmetry.transforms),
+        dtype=intrinsics.dtype,
+        device=intrinsics.device,
+    )
+    axis = (
+        None
+        if symmetry.axis_cad is None
+        else torch.as_tensor(symmetry.axis_cad, dtype=intrinsics.dtype, device=intrinsics.device)
+    )
     return CADPoseTarget(
         center_uv_norm=center_norm,
         log_depth=translation[2].log(),
-        rotation_matrix=torch.as_tensor(instance.rotation_matrix, dtype=intrinsics.dtype, device=intrinsics.device),
+        rotation_matrix=rotation,
         translation_m=translation,
-        dimensions_m=torch.as_tensor(instance.dimensions_m, dtype=intrinsics.dtype, device=intrinsics.device),
+        dimensions_m=dimensions,
         symmetry_type=symmetry.type,
         symmetry_transforms=transforms,
         axis_cad=axis,
@@ -259,6 +430,59 @@ def _resolve_schema_paths(dataset_root: Path, meta: Mapping[str, Any]) -> dict[s
     return paths
 
 
+@lru_cache(maxsize=8)
+def _load_dataset_contract_cached(
+    dataset_root_string: str,
+    metadata_mtime_ns: int,
+    metadata_size: int,
+    catalog_mtime_ns: int,
+    catalog_size: int,
+) -> _DatasetContract:
+    """Load and validate immutable dataset-level state once per file version."""
+
+    del metadata_mtime_ns, metadata_size, catalog_mtime_ns, catalog_size
+    try:
+        import jsonschema
+    except ModuleNotFoundError as exc:
+        raise RuntimeError("Perseve pose loading requires the 'jsonschema' package") from exc
+    dataset_root = Path(dataset_root_string)
+    metadata_path = dataset_root / "dataset_meta.json"
+    catalog_path = dataset_root / "objects.json"
+    metadata = _load_json(metadata_path)
+    catalog_raw = _load_json(catalog_path)
+    schema_paths = _resolve_schema_paths(dataset_root, metadata)
+    schema_documents = {name: _load_json(path) for name, path in schema_paths.items()}
+    validators = {
+        name: jsonschema.Draft202012Validator(schema)
+        for name, schema in schema_documents.items()
+    }
+    validators["dataset_meta"].validate(metadata)
+    validators["objects"].validate(catalog_raw)
+    _require_supported_version(str(metadata.get("schema_version", "")), "dataset metadata")
+    _require_supported_version(str(catalog_raw.get("schema_version", "")), "object catalog")
+    schema_majors = {
+        int(str(value.get("schema_version", "")).split(".", 1)[0])
+        for value in (metadata, catalog_raw)
+    }
+    if len(schema_majors) != 1:
+        raise ValueError(
+            f"Dataset metadata and catalog schema majors differ: {schema_majors}"
+        )
+    parsed_catalog = _parse_catalog(catalog_raw, metadata, dataset_root)
+    return _DatasetContract(
+        dataset_meta=metadata,
+        catalog=parsed_catalog,
+        schema_paths=schema_paths,
+        annotation_validator=validators["pose_annotations"],
+        schema_major=next(iter(schema_majors)),
+        dataset_meta_checksum=sha256_file(metadata_path),
+        catalog_checksum=sha256_file(catalog_path),
+        schema_checksums={
+            name: sha256_file(path) for name, path in schema_paths.items()
+        },
+    )
+
+
 def _validate_json_schemas(meta: Any, catalog: Any, annotation: Any, schema_paths: Mapping[str, Path]) -> None:
     try:
         import jsonschema
@@ -273,48 +497,95 @@ def _require_supported_version(version: str, kind: str) -> None:
         major = int(version.split(".", 1)[0])
     except (ValueError, IndexError) as exc:
         raise ValueError(f"Invalid {kind} schema version: {version!r}") from exc
-    if major != SUPPORTED_SCHEMA_MAJOR:
-        raise ValueError(f"Unsupported {kind} schema major {major}; expected {SUPPORTED_SCHEMA_MAJOR}")
+    if major not in SUPPORTED_SCHEMA_MAJORS:
+        raise ValueError(
+            f"Unsupported {kind} schema major {major}; expected one of {sorted(SUPPORTED_SCHEMA_MAJORS)}"
+        )
 
 
-def _parse_catalog(raw: Mapping[str, Any], meta: Mapping[str, Any]) -> dict[str, CADCatalogObject]:
+def _parse_catalog(
+    raw: Mapping[str, Any],
+    meta: Mapping[str, Any],
+    dataset_root: Path,
+) -> dict[str, CADCatalogObject]:
     rotation_atol = float(meta.get("validation_tolerances", {}).get("rotation_atol", 1e-6))
     dimension_atol = float(meta.get("validation_tolerances", {}).get("dimension_atol_m", 1e-6))
     objects: dict[str, CADCatalogObject] = {}
     for cad_id, value in raw["objects"].items():
-        symmetry_raw = value["symmetry"]
-        symmetry_type = symmetry_raw["type"]
-        if symmetry_type not in SYMMETRY_TYPES:
-            raise ValueError(f"Unsupported symmetry type for {cad_id}: {symmetry_type}")
-        transforms = tuple(np.asarray(item, dtype=np.float64) for item in symmetry_raw["transforms"])
-        for transform in transforms:
-            _validate_rotation(transform, rotation_atol, f"{cad_id} symmetry")
-        if not any(np.allclose(item, np.eye(3), atol=rotation_atol, rtol=0) for item in transforms):
-            raise ValueError(f"Symmetry group for {cad_id} does not contain identity")
-        if symmetry_type == "discrete":
-            _validate_group_closure(transforms, rotation_atol, cad_id)
-        axis = symmetry_raw.get("axis_cad")
-        axis_np = None if axis is None else np.asarray(axis, dtype=np.float64)
-        if symmetry_type == "continuous_axis" and (
-            axis_np is None or not np.isclose(np.linalg.norm(axis_np), 1.0, atol=rotation_atol, rtol=0)
-        ):
-            raise ValueError(f"Continuous symmetry axis for {cad_id} must be unit length")
-        bbox_min, bbox_max = np.asarray(value["bbox_min_m"], dtype=np.float64), np.asarray(value["bbox_max_m"], dtype=np.float64)
+        bbox_min = np.asarray(value["bbox_min_m"], dtype=np.float64)
+        bbox_max = np.asarray(value["bbox_max_m"], dtype=np.float64)
         dimensions = np.asarray(value["base_dimensions_m"], dtype=np.float64)
         if not np.allclose(bbox_max - bbox_min, dimensions, atol=dimension_atol, rtol=1e-5):
             raise ValueError(f"Catalog dimensions do not match bounds for {cad_id}")
         canonical_transform = np.asarray(value["T_cad_from_source_meters"], dtype=np.float64)
         _validate_rigid_transform(canonical_transform, rotation_atol, f"{cad_id} source transform")
-        symmetry = SymmetryMetadata(
-            symmetry_type,
-            transforms,
-            axis_np,
-            str(symmetry_raw["label_source"]),
-            str(symmetry_raw["status"]),
-            str(symmetry_raw["pipeline_version"]),
-            str(symmetry_raw["parameters_sha256"]),
+        point_set = None
+        point_raw = value.get("point_set")
+        if point_raw is not None:
+            centroid = np.asarray(point_raw["surface_centroid_m"], dtype=np.float64)
+            artifact_path = (dataset_root / str(point_raw["path"])).resolve()
+            try:
+                artifact_path.relative_to(dataset_root.resolve())
+            except ValueError as exc:
+                raise ValueError(f"Point-set path for {cad_id} escapes the dataset root") from exc
+            loaded = load_point_set_artifact(
+                artifact_path,
+                expected_sha256=str(point_raw["sha256"]),
+                expected_point_count=int(point_raw["point_count"]),
+                expected_centroid_m=centroid,
+                centroid_atol_m=max(dimension_atol, 1e-10),
+            )
+            point_set = PointSetMetadata(
+                artifact_path,
+                str(point_raw["sha256"]),
+                int(point_raw["point_count"]),
+                str(point_raw["sampling_method"]),
+                str(point_raw["sampling_parameters_sha256"]),
+                centroid,
+                loaded,
+            )
+
+        symmetry = None
+        symmetry_raw = value.get("symmetry")
+        if symmetry_raw is not None:
+            symmetry_type = symmetry_raw["type"]
+            if symmetry_type not in SYMMETRY_TYPES:
+                raise ValueError(f"Unsupported symmetry type for {cad_id}: {symmetry_type}")
+            transforms = tuple(np.asarray(item, dtype=np.float64) for item in symmetry_raw["transforms"])
+            for transform in transforms:
+                _validate_rotation(transform, rotation_atol, f"{cad_id} symmetry")
+            if not any(np.allclose(item, np.eye(3), atol=rotation_atol, rtol=0) for item in transforms):
+                raise ValueError(f"Symmetry group for {cad_id} does not contain identity")
+            if symmetry_type == "discrete":
+                _validate_group_closure(transforms, rotation_atol, cad_id)
+            axis = symmetry_raw.get("axis_cad")
+            axis_np = None if axis is None else np.asarray(axis, dtype=np.float64)
+            if symmetry_type == "continuous_axis" and (
+                axis_np is None
+                or not np.isclose(np.linalg.norm(axis_np), 1.0, atol=rotation_atol, rtol=0)
+            ):
+                raise ValueError(f"Continuous symmetry axis for {cad_id} must be unit length")
+            symmetry = SymmetryMetadata(
+                symmetry_type,
+                transforms,
+                axis_np,
+                str(symmetry_raw["label_source"]),
+                str(symmetry_raw["status"]),
+                str(symmetry_raw["pipeline_version"]),
+                str(symmetry_raw["parameters_sha256"]),
+            )
+        if point_set is None and symmetry is None:
+            raise ValueError(f"CAD {cad_id} has neither point_set nor legacy symmetry metadata")
+        objects[cad_id] = CADCatalogObject(
+            cad_id,
+            dimensions,
+            bbox_min,
+            bbox_max,
+            float(value["source_to_meters"]),
+            canonical_transform,
+            point_set,
+            symmetry,
         )
-        objects[cad_id] = CADCatalogObject(cad_id, dimensions, bbox_min, bbox_max, float(value["source_to_meters"]), canonical_transform, symmetry)
     return objects
 
 
@@ -330,6 +601,7 @@ def _parse_frame(raw: Mapping[str, Any], path: Path, catalog: Mapping[str, CADCa
     )
     tolerance = meta.get("validation_tolerances", {})
     atol, rtol = float(tolerance.get("dimension_atol_m", 1e-6)), float(tolerance.get("dimension_rtol", 1e-5))
+    schema_major = int(str(raw["schema_version"]).split(".", 1)[0])
     image_size = tuple(int(value) for value in raw["image"]["size_wh"])
     instances, seen_ids = [], set()
     for value in raw["instances"]:
@@ -342,8 +614,8 @@ def _parse_frame(raw: Mapping[str, Any], path: Path, catalog: Mapping[str, CADCa
         state, eligible = str(value["annotation_state"]), bool(value["pose_training_eligible"])
         if state not in ANNOTATION_STATES:
             raise ValueError(f"Unsupported annotation state: {state}")
-        if eligible and (state != "visible" or not catalog[cad_id].symmetry.rotation_eligible):
-            raise ValueError(f"Ineligible state/symmetry marked pose_training_eligible for {instance_id}")
+        if eligible and state != "visible":
+            raise ValueError(f"Non-visible instance marked pose_training_eligible: {instance_id}")
         mask_raw = value.get("mask")
         mapping_key = None if mask_raw is None else str(mask_raw["mapping_key"])
         mask_rgba = None if mask_raw is None else tuple(int(channel) for channel in mask_raw["value"])
@@ -372,10 +644,32 @@ def _parse_frame(raw: Mapping[str, Any], path: Path, catalog: Mapping[str, CADCa
             catalog[cad_id].base_dimensions_m * scale, dimensions, atol=atol, rtol=rtol
         ):
             raise ValueError(f"Effective dimensions do not match catalog dimensions * render scale for {instance_id}")
-        if eligible and (transform is None or dimensions is None or bbox is None or mask_rgba is None):
+        catalog_object = catalog[cad_id]
+        if schema_major >= 2:
+            if eligible and catalog_object.point_set is None:
+                raise ValueError(f"Pose-eligible v2 instance {instance_id} has no valid point-set artifact")
+            if eligible and (
+                scale is None or not np.allclose(scale, scale[0], atol=atol, rtol=rtol)
+            ):
+                raise ValueError(f"Pose-eligible point-set instance {instance_id} requires uniform scale")
+        elif eligible and not catalog_object.legacy_rotation_eligible:
+            raise ValueError(f"Unverified legacy symmetry marked pose_training_eligible for {instance_id}")
+        if eligible and (
+            transform is None
+            or (schema_major >= 2 and scale is None)
+            or dimensions is None
+            or bbox is None
+            or mask_rgba is None
+        ):
             raise ValueError(f"Pose-eligible instance {instance_id} is missing required geometry or mask fields")
-        if eligible and transform[2, 3] <= 0:
-            raise ValueError(f"Pose-eligible instance {instance_id} has non-positive depth")
+        if eligible:
+            if catalog_object.point_set is not None:
+                effective_centroid = scale[0] * catalog_object.point_set.surface_centroid_m
+                centroid_camera = transform[:3, :3] @ effective_centroid + transform[:3, 3]
+                if centroid_camera[2] <= 0:
+                    raise ValueError(f"Pose-eligible instance {instance_id} has non-positive centroid depth")
+            elif transform[2, 3] <= 0:
+                raise ValueError(f"Pose-eligible instance {instance_id} has non-positive depth")
         instances.append(PoseInstance(instance_id, cad_id, state, eligible, mapping_key, mask_rgba, bbox, transform, scale, dimensions))
     return PoseFrame(
         str(raw["schema_version"]),

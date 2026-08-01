@@ -40,7 +40,7 @@ def matrix_to_rotation_6d(rotation_matrix: Tensor) -> Tensor:
 
 
 def reconstruct_translation(center_uv_px: Tensor, log_depth: Tensor, intrinsics: Tensor) -> Tensor:
-    """Reconstruct metric OpenCV-frame translation from image center and log-depth."""
+    """Back-project a metric OpenCV-frame point from image center and log-depth."""
 
     if center_uv_px.shape[-1] != 2:
         raise ValueError(f"Expected projected centers ending in 2 values, got {tuple(center_uv_px.shape)}")
@@ -58,6 +58,57 @@ def reconstruct_translation(center_uv_px: Tensor, log_depth: Tensor, intrinsics:
         intrinsics.to(calculation_dtype), homogeneous.to(calculation_dtype).unsqueeze(-1)
     ).squeeze(-1)
     return rays * log_depth.to(calculation_dtype).exp().unsqueeze(-1)
+
+
+def surface_centroid_camera(
+    rotation_matrix: Tensor,
+    aabb_translation_m: Tensor,
+    effective_surface_centroid_m: Tensor,
+) -> Tensor:
+    """Transform an effective canonical surface centroid into camera space."""
+
+    effective_surface_centroid_m = _broadcast_vector_for_rotation(
+        effective_surface_centroid_m, rotation_matrix
+    )
+    aabb_translation_m = _broadcast_vector_for_rotation(aabb_translation_m, rotation_matrix)
+    calculation_dtype = torch.promote_types(rotation_matrix.dtype, effective_surface_centroid_m.dtype)
+    rotation_matrix = rotation_matrix.to(calculation_dtype)
+    effective_surface_centroid_m = effective_surface_centroid_m.to(calculation_dtype)
+    aabb_translation_m = aabb_translation_m.to(calculation_dtype)
+    return (
+        torch.matmul(rotation_matrix, effective_surface_centroid_m.unsqueeze(-1)).squeeze(-1)
+        + aabb_translation_m
+    )
+
+
+def aabb_translation_from_surface_centroid(
+    centroid_camera_m: Tensor,
+    rotation_matrix: Tensor,
+    effective_surface_centroid_m: Tensor,
+) -> Tensor:
+    """Recover public AABB-origin translation from a camera-space centroid."""
+
+    effective_surface_centroid_m = _broadcast_vector_for_rotation(
+        effective_surface_centroid_m, rotation_matrix
+    )
+    centroid_camera_m = _broadcast_vector_for_rotation(centroid_camera_m, rotation_matrix)
+    calculation_dtype = torch.promote_types(rotation_matrix.dtype, centroid_camera_m.dtype)
+    rotation_matrix = rotation_matrix.to(calculation_dtype)
+    effective_surface_centroid_m = effective_surface_centroid_m.to(calculation_dtype)
+    centroid_camera_m = centroid_camera_m.to(calculation_dtype)
+    return centroid_camera_m - torch.matmul(
+        rotation_matrix, effective_surface_centroid_m.unsqueeze(-1)
+    ).squeeze(-1)
+
+
+def rotate_points(points: Tensor, rotation_matrix: Tensor) -> Tensor:
+    """Apply column-vector rotations to point rows ending in ``Nx3``."""
+
+    if points.ndim < 2 or points.shape[-1] != 3:
+        raise ValueError(f"Expected points ending in Nx3, got {tuple(points.shape)}")
+    if rotation_matrix.shape[-2:] != (3, 3):
+        raise ValueError(f"Expected rotations ending in 3x3, got {tuple(rotation_matrix.shape)}")
+    return torch.matmul(points, rotation_matrix.transpose(-1, -2))
 
 
 def project_points(points_camera: Tensor, intrinsics: Tensor, eps: float = 1e-8) -> Tensor:
@@ -139,3 +190,11 @@ def _broadcast_intrinsics(intrinsics: Tensor, target_leading_dims: int) -> Tenso
     while intrinsics.ndim - 2 < target_leading_dims:
         intrinsics = intrinsics.unsqueeze(-3)
     return intrinsics
+
+
+def _broadcast_vector_for_rotation(vector: Tensor, rotation_matrix: Tensor) -> Tensor:
+    if vector.shape[-1:] != (3,):
+        raise ValueError(f"Expected vectors ending in 3 values, got {tuple(vector.shape)}")
+    while vector.ndim < rotation_matrix.ndim - 1:
+        vector = vector.unsqueeze(-2)
+    return vector

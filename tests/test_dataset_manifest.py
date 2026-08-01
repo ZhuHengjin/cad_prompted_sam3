@@ -12,7 +12,7 @@ import unittest
 from collections import Counter
 from pathlib import Path
 
-from build_dataset_manifest import build_rows, load_wrist_groups
+from build_dataset_manifest import build_pose_rows, build_rows, load_wrist_groups
 from dataset_manifest import (
     ManifestRow,
     assign_group_splits,
@@ -125,6 +125,34 @@ class DatasetManifestTests(unittest.TestCase):
             make_sample(root, "side", "Side_Camera_0", "0000")
             with self.assertRaises(ValueError):
                 build_rows(root, "wrist", "side", (0.8, 0.1, 0.1), 42)
+
+    def test_flat_pose_builder_uses_sidecar_scene_groups(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for index in range(10):
+                frame_id = f"{index:04d}"
+                make_sample(root, "pose", ".", frame_id)
+                sidecar = {
+                    "frame_id": frame_id,
+                    "scene_id": f"scene_{index // 2:02d}",
+                }
+                (root / "pose" / f"pose_annotations_{frame_id}.json").write_text(
+                    json.dumps(sidecar)
+                )
+            rows = build_pose_rows(
+                root,
+                [("abc_pose", "pose")],
+                (0.6, 0.2, 0.2),
+                42,
+            )
+            self.assertEqual(len(rows), 10)
+            self.assertEqual({row.camera_dir for row in rows}, {"."})
+            split_by_group = {}
+            for row in rows:
+                prior = split_by_group.setdefault(row.group_id, row.split)
+                self.assertEqual(prior, row.split)
+            self.assertEqual(len(split_by_group), 5)
+            validate_manifest_rows(rows, root)
 
 
 if __name__ == "__main__":

@@ -1,0 +1,75 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://perseve.local/schemas/perseve-pose-v2/objects.schema.json",
+  "title": "Perseve point-set object catalog v2",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "objects"],
+  "properties": {
+    "schema_version": {"type": "string", "pattern": "^2\\.[0-9]+\\.[0-9]+$"},
+    "objects": {
+      "type": "object",
+      "minProperties": 1,
+      "additionalProperties": {"$ref": "#/$defs/object"}
+    },
+    "extensions": {"type": "object"}
+  },
+  "$defs": {
+    "vec3": {
+      "type": "array",
+      "minItems": 3,
+      "maxItems": 3,
+      "items": {"type": "number"}
+    },
+    "mat4": {
+      "type": "array",
+      "minItems": 4,
+      "maxItems": 4,
+      "items": {
+        "type": "array",
+        "minItems": 4,
+        "maxItems": 4,
+        "items": {"type": "number"}
+      }
+    },
+    "point_set": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "path", "sha256", "point_count", "sampling_method",
+        "sampling_parameters_sha256", "surface_centroid_m"
+      ],
+      "properties": {
+        "path": {"type": "string", "minLength": 1},
+        "sha256": {"type": "string", "pattern": "^[0-9a-fA-F]{64}$"},
+        "point_count": {"type": "integer", "minimum": 1},
+        "sampling_method": {"type": "string", "minLength": 1},
+        "sampling_parameters_sha256": {"type": "string", "pattern": "^[0-9a-fA-F]{64}$"},
+        "surface_centroid_m": {"$ref": "#/$defs/vec3"},
+        "extensions": {"type": "object"}
+      }
+    },
+    "object": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "mesh_path", "mesh_sha256", "source_length_unit", "source_to_meters",
+        "T_cad_from_source_meters", "bbox_min_m", "bbox_max_m",
+        "base_dimensions_m", "canonical_origin", "point_set"
+      ],
+      "properties": {
+        "mesh_path": {"type": "string", "minLength": 1},
+        "mesh_sha256": {"type": "string", "pattern": "^[0-9a-fA-F]{64}$"},
+        "source_length_unit": {"type": "string", "minLength": 1},
+        "source_to_meters": {"type": "number", "exclusiveMinimum": 0},
+        "T_cad_from_source_meters": {"$ref": "#/$defs/mat4"},
+        "bbox_min_m": {"$ref": "#/$defs/vec3"},
+        "bbox_max_m": {"$ref": "#/$defs/vec3"},
+        "base_dimensions_m": {"$ref": "#/$defs/vec3"},
+        "canonical_origin": {"const": "local_aabb_center"},
+        "point_set": {"$ref": "#/$defs/point_set"},
+        "extensions": {"type": "object"}
+      }
+    }
+  }
+}

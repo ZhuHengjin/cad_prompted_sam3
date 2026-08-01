@@ -1,0 +1,60 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://perseve.local/schemas/perseve-pose-v2/dataset-meta.schema.json",
+  "title": "Perseve point-set pose dataset metadata v2",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema", "schema_version", "length_unit", "transform_convention",
+    "vector_convention", "matrix_storage", "camera_frame", "image_origin",
+    "pixel_convention", "segmentation_encoding", "bbox_convention",
+    "asset_catalog", "schemas", "validation_tolerances", "generator"
+  ],
+  "properties": {
+    "schema": {"const": "perseve.pose"},
+    "schema_version": {"type": "string", "pattern": "^2\\.[0-9]+\\.[0-9]+$"},
+    "length_unit": {"const": "m"},
+    "transform_convention": {"const": "p_target = T_target_from_source @ p_source"},
+    "vector_convention": {"const": "column"},
+    "matrix_storage": {"const": "row_major_json"},
+    "camera_frame": {"const": "opencv_x_right_y_down_z_forward"},
+    "image_origin": {"const": "top_left"},
+    "pixel_convention": {"const": "top_left_pixel_center_is_0_0"},
+    "segmentation_encoding": {"const": "rgba_png_v1"},
+    "bbox_convention": {"const": "xyxy_inclusive_integer"},
+    "asset_catalog": {"type": "string", "minLength": 1},
+    "schemas": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["dataset_meta", "objects", "pose_annotations"],
+      "properties": {
+        "dataset_meta": {"type": "string", "minLength": 1},
+        "objects": {"type": "string", "minLength": 1},
+        "pose_annotations": {"type": "string", "minLength": 1}
+      }
+    },
+    "validation_tolerances": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["rotation_atol", "dimension_atol_m", "dimension_rtol"],
+      "properties": {
+        "rotation_atol": {"type": "number", "exclusiveMinimum": 0},
+        "dimension_atol_m": {"type": "number", "minimum": 0},
+        "dimension_rtol": {"type": "number", "minimum": 0}
+      }
+    },
+    "generator": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "git_commit", "isaac_sim_version", "seed", "config_sha256"],
+      "properties": {
+        "name": {"const": "perseve"},
+        "git_commit": {"type": "string", "minLength": 1},
+        "isaac_sim_version": {"type": "string", "minLength": 1},
+        "seed": {"type": "integer"},
+        "config_sha256": {"type": "string", "pattern": "^[0-9a-fA-F]{64}$"}
+      }
+    },
+    "extensions": {"type": "object"}
+  }
+}

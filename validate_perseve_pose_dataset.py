@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
-"""Validate Perseve pose-v1 sidecars referenced by a SAM3 dataset manifest."""
+"""Validate Perseve point-set pose-v2 or legacy pose-v1 manifest sidecars."""
 
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 from collections import Counter
+from collections.abc import Iterable
 from pathlib import Path
 
 from dataset_manifest import load_manifest, manifest_sha256
@@ -21,7 +23,11 @@ def parse_args() -> argparse.Namespace:
         default="train,validation,test",
         help="Comma-separated manifest splits to validate.",
     )
-    parser.add_argument("--skip_pixels", action="store_true", help="Skip PNG/mapping/box joins (schema and geometry only).")
+    parser.add_argument(
+        "--skip_pixels",
+        action="store_true",
+        help="Skip PNG/mapping/box joins (schema and geometry only).",
+    )
     return parser.parse_args()
 
 
@@ -59,8 +65,28 @@ def main() -> None:
         "symmetry_pipeline_versions": sorted(
             {version for sample in samples for version in sample.symmetry_pipeline_versions}
         ),
+        "point_set_checksums": summarize_checksum_set(
+            checksum for sample in samples for checksum in sample.point_set_checksums
+        ),
+        "sampling_pipeline_versions": sorted(
+            {version for sample in samples for version in sample.sampling_pipeline_versions}
+        ),
+        "sampling_parameter_checksums": summarize_checksum_set(
+            checksum for sample in samples for checksum in sample.sampling_parameter_checksums
+        ),
     }
     print(json.dumps(report, indent=2, sort_keys=True))
+
+
+def summarize_checksum_set(checksums: Iterable[str]) -> dict[str, int | str]:
+    """Summarize a checksum set without emitting one entry per CAD asset."""
+
+    values = sorted(set(checksums))
+    payload = json.dumps(values, separators=(",", ":")).encode("utf-8")
+    return {
+        "count": len(values),
+        "digest_sha256": hashlib.sha256(payload).hexdigest(),
+    }
 
 
 if __name__ == "__main__":
