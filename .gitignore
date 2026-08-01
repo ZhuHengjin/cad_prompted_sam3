@@ -2,6 +2,7 @@
 *.pt
 *.pth
 *.onnx
+cad_prompted_sam3_assets/
 
 # Selection history file
 .history
@@ -23,6 +24,8 @@ saved_images/
 
 *.log
 finetune_exemplar/
+/finetune_exemplar_*/
+/eval_abc_*/
 mask_outputs/
 outputs_eval_exemplar/
 outputs_finetune_exemplar/
