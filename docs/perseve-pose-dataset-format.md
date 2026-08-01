@@ -160,7 +160,7 @@ provenance:
 ```json
 {
   "schema": "perseve.pose",
-  "schema_version": "1.0.0",
+  "schema_version": "2.0.0",
   "length_unit": "m",
   "transform_convention": "p_target = T_target_from_source @ p_source",
   "vector_convention": "column",
@@ -201,6 +201,7 @@ following fragment illustrates the v2 catalog:
 
 ```json
 {
+  "schema_version": "2.0.0",
   "objects": {
     "170041564-21-cl-1-bd": {
       "mesh_path": "cad_usd/170041564-21-cl-1-bd/cl-1-bd_stl.usd",
@@ -261,7 +262,7 @@ instance:
 
 ```json
 {
-  "schema_version": "1.0.0",
+  "schema_version": "2.0.0",
   "frame_id": "0000",
   "scene_id": "0000",
   "image": {
@@ -719,9 +720,8 @@ training-run provenance.
 
 ## Cross-repository implementation sequence
 
-Steps 1, 3, 8, and 9 are implemented in this repository. The Perseve-side
-generation changes and renderer integration remain work in
-`/home/henryzhu/repos/perseve`.
+Steps 1, 3, 8, and 9 are implemented in this repository. The generation and
+renderer integration work belongs in the separate Perseve repository.
 
 1. Add the three v2 JSON Schemas, schema-backed dataclasses, and a pure-Python
    validator.

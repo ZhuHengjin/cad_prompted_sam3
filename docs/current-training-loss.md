@@ -1,9 +1,13 @@
 # Current Training Loss
 
-This page documents the loss that is **actually used** by
-[`finetune_image_exemplar_multi_gt.py`](../finetune_image_exemplar_multi_gt.py),
-for both training and validation. The authoritative implementation is
-[`compute_multi_gt_detection_loss`](../finetune_image_exemplar_multi_gt.py#L1080).
+This page documents the historical/default detection and segmentation loss
+used by [`finetune_image_exemplar_multi_gt.py`](../finetune_image_exemplar_multi_gt.py)
+for validation, segmentation-only training, and the `head`/`joint` pose stages.
+The `joint_lite` stage separates and downweights these components; see
+[CAD pose joint-lite training](cad-pose-joint-lite-training.md).
+The backward-compatible combined implementation is
+`compute_multi_gt_detection_loss`, while
+`compute_multi_gt_detection_losses` exposes its components for joint-lite.
 
 ## The complete objective at a glance
 
@@ -14,7 +18,7 @@ L_{image}=2L_{mask}+L_{presence}+w_{bbox}L_{box}.
 $$
 
 The default weights are declared in the
-[argument parser](../finetune_image_exemplar_multi_gt.py#L1581):
+[argument parser](../finetune_image_exemplar_multi_gt.py):
 
 | Setting | Default | Purpose |
 | --- | ---: | --- |
@@ -33,7 +37,7 @@ L_{image}=2\operatorname{mean}_{(j,p)\in\mathcal M}
 $$
 
 The outer `2` on `L_mask` is hard-coded in the
-[return statement](../finetune_image_exemplar_multi_gt.py#L1148). Therefore,
+[combined-loss helper](../finetune_image_exemplar_multi_gt.py). Therefore,
 the **effective** coefficients of the matched-mask terms are 4 for BCE and 4
 for Dice. A total loss is not an IoU or an error percentage: it is this
 weighted sum of quantities with different meanings.
@@ -51,7 +55,7 @@ For each predicted candidate $p$, the model supplies:
 
 Before the objective runs, GT masks are resized to the model input and then to
 the predicted mask resolution, with nearest-neighbor interpolation
-([preparation](../finetune_image_exemplar_multi_gt.py#L2425)). Thus every
+([preparation](../finetune_image_exemplar_multi_gt.py)). Thus every
 predicted mask and its target have the same image grid.
 
 ## 1. Match masks to ground-truth objects
@@ -70,15 +74,15 @@ $$
 \frac{|g_j\cap\hat g_p|}{|g_j\cup\hat g_p|}.
 $$
 
-The [IoU matrix is built here](../finetune_image_exemplar_multi_gt.py#L956).
+The [IoU matrix is built in the trainer](../finetune_image_exemplar_multi_gt.py).
 The code uses `1 - IoU` as cost, sorts all pairs from best to worst, and greedily
-accepts them ([assignment loop](../finetune_image_exemplar_multi_gt.py#L1045)).
+accepts them ([assignment loop](../finetune_image_exemplar_multi_gt.py)).
 
 The matching rules are important:
 
 - A prediction may match only one GT object.
 - A GT object may match up to **12** predictions. This is the loss helper's
-  default `max_per_gt` ([definition](../finetune_image_exemplar_multi_gt.py#L1089)).
+  default `max_per_gt` ([definition](../finetune_image_exemplar_multi_gt.py)).
 - There is no minimum-IoU cutoff. A poor match may still be selected and is
   trained toward its selected GT.
 - This is greedy matching, not a global Hungarian optimum.
@@ -87,13 +91,13 @@ The matching rules are important:
   pairs have been chosen.
 
 `--matches_per_gt` controls metric matching but is not passed to this training
-loss call ([call site](../finetune_image_exemplar_multi_gt.py#L2436)); the
+loss call ([call site](../finetune_image_exemplar_multi_gt.py)); the
 current loss therefore uses 12 regardless of that CLI setting.
 
 If there are no predictions, no GT masks, or no accepted pairs, the helper
-returns `None` ([early exits](../finetune_image_exemplar_multi_gt.py#L1099)).
+returns `None` ([early exits](../finetune_image_exemplar_multi_gt.py)).
 The caller skips that image instead of including a zero in the batch mean
-([handling](../finetune_image_exemplar_multi_gt.py#L2447)).
+([handling](../finetune_image_exemplar_multi_gt.py)).
 
 ## 2. Matched mask losses: BCE plus soft Dice
 
@@ -120,7 +124,7 @@ $$
 Dice rewards foreground overlap and is particularly useful when objects occupy
 few pixels compared with background. Perfect overlap yields loss near zero;
 little overlap yields loss near one. See the
-[BCE and Dice implementation](../finetune_image_exemplar_multi_gt.py#L1121).
+[BCE and Dice implementation](../finetune_image_exemplar_multi_gt.py).
 
 The matched-pair values are averaged:
 
@@ -147,9 +151,9 @@ L_{box}=\operatorname{mean}_{(j,p)\in\mathcal M}
 \lVert b_p-b(g_j)\rVert_1.
 $$
 
-The GT-box conversion is in [`loss_fns.py`](../loss_fns.py#L7), and the matched
+The GT-box conversion is in [`loss_fns.py`](../loss_fns.py), and the matched
 L1 calculation is in
-[`compute_bbox_l1_loss_from_matches`](../loss_fns.py#L26). Empty/invalid masks
+[`compute_bbox_l1_loss_from_matches`](../loss_fns.py). Empty/invalid masks
 cannot provide a box; if no valid matched boxes remain, this loss is zero.
 
 ## 4. Presence / detection-score loss
@@ -166,7 +170,7 @@ t_p=\max\left(0.11,
 \sigma(s_p)^{0.5}\operatorname{IoU}_{j,p}^{0.5}\right).
 $$
 
-This [target construction](../loss_fns.py#L215) has two consequences:
+This [target construction](../loss_fns.py) has two consequences:
 
 - The minimum `0.11` makes every match a “positive” (`target > 0.1`).
 - `.detach()` treats the target as a fixed label during backpropagation. The
@@ -186,7 +190,7 @@ With defaults, the positive group has weight 0.3 and unmatched candidates have
 weight 0.45. Averaging each group separately means adding negatives does not
 linearly increase the negative loss; it changes that group's mean. Although the
 helper supports focal loss, this trainer explicitly disables it
-([configuration](../finetune_image_exemplar_multi_gt.py#L1136)).
+([configuration](../finetune_image_exemplar_multi_gt.py)).
 
 ## 5. Batch loss, gradients, and optimizer updates
 
@@ -197,10 +201,10 @@ L_{batch}=\operatorname{mean}_{image\in valid\ batch}L_{image}.
 $$
 
 It backpropagates this average
-([batch construction and backward](../finetune_image_exemplar_multi_gt.py#L2504)).
+([batch construction and backward](../finetune_image_exemplar_multi_gt.py)).
 It calls `optimizer.step()` every `--grad_accum` batches, whose default is 12
-([argument](../finetune_image_exemplar_multi_gt.py#L1599),
-[step condition](../finetune_image_exemplar_multi_gt.py#L2513)).
+([argument](../finetune_image_exemplar_multi_gt.py),
+[step condition](../finetune_image_exemplar_multi_gt.py)).
 
 One exact implementation detail: `L_batch` is **not divided by** `grad_accum`
 before `backward()`. Therefore, each optimizer update uses the **sum** of up to
@@ -224,4 +228,4 @@ losses using the final formula above.
 
 `--det_filter` can change which candidates reach the loss, and therefore which
 pairs are available, but it is not a direct loss weight
-([detection call](../finetune_image_exemplar_multi_gt.py#L2414)).
+([detection call](../finetune_image_exemplar_multi_gt.py)).

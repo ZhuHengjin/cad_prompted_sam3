@@ -90,6 +90,11 @@ full sampling parameters (including NumPy version), and parameter checksum.
 `T_cad_from_source_meters` may be supplied as 16 row-major values when the
 source mesh is not already in the canonical AABB frame.
 
+USD loading uses the optional `usd` dependency group. Install it with
+`uv sync --extra usd` and invoke the preprocessor through
+`uv run --extra usd python ...`. STL preprocessing uses only the base
+dependencies.
+
 Raw mesh vertices are not the default because tessellation density would
 otherwise weight some surface regions more heavily than others. The artifact
 checksum, source mesh checksum, sampling version, random seed, and parameter

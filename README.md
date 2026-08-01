@@ -28,10 +28,17 @@ pip install -r requirements.txt
    ```bash
    python eval_image_exemplar.py
    ```
-1. Generate a rendering template from an STL file (requires Blender 5.0). Run this from the Blender root folder:
+1. Render all STL files in a flat directory from twelve preset views (requires Blender 5.0):
    ```bash
-   ./blender -b -P path/to/rendering_prompted_muggled_sam/blender_renderer.py
+   /path/to/blender -b -P /path/to/cad_prompted_sam3/blender_renderer.py -- \
+     --stl-dir /path/to/flat/stls \
+     --output-dir /path/to/exemplar/renders \
+     --size 512
    ```
+   The renderer writes padded view IDs such as `_stl_base_00.png` through
+   `_stl_base_11.png`, together with matching `_mask.png` files. For the nested
+   ABC corpus, follow the [ABC dataset preparation guide](docs/abc-pose-v2-preparation.md)
+   to stage the complete STL collection first.
 1. Run real-time webcam inference. First set the object reference directory and object name in `run_webcam_exemplar.py`, then run:
    ```bash
    python run_webcam_exemplar.py
@@ -40,7 +47,8 @@ pip install -r requirements.txt
 ## Project Docs
 
 - [Fine-tuning notes](docs/fine-tune-note.md): LEGO SAM3 continuation commands, logging, plotting, and checkpoint-selection workflow.
-- [Fine-tuning split behavior](docs/finetune-split-behavior.md): frame-level train/validation/test split behavior for `finetune_image_exemplar_multi_gt_split.py`.
+- [Fine-tuning split behavior](docs/finetune-split-behavior.md): versioned manifest construction and train/validation/test behavior for `finetune_image_exemplar_multi_gt.py`.
+- [Project documentation index](docs/README.md): pose datasets, point-set supervision, training, evaluation, and inference.
 
 
 # MuggledSAM

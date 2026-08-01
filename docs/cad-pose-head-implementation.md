@@ -20,7 +20,7 @@ The implementation adds:
 - a CAD-dimension-conditioned pose head attached to SAM3 detection tokens;
 - deterministic point-set artifacts and schema-v2 dataset validation;
 - centroid-centered label-free rotation loss and deterministic mask assignment;
-- head-only and joint training stages;
+- head-only, full-joint, and pose-first joint-lite training stages;
 - checkpoint provenance and resume validation;
 - validation/test metrics and validation-only score calibration;
 - an inference API and command-line example;
@@ -384,6 +384,24 @@ Pose training requires both `--enable_pose` and `--dataset_manifest`.
 - permits visible, pose-ineligible CAD objects to contribute segmentation
   supervision while excluding them from pose losses.
 
+`--pose_stage joint_lite`:
+
+- keeps the image encoder, projection, sampling/text encoders, and segmentation
+  decoder frozen;
+- trains exemplar fusion and the detector/candidate-token path at
+  `lr * joint_shared_lr_scale`;
+- trains the pose head at the base `--lr`;
+- retains lower-weight box, objectness, and mask anchors while pose remains the
+  primary objective; and
+- keeps the frozen segmentation decoder in the differentiable path so mask
+  loss can anchor the trainable upstream modules.
+
+`--pose_train_min_match_iou` optionally restricts pose supervision to
+one-to-one matches above a mask-IoU threshold. Images and low-IoU matches still
+contribute detection anchors in joint-lite mode. See
+[CAD pose joint-lite training](cad-pose-joint-lite-training.md) for the loss,
+optimizer groups, and a complete launch configuration.
+
 Without `--enable_pose`, training and return values retain the previous
 segmentation-only behavior.
 
@@ -421,6 +439,19 @@ The pose loss and target can be configured with:
 --point_set_soft_width
 --point_loss_beta
 --point_distance_chunk_size
+```
+
+Joint-lite adaptation and IoU-qualified reporting add:
+
+```text
+--pose_train_min_match_iou
+--pose_eval_min_match_iou
+--joint_shared_lr_scale
+--joint_bbox_weight
+--joint_objectness_weight
+--joint_mask_weight
+--validate_before_training
+--no_resume_optimizer
 ```
 
 The following options are retained only for schema-v1/checkpoint
@@ -469,6 +500,7 @@ checkpoint:
 | optimizer state | Optimizer/scheduler continuation for a compatible training stage |
 | `pose_config` | Depth normalization statistics, loss weights, and tolerances |
 | `args` | Full CLI configuration, including the selected pose stage |
+| manifest checksum | Detects changed rows, paths, or split assignments |
 | dataset metadata checksum | Detects dataset-level contract changes |
 | catalog checksum | Detects CAD catalog changes |
 | aggregate annotation checksum | Detects pose-label changes |
@@ -476,10 +508,10 @@ checkpoint:
 | point-set checksums | Detects canonical geometry-artifact changes |
 | sampling pipeline and parameter checksums | Detects preprocessing changes |
 
-Resume verifies catalog, dataset metadata, schema major, point-set, sampling
-pipeline, and sampling-parameter provenance against the current dataset. The
-annotation and schema-file checksums are retained for auditing but are not
-currently resume-blocking comparisons. Additional v1 provenance behavior is
+Resume verifies the manifest, catalog, dataset metadata, annotations, exact
+schema files and versions, point sets, sampling pipeline, and sampling
+parameters against the current dataset. In-place resume also refuses to replace
+a different stored manifest snapshot. Additional v1 provenance behavior is
 preserved in the superseded-details section.
 Optimizer state is restored only when compatible with the current trainable
 parameters; otherwise the script warns and starts a new optimizer. Older
@@ -509,6 +541,13 @@ superseded-details section.
 
 Evaluation uses the same detection filtering, NMS candidate indices, and one-to-one
 mask assignment as the training/inference path.
+
+When `--pose_eval_min_match_iou` is greater than zero, evaluation also emits an
+IoU-qualified row alongside the all-match row. It reports qualified match
+coverage, success among qualified matches, and end-to-end success relative to
+all eligible ground-truth instances. Final calibrated validation emits the
+corresponding qualified row as well. This makes localization coverage visible
+instead of allowing conditional pose quality to hide missed or poor matches.
 
 Pose-quality temperature is fitted with scalar-temperature optimization on the
 validation split only. Periodic validation evaluates the current temperature. Final

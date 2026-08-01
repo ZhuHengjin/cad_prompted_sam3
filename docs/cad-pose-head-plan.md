@@ -30,9 +30,9 @@ The output of SAMV3ExemplarDetector is the correct integration point. Its
 detection_tokens_bnc tensor has shape $B\times N\times256$, with one
 exemplar-conditioned token for every candidate detection. These tokens already
 drive box scoring and mask generation in
-[exemplar_detector_model.py](../muggled_sam/v3_sam/exemplar_detector_model.py#L92)
+[exemplar_detector_model.py](../muggled_sam/v3_sam/exemplar_detector_model.py)
 and
-[finetune_image_exemplar_multi_gt.py](../finetune_image_exemplar_multi_gt.py#L730).
+[finetune_image_exemplar_multi_gt.py](../finetune_image_exemplar_multi_gt.py).
 
 The initial architecture is:
 
@@ -552,9 +552,9 @@ $$
 The same symmetry definition must be used by assignment, final rotation loss,
 auxiliary losses, and evaluation. YOPO's released code considers a fixed
 180-degree alternative for selected classes in its
-[rotation matching cost](../../YOPO/yopo/models/task_modules/assigners/match_cost.py#L1024),
+[rotation matching cost](../../YOPO/yopo/models/task_modules/assigners/match_cost.py),
 but its final
-[rotation loss](../../YOPO/yopo/models/losses/pose_loss.py#L975) compares with
+[rotation loss](../../YOPO/yopo/models/losses/pose_loss.py) compares with
 one target rotation. This design would make the treatment consistent.
 
 | Symmetry | Supervision |
