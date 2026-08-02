@@ -18,6 +18,7 @@ from finetune_image_exemplar_multi_gt import (
     load_finetune_checkpoint,
     pose_prompt_surface_centroid_m,
     reference_view_id_candidates,
+    resolve_run_dir_from_checkpoint,
     resolve_reference_pair,
     surface_distance_percentile,
     validate_resume_manifest_checksum,
@@ -26,6 +27,22 @@ from finetune_image_exemplar_multi_gt import (
 
 
 class TrainingManifestResolutionTests(unittest.TestCase):
+    def test_checkpoint_path_resolves_new_and_legacy_run_layouts(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            current_run = root / "experiment" / "run_20260801_120000"
+            legacy_run = root / "experiment" / "run_20260701_120000"
+            self.assertEqual(
+                resolve_run_dir_from_checkpoint(
+                    current_run / "checkpoints" / "finetune.pth"
+                ),
+                current_run,
+            )
+            self.assertEqual(
+                resolve_run_dir_from_checkpoint(legacy_run / "finetune.pth"),
+                legacy_run,
+            )
+
     def test_metrics_log_migrates_the_previous_header_by_column_name(self):
         previous_fields = (
             "phase",

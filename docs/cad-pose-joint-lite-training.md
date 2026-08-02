@@ -103,8 +103,8 @@ MODEL=/path/to/sam3.pt
 MANIFEST=/path/to/dataset_manifest.csv
 DATA_ROOT=/path/to/data/root
 REFERENCES=/path/to/cad/exemplar/renders
-CHECKPOINT=/path/to/selected_pose_head_checkpoint.pth
-OUTPUT=/path/to/finetune_exemplar_cad_pose_joint_lite
+CHECKPOINT=/path/to/pose_head_run/checkpoints/selected_pose_head_checkpoint.pth
+OUTPUT="$REPO/runs/finetune_exemplar_cad_pose_joint_lite"
 FINAL_EPOCH=60  # Replace with the intended final epoch.
 DEVICE=cuda:0
 ```

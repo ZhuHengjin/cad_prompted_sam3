@@ -189,7 +189,7 @@ uv run python finetune_image_exemplar_multi_gt.py \
   --batch_size 1 \
   --grad_accum 1 \
   --device cuda:0 \
-  --output_dir finetune_exemplar_abc_pose_smoke
+  --output_dir runs/finetune_exemplar_abc_pose_smoke
 ```
 
 After the smoke run produces finite pose losses and a checkpoint, choose the

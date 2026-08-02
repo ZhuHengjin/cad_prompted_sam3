@@ -5,7 +5,7 @@ The trainer writes append-only ``metrics.csv`` files with one row per batch,
 an epoch summary, and validation (or standalone evaluation) results. For
 example:
 
-    python plot_finetune_log.py finetune_exemplar/run_20260713_032020/metrics.csv
+    python plot_finetune_log.py runs/finetune_exemplar/run_20260713_032020/metrics.csv
 
 The dashboard includes total and component pose losses, 3D translation and
 point-set errors, detector IoU, and epoch-level validation metrics. The plot is

@@ -481,7 +481,7 @@ python finetune_image_exemplar_multi_gt.py \
   --data_root /path/to/data/root \
   --enable_pose \
   --pose_stage head \
-  --output_dir /path/to/output
+  --output_dir runs/finetune_exemplar_cad_pose_head
 ```
 
 Use the exact base-model and dataset arguments supported by the local training
@@ -520,7 +520,7 @@ new pose head; an incompatible untrained pose-head entry in a segmentation-only
 checkpoint is ignored. Architecture version 3 identifies the surface-centroid
 interface; trained pose heads from versions 1 or 2 must be retrained.
 
-The final validation calibration is saved as `finetune_calibrated.pth` so inference
+The final validation calibration is saved as `checkpoints/finetune_calibrated.pth` so inference
 and test evaluation use the fitted pose-score temperature.
 
 ## Evaluation and calibration
@@ -584,7 +584,7 @@ CAD identifier, metric dimensions, and camera matrix:
 ```bash
 python simple_examples/cad_pose_detection.py \
   /path/to/sam3.pt \
-  /path/to/finetune_calibrated.pth \
+  /path/to/run/checkpoints/finetune_calibrated.pth \
   /path/to/image.png \
   /path/to/cad_render.png \
   example_cad_id \

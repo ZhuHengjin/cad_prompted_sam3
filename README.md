@@ -24,7 +24,7 @@ pip install -r requirements.txt
 
 ## Quick Tasks
 
-1. Run the sample evaluation on the 3D-printing dataset. Segmentation outputs will be written to `outputs_eval_exemplar/`.
+1. Run the sample evaluation on the 3D-printing dataset. Segmentation outputs will be written to `runs/eval_image_exemplar/`.
    ```bash
    python eval_image_exemplar.py
    ```

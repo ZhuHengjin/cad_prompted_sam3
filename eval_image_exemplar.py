@@ -845,7 +845,7 @@ def parse_args() -> argparse.Namespace:
         help="IoU threshold for mask NMS (<=0 disables NMS).",
     )
     parser.add_argument("--det_filter", type=float, default=0.0)
-    parser.add_argument("--output_dir", type=str, default="outputs_eval_exemplar")
+    parser.add_argument("--output_dir", type=str, default="runs/eval_image_exemplar")
     parser.add_argument("--device", type=str, default="cuda:0")
     parser.add_argument("--dtype", type=str, choices=["fp32", "bf16"], default="")
     parser.add_argument("--shuffle", action="store_true")

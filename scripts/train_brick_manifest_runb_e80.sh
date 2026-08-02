@@ -11,12 +11,12 @@ export PYTORCH_ALLOC_CONF="expandable_segments:True"
 
 uv run python finetune_image_exemplar_multi_gt.py \
   --model_path /home/hengjinz/repos/LegoSegmentation/weights/sam3.pt \
-  --resume_path /home/hengjinz/repos/cad_prompted_sam3/finetune_exemplar/run_20260713_032020/finetune.pth \
+  --resume_path /home/hengjinz/repos/cad_prompted_sam3/runs/finetune_exemplar/run_20260713_032020/checkpoints/finetune.pth \
   --dataset_manifest /home/hengjinz/data/brick_sam_sdg/splits/v1/manifest.csv \
   --data_root /home/hengjinz/data/brick_sam_sdg \
   --reference_dir /home/hengjinz/repos/LegoSegmentation/exemplars/renders \
   --device cuda:2 \
-  --output_dir finetune_exemplar \
+  --output_dir runs/finetune_exemplar \
   --epochs 180 \
   --batch_size 2 \
   --grad_accum 12 \

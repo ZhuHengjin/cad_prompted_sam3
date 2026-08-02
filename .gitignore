@@ -23,12 +23,9 @@ saved_images/
 
 
 *.log
-finetune_exemplar/
-/finetune_exemplar_*/
-/eval_abc_*/
+/runs/*
+!/runs/README.md
 mask_outputs/
-outputs_eval_exemplar/
-outputs_finetune_exemplar/
 *.png
 *.jpg
 dataset_debug

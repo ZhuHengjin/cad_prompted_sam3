@@ -1982,7 +1982,7 @@ def parse_args() -> argparse.Namespace:
         default=20,
         help="Save debug collage every N batches (0 disables).",
     )
-    parser.add_argument("--output_dir", type=str, default="finetune_exemplar")
+    parser.add_argument("--output_dir", type=str, default="runs/finetune_exemplar")
     parser.add_argument("--device", type=str, default="cuda:1")
     parser.add_argument("--dtype", type=str, choices=["fp32", "bf16"], default="")
     parser.add_argument(
@@ -2023,6 +2023,13 @@ def create_run_dir(base_dir: str) -> str:
             os.makedirs(candidate, exist_ok=True)
             return candidate
     raise RuntimeError(f"Unable to create run directory under {base_dir}")
+
+
+def resolve_run_dir_from_checkpoint(checkpoint_path: Path) -> Path:
+    """Return the owning run directory for old and new checkpoint layouts."""
+
+    parent = checkpoint_path.expanduser().resolve().parent
+    return parent.parent if parent.name == "checkpoints" else parent
 
 
 def initialize_metrics_log(metrics_path: Path) -> None:
@@ -3082,7 +3089,7 @@ def main() -> None:
             f"Starting at epoch {start_epoch}."
         )
     if args.resume_in_place and args.resume_path:
-        run_dir = str(Path(args.resume_path).expanduser().resolve().parent)
+        run_dir = str(resolve_run_dir_from_checkpoint(Path(args.resume_path)))
     else:
         run_dir = create_run_dir(args.output_dir)
     args.output_dir = run_dir
@@ -3384,6 +3391,8 @@ def main() -> None:
 
     debug_dir = os.path.join(run_dir, "debug_boxes")
     os.makedirs(debug_dir, exist_ok=True)
+    checkpoints_dir = Path(run_dir) / "checkpoints"
+    checkpoints_dir.mkdir(parents=True, exist_ok=True)
     metrics_path = Path(run_dir) / "metrics.csv"
     initialize_metrics_log(metrics_path)
     if manifest_path is not None:
@@ -4044,7 +4053,7 @@ def main() -> None:
                         if batch_pose_match_ious else ""
                     )
                 )
-                save_path = os.path.join(args.output_dir, f"finetune.pth")
+                save_path = str(checkpoints_dir / "finetune.pth")
                 torch.save(
                     build_finetune_checkpoint(
                         detmodel,
@@ -4083,7 +4092,7 @@ def main() -> None:
             samples=epoch_count,
         )
         if args.save_every > 0 and epoch % args.save_every == 0:
-            save_path = os.path.join(args.output_dir, f"finetune_epoch_{epoch:03d}.pth")
+            save_path = str(checkpoints_dir / f"finetune_epoch_{epoch:03d}.pth")
             torch.save(
                 build_finetune_checkpoint(
                     detmodel,
@@ -4151,7 +4160,7 @@ def main() -> None:
                     metrics=pose_metrics,
                     conditional_metrics=conditional_pose_metrics,
                 )
-                calibrated_path = os.path.join(args.output_dir, "finetune_calibrated.pth")
+                calibrated_path = str(checkpoints_dir / "finetune_calibrated.pth")
                 torch.save(
                     build_finetune_checkpoint(
                         detmodel,
