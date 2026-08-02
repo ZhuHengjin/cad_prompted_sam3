@@ -16,6 +16,10 @@ Generated training and evaluation data follows the repository's [run artifact la
 - [Fine-tuning split behavior](finetune-split-behavior.md): versioned manifest construction and train/validation/test behavior for `finetune_image_exemplar_multi_gt.py`.
 - [Current training loss](current-training-loss.md): the multi-GT mask, box, and presence objective used by `finetune_image_exemplar_multi_gt.py`.
 
+## Explanations
+
+- [Multi-view exemplar-token construction](explanations/exemplar-token-construction.md): how reference masks select points, reference images supply learned appearance features, and tokens from multiple views form one exemplar sequence.
+
 ## Model Extensions
 
 - [CAD pose-head plan](cad-pose-head-plan.md): target architecture, AABB-frame centroid representation, label-free point-set supervision, training stages, evaluation, and migration roadmap.
