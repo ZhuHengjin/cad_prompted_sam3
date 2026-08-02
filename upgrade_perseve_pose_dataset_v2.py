@@ -1,6 +1,12 @@
 #!/usr/bin/env python3
 """Upgrade a Perseve pose-v1 dataset to point-set pose-v2.
 
+Deprecated: this script was created to migrate legacy Perseve pose-v1
+datasets, which stored explicit symmetry labels, to the label-free point-set
+pose-v2 contract.  Current Perseve versions generate pose-v2 datasets
+directly, so this upgrader is retained only for existing historical v1 data
+and should not be used for newly generated datasets.
+
 The point-set batch preprocessor writes ``point_sets.json`` beside its NPZ
 artifacts.  This script joins that manifest to the generated dataset catalog,
 verifies that both use the same source meshes and canonical CAD frames, and
