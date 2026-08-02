@@ -5,6 +5,10 @@ exemplar and detector representation improves CAD pose prediction. Pose remains
 the primary objective. Box, objectness, and mask supervision act as lower-weight
 anchors so pose-driven updates do not destroy candidate localization.
 
+This page is the reusable joint-lite runbook. Configuration and results for the
+2026-08-01 ABC run are recorded separately in the
+[experiment log](experiments/2026-08-01-abc-pose-joint-lite.md).
+
 ## Starting checkpoint
 
 Start from a pose-head checkpoint selected on validation geometry rather than
@@ -33,11 +37,12 @@ The frozen segmentation decoder remains in the differentiable forward path.
 Mask loss can therefore anchor fusion and detector inputs without updating
 decoder parameters.
 
-## Pose-match IoU filtering
+## Pose matching
 
-The pose matcher performs greedy one-to-one assignment by mask IoU. Set
-`--pose_train_min_match_iou` to prevent a poorly localized candidate token from
-receiving pose supervision. With a threshold of `0.5`:
+Pose matching and metric interpretation are shared by all pose-training stages;
+see [CAD pose matching and evaluation](cad-pose-matching-and-evaluation.md) for
+the canonical policy. The joint-lite recipe uses a training mask-IoU threshold
+of `0.5`:
 
 ```text
 IoU >= 0.5: box + objectness + mask + pose losses
@@ -48,26 +53,16 @@ Low-IoU images are retained for anchor supervision. Pose loss is averaged over
 accepted matches; a batch with no accepted pose match can still update the
 fusion and detector modules through the anchors.
 
-Set `--pose_eval_min_match_iou` to emit an additional conditional metric row
-without replacing the all-match metrics. A threshold of `0.7` produces phase
-suffixes such as:
+The recipe uses `0.7` for the additional conditional evaluation row while
+retaining the all-match row:
 
 ```text
 validation_pose_iou_070
 validation_pose_calibrated_iou_070
 ```
 
-Each conditional row reports:
-
-- `samples`: IoU-qualified matches;
-- `eligible_samples`: all eligible ground-truth pose instances;
-- `pose_match_coverage`: qualified matches divided by eligible instances;
-- `pose_success_rate`: successful poses among qualified matches; and
-- `pose_end_to_end_success_rate`: qualified successes divided by all eligible
-  instances.
-
-The end-to-end rate and coverage keep conditional results from looking better
-merely because difficult detections were filtered out.
+These values are recipe choices rather than architecture constants. Record any
+changes in the corresponding experiment document.
 
 ## Pose-first joint-lite loss
 
@@ -80,7 +75,7 @@ L = L_{pose,\,IoU\ge\tau}
   + w_{mask}L_{mask}.
 $$
 
-The baseline settings use `tau=0.5`, `w_box=0.25`,
+The current recipe uses `tau=0.5`, `w_box=0.25`,
 `w_objectness=0.25`, and `w_mask=0.10`. The mask component retains its
 existing internal definition:
 

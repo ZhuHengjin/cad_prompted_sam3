@@ -398,9 +398,11 @@ Pose training requires both `--enable_pose` and `--dataset_manifest`.
 
 `--pose_train_min_match_iou` optionally restricts pose supervision to
 one-to-one matches above a mask-IoU threshold. Images and low-IoU matches still
-contribute detection anchors in joint-lite mode. See
-[CAD pose joint-lite training](cad-pose-joint-lite-training.md) for the loss,
-optimizer groups, and a complete launch configuration.
+contribute detection anchors in joint-lite mode. See [CAD pose matching and
+evaluation](cad-pose-matching-and-evaluation.md) for the shared assignment and
+metric policy, and [CAD pose joint-lite
+training](cad-pose-joint-lite-training.md) for the stage-specific loss,
+optimizer groups, and launch configuration.
 
 Without `--enable_pose`, training and return values retain the previous
 segmentation-only behavior.
@@ -441,11 +443,16 @@ The pose loss and target can be configured with:
 --point_distance_chunk_size
 ```
 
-Joint-lite adaptation and IoU-qualified reporting add:
+Pose-match filtering and IoU-qualified reporting add:
 
 ```text
 --pose_train_min_match_iou
 --pose_eval_min_match_iou
+```
+
+Joint-lite adaptation adds:
+
+```text
 --joint_shared_lr_scale
 --joint_bbox_weight
 --joint_objectness_weight
@@ -542,12 +549,9 @@ superseded-details section.
 Evaluation uses the same detection filtering, NMS candidate indices, and one-to-one
 mask assignment as the training/inference path.
 
-When `--pose_eval_min_match_iou` is greater than zero, evaluation also emits an
-IoU-qualified row alongside the all-match row. It reports qualified match
-coverage, success among qualified matches, and end-to-end success relative to
-all eligible ground-truth instances. Final calibrated validation emits the
-corresponding qualified row as well. This makes localization coverage visible
-instead of allowing conditional pose quality to hide missed or poor matches.
+See [CAD pose matching and evaluation](cad-pose-matching-and-evaluation.md) for
+the canonical one-to-one assignment, IoU-qualified rows, coverage denominators,
+and end-to-end metric interpretation.
 
 Pose-quality temperature is fitted with scalar-temperature optimization on the
 validation split only. Periodic validation evaluates the current temperature. Final
