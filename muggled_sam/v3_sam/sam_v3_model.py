@@ -28,6 +28,7 @@ from .image_exemplar_fusion_model import SAMV3ImageExemplarFusion
 from .exemplar_detector_model import SAMV3ExemplarDetector
 from .exemplar_segmentation_model import SAMV3ExemplarSegmentation
 from .cad_pose import CADPosePredictions, SAMV3CADPoseHead
+from .exemplar_view_pose import ExemplarViewPoseEncoder
 
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -64,6 +65,7 @@ class SAMV3Model(nn.Module):
         exemplar_detector_model: SAMV3ExemplarDetector,
         exemplar_segmentation_model: SAMV3ExemplarSegmentation,
         cad_pose_head_model: SAMV3CADPoseHead | None = None,
+        exemplar_view_pose_encoder_model: ExemplarViewPoseEncoder | None = None,
     ):
 
         # Inherit from parent
@@ -87,6 +89,9 @@ class SAMV3Model(nn.Module):
         self.exemplar_detector = exemplar_detector_model
         self.exemplar_segmentation = exemplar_segmentation_model
         self.cad_pose_head = cad_pose_head_model or SAMV3CADPoseHead()
+        self.exemplar_view_pose_encoder = (
+            exemplar_view_pose_encoder_model or ExemplarViewPoseEncoder()
+        )
 
         # Default to eval mode, expecting to use inference only
         self.eval()
@@ -480,6 +485,7 @@ class SAMV3Model(nn.Module):
             self.exemplar_segmentation,
             bpe_vocab_path,
             self.cad_pose_head,
+            self.exemplar_view_pose_encoder,
         )
 
     # .................................................................................................................
@@ -515,6 +521,7 @@ class SAMV3DetectorModel(nn.Module):
         exemplar_segmentation_model: SAMV3ExemplarSegmentation,
         bpe_vocab_path: str | None = None,
         cad_pose_head_model: SAMV3CADPoseHead | None = None,
+        exemplar_view_pose_encoder_model: ExemplarViewPoseEncoder | None = None,
     ):
         # Inherit from parent
         super().__init__()
@@ -528,6 +535,9 @@ class SAMV3DetectorModel(nn.Module):
         self.exemplar_detector = exemplar_detector_model
         self.exemplar_segmentation = exemplar_segmentation_model
         self.cad_pose_head = cad_pose_head_model or SAMV3CADPoseHead()
+        self.exemplar_view_pose_encoder = (
+            exemplar_view_pose_encoder_model or ExemplarViewPoseEncoder()
+        )
 
         # Fill in default vocab path
         if bpe_vocab_path is None:

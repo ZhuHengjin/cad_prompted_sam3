@@ -1,6 +1,7 @@
 """Regression tests for resolving manifest rows into supervised samples."""
 
 import csv
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -21,6 +22,7 @@ from finetune_image_exemplar_multi_gt import (
     resolve_run_dir_from_checkpoint,
     resolve_reference_pair,
     surface_distance_percentile,
+    validate_pose_reference_metadata,
     validate_resume_manifest_checksum,
     validate_pose_resume_provenance,
 )
@@ -179,6 +181,50 @@ class TrainingManifestResolutionTests(unittest.TestCase):
                 resolve_reference_pair(root, "cad-a", "02"),
                 (root / "cad-a_stl_base_2.png", root / "cad-a_stl_base_2_mask.png"),
             )
+
+    def test_pose_reference_metadata_is_bound_to_the_active_cad_frame(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            image_path = root / "cad-a_stl_base_02.png"
+            mask_path = root / "cad-a_stl_base_02_mask.png"
+            image_path.write_bytes(b"image")
+            mask_path.write_bytes(b"mask")
+            metadata_path = root / "cad-a_render_transform.json"
+            metadata = {
+                "object_id": "cad-a",
+                "geometry": {
+                    "orientation_mode": "canonical",
+                    "catalog_driven": True,
+                    "source_to_meters": 0.001,
+                    "T_cad_from_source_meters": np.eye(4).tolist(),
+                    "T_presentation_from_cad": np.eye(4).tolist(),
+                    "canonical_dimensions_m": [0.1, 0.2, 0.3],
+                },
+                "views": [
+                    {
+                        "view_id": "02",
+                        "image": image_path.name,
+                        "mask": mask_path.name,
+                        "R_refcam_cv_from_cad": np.eye(3).tolist(),
+                    }
+                ],
+            }
+            metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+            catalog = {
+                "cad-a": SimpleNamespace(
+                    source_to_meters=0.001,
+                    T_cad_from_source_meters=np.eye(4),
+                    base_dimensions_m=np.asarray([0.1, 0.2, 0.3]),
+                )
+            }
+
+            report = validate_pose_reference_metadata(root, ["cad-a"], catalog, ["2"])
+            self.assertEqual(report, {"cad_id_count": 1, "view_count": 1})
+
+            metadata["geometry"]["orientation_mode"] = "largest-face-up"
+            metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "expected 'canonical'"):
+                validate_pose_reference_metadata(root, ["cad-a"], catalog, ["02"])
 
     def _rows_and_entry(self, root: Path):
         dataset_root = root / "pose"

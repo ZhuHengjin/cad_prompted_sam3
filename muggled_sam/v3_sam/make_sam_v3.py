@@ -22,6 +22,7 @@ from .image_exemplar_fusion_model import SAMV3ImageExemplarFusion
 from .exemplar_detector_model import SAMV3ExemplarDetector
 from .exemplar_segmentation_model import SAMV3ExemplarSegmentation
 from .cad_pose import SAMV3CADPoseHead
+from .exemplar_view_pose import ExemplarViewPoseEncoder
 
 from .state_dict_conversion.config_from_original_state_dict import get_model_config_from_state_dict
 from .state_dict_conversion.convert_original_state_dict_keys import SAM3StageType, convert_state_dict_keys
@@ -212,6 +213,7 @@ def make_sam_v3(
     )
     exmseg_model = SAMV3ExemplarSegmentation(features_per_detection_token, exmsegment_num_heads)
     cadpose_model = SAMV3CADPoseHead(token_dim=features_per_detection_token)
+    exemplar_view_pose_model = ExemplarViewPoseEncoder(token_dim=features_per_detection_token)
 
     # Bundle components into final model
     return SAMV3Model(
@@ -228,4 +230,5 @@ def make_sam_v3(
         exmdet_model,
         exmseg_model,
         cadpose_model,
+        exemplar_view_pose_model,
     )

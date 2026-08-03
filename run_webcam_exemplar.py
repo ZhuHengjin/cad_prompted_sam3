@@ -11,6 +11,10 @@ import numpy as np
 import torch
 
 from muggled_sam.make_sam import make_sam_from_state_dict
+from muggled_sam.v3_sam.exemplar_view_pose import (
+    EXEMPLAR_VIEW_MODES,
+    load_exemplar_view_adapter_for_inference,
+)
 
 from eval_image_exemplar import (
     _mask_bbox,
@@ -84,6 +88,13 @@ def parse_args() -> argparse.Namespace:
         default=24,
         help="Approx number of mask points to sample per reference.",
     )
+    parser.add_argument(
+        "--exemplar_view_mode",
+        choices=("auto", *EXEMPLAR_VIEW_MODES),
+        default="auto",
+        help="Reference-view mode; auto reads the finetune checkpoint provenance.",
+    )
+    parser.add_argument("--exemplar_view_shuffle_seed", type=int, default=42)
     parser.add_argument(
         "--device",
         type=str,
@@ -211,11 +222,16 @@ def main() -> None:
     detmodel.eval()
 
     if args.finetune_ckpt:
-        ckpt = torch.load(args.finetune_ckpt, map_location="cpu")
+        ckpt = torch.load(args.finetune_ckpt, map_location="cpu", weights_only=False)
         detmodel.image_exemplar_fusion.load_state_dict(ckpt["image_exemplar_fusion"])
         detmodel.exemplar_detector.load_state_dict(ckpt["exemplar_detector"])
         detmodel.exemplar_segmentation.load_state_dict(ckpt["exemplar_segmentation"])
+        args.exemplar_view_mode = load_exemplar_view_adapter_for_inference(
+            detmodel, ckpt, args.exemplar_view_mode
+        )
         print("Loaded finetuned detector weights from", args.finetune_ckpt)
+    elif args.exemplar_view_mode == "auto":
+        args.exemplar_view_mode = "none"
 
     exemplar_ref = build_exemplar_tokens_for_object(
         detmodel=detmodel,
@@ -227,6 +243,7 @@ def main() -> None:
         num_points_approx=args.num_points_approx,
         device=device,
         grayscale=args.grayscale,
+        include_view_metadata=args.exemplar_view_mode != "none",
     )
     if exemplar_ref is None:
         raise RuntimeError("No exemplar tokens built. Check reference_dir/object_id/ref_view_ids.")
@@ -261,7 +278,13 @@ def main() -> None:
                 encoded_img = detmodel.image_encoder(img_t)
                 encoded_image_features_list = detmodel.image_projection.v3_projection(encoded_img)
 
-                exemplar_batch, padding_mask = pad_exemplar_batch([exemplar_ref], device=device)
+                exemplar_batch, padding_mask = pad_exemplar_batch(
+                    [exemplar_ref],
+                    device=device,
+                    pose_encoder=detmodel.exemplar_view_pose_encoder,
+                    mode=args.exemplar_view_mode,
+                    shuffle_seed=args.exemplar_view_shuffle_seed,
+                )
                 mask_preds, box_preds, det_scores, _ = generate_detections_train(
                     detmodel,
                     encoded_image_features_list,

@@ -10,7 +10,7 @@ import random
 import re
 from collections import defaultdict
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple, Union
 
 import cv2
 import matplotlib
@@ -22,6 +22,13 @@ import torch.nn.functional as F
 import time
 from matplotlib.patches import Rectangle
 from muggled_sam.make_sam import make_sam_from_state_dict
+from muggled_sam.v3_sam.exemplar_view_pose import (
+    EXEMPLAR_VIEW_MODES,
+    ExemplarViewBundle,
+    load_exemplar_view_adapter_for_inference,
+    load_reference_view_rotations,
+    pad_exemplar_view_batch,
+)
 
 
 IGNORED_LABELS = {"BACKGROUND", "UNLABELLED"}
@@ -558,30 +565,20 @@ def compute_ap(recalls: np.ndarray, precisions: np.ndarray) -> float:
 
 
 def pad_exemplar_batch(
-    exemplars_list: List[torch.Tensor],
+    exemplars_list: Sequence[Union[torch.Tensor, ExemplarViewBundle]],
     device: torch.device,
+    *,
+    pose_encoder=None,
+    mode: str = "none",
+    shuffle_seed: int = 0,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    if not exemplars_list:
-        raise ValueError("No exemplars provided for batching.")
-    max_n = max(t.shape[1] for t in exemplars_list)
-    feat_dim = exemplars_list[0].shape[2]
-    batch = []
-    padding_masks = []
-    for ex in exemplars_list:
-        ex = ex.to(device)
-        n = ex.shape[1]
-        if n < max_n:
-            pad = torch.zeros((1, max_n - n, feat_dim), device=device, dtype=ex.dtype)
-            ex = torch.cat([ex, pad], dim=1)
-            mask = torch.zeros((max_n,), device=device, dtype=torch.bool)
-            mask[n:] = True
-        else:
-            mask = torch.zeros((max_n,), device=device, dtype=torch.bool)
-        batch.append(ex)
-        padding_masks.append(mask)
-    batch_bnc = torch.cat(batch, dim=0)
-    padding_mask_bn = torch.stack(padding_masks, dim=0)
-    return batch_bnc, padding_mask_bn
+    return pad_exemplar_view_batch(
+        exemplars_list,
+        device=device,
+        pose_encoder=pose_encoder,
+        mode=mode,
+        shuffle_seed=shuffle_seed,
+    )
 
 
 def _mask_bbox(mask_hw: np.ndarray) -> Optional[Tuple[int, int, int, int]]:
@@ -769,9 +766,12 @@ def build_exemplar_tokens_for_object(
     num_points_approx: int,
     device: torch.device,
     grayscale: bool,
-) -> Optional[torch.Tensor]:
+    include_view_metadata: bool = False,
+) -> Optional[Union[torch.Tensor, ExemplarViewBundle]]:
     lookup_id = object_id
     feats: List[torch.Tensor] = []
+    token_view_indices: List[torch.Tensor] = []
+    used_view_ids: List[str] = []
     for ref_id in ref_view_ids:
         ref_stub = f"{lookup_id}_stl_base_{ref_id}"
         ref_img_path = reference_dir / f"{ref_stub}.png"
@@ -801,9 +801,25 @@ def build_exemplar_tokens_for_object(
             include_coordinate_encodings=False,
         )
         feats.append(exemplar_tokens.detach().cpu())
+        token_view_indices.append(
+            torch.full((exemplar_tokens.shape[1],), len(used_view_ids), dtype=torch.long)
+        )
+        used_view_ids.append(ref_id)
     if not feats:
         return None
     exemplar_ref = torch.cat(feats, dim=1).to(device)
+    if include_view_metadata:
+        rotations = load_reference_view_rotations(
+            reference_dir / f"{lookup_id}_render_transform.json",
+            used_view_ids,
+        )
+        return ExemplarViewBundle(
+            tokens_bnc=exemplar_ref,
+            token_view_indices_n=torch.cat(token_view_indices, dim=0),
+            view_rotations_v33=rotations,
+            view_ids=tuple(used_view_ids),
+            object_id=object_id,
+        )
     return exemplar_ref
 
 
@@ -831,6 +847,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max_side_length", type=int, default=1008)
     parser.add_argument("--no_square", action="store_true", help="Disable square resizing in encoder.")
     parser.add_argument("--num_points_approx", type=int, default=24)
+    parser.add_argument(
+        "--exemplar_view_mode",
+        choices=("auto", *EXEMPLAR_VIEW_MODES),
+        default="auto",
+        help="Reference-view mode; auto reads the finetune checkpoint provenance.",
+    )
+    parser.add_argument("--exemplar_view_shuffle_seed", type=int, default=42)
     parser.add_argument("--batch_size", type=int, default=24)
     parser.add_argument(
         "--sub_sample",
@@ -896,11 +919,16 @@ def main() -> None:
     detmodel.eval()
 
     if args.finetune_ckpt:
-        ckpt = torch.load(args.finetune_ckpt, map_location="cpu")
+        ckpt = torch.load(args.finetune_ckpt, map_location="cpu", weights_only=False)
         detmodel.image_exemplar_fusion.load_state_dict(ckpt["image_exemplar_fusion"])
         detmodel.exemplar_detector.load_state_dict(ckpt["exemplar_detector"])
         detmodel.exemplar_segmentation.load_state_dict(ckpt["exemplar_segmentation"])
+        args.exemplar_view_mode = load_exemplar_view_adapter_for_inference(
+            detmodel, ckpt, args.exemplar_view_mode
+        )
         print("Loaded finetuned detector weights from", args.finetune_ckpt)
+    elif args.exemplar_view_mode == "auto":
+        args.exemplar_view_mode = "none"
 
     os.makedirs(args.output_dir, exist_ok=True)
     vis_dir = os.path.join(args.output_dir, "step_outputs")
@@ -950,7 +978,7 @@ def main() -> None:
     if not reference_dir.is_dir():
         raise FileNotFoundError(reference_dir)
 
-    ref_cache: Dict[str, torch.Tensor] = {}
+    ref_cache: Dict[str, Union[torch.Tensor, ExemplarViewBundle]] = {}
     seg_cache: Dict[str, np.ndarray] = {}
     mapping_cache: Dict[str, Dict[str, List[Tuple[int, ...]]]] = {}
     batch_step = 0
@@ -1009,10 +1037,15 @@ def main() -> None:
                             num_points_approx=args.num_points_approx,
                             device=device,
                             grayscale=args.grayscale,
+                            include_view_metadata=args.exemplar_view_mode != "none",
                         )
                         if exemplar_ref is None:
                             continue
-                        ref_cache[obj_id] = exemplar_ref.detach().cpu()
+                        ref_cache[obj_id] = (
+                            exemplar_ref.detach_cpu()
+                            if isinstance(exemplar_ref, ExemplarViewBundle)
+                            else exemplar_ref.detach().cpu()
+                        )
 
                     exemplar_ref = ref_cache[obj_id]
                     prepared.append(
@@ -1053,7 +1086,13 @@ def main() -> None:
                     encoded_image_features_list = detmodel.image_projection.v3_projection(encoded_img)
                     t1 = time.time()
                     exemplars_list = [prepared[i]["exemplar_ref"] for i in idxs]
-                    exemplar_batch, padding_mask = pad_exemplar_batch(exemplars_list, device=device)
+                    exemplar_batch, padding_mask = pad_exemplar_batch(
+                        exemplars_list,
+                        device=device,
+                        pose_encoder=detmodel.exemplar_view_pose_encoder,
+                        mode=args.exemplar_view_mode,
+                        shuffle_seed=args.exemplar_view_shuffle_seed,
+                    )
 
                     mask_preds, box_preds, det_scores, pres_scores = generate_detections_train(
                         detmodel,

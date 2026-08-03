@@ -20,6 +20,9 @@ flowchart LR
     V["Encode the text 'visual'"] --> C["Append tokens for one view"]
     F --> C
     C --> A["Concatenate tokens from all valid views"]
+    R["Per-view camera rotation"] --> B["Structured token/view bundle"]
+    A --> B
+    B --> O["Optional view-pose residual"]
 ```
 
 For every requested reference view, [`build_exemplar_tokens_for_object()`](../../finetune_image_exemplar_multi_gt.py#L1710) loads a matching image and mask, samples foreground points, encodes the image, and constructs that view's tokens. Missing or unusable views are skipped. The tokens from all valid views are finally concatenated along the token dimension.
@@ -129,7 +132,8 @@ Its tensor shape is:
 
 ## 6. Multiple views become one long token sequence
 
-Each reference view is encoded independently and appended to `feats`. The final operation is:
+Each reference view is encoded independently and appended to `feats`. The token
+tensor is still concatenated as:
 
 ```python
 exemplar_ref = torch.cat(feats, dim=1).to(device)
@@ -141,7 +145,17 @@ This concatenates along dimension 1, the token dimension:
 [front-view tokens | side-view tokens | top-view tokens | ...]
 ```
 
-The construction function does not average the views or explicitly fuse one view with another. It also does not add a separate view-ID token. Instead, downstream detection and segmentation transformers receive the combined sequence and can attend to whichever reference tokens best match the target image. See the exemplar input to [`ExemplarDetector.forward()`](../../muggled_sam/v3_sam/exemplar_detector_model.py#L92).
+The construction function does not average the views or explicitly fuse one
+view with another. It now also records a token-to-view index and the view's
+`R_refcam_cv_from_cad` in an `ExemplarViewBundle`. In the exact baseline mode,
+this metadata is bypassed and downstream detection receives the same tensor as
+before. Experimental modes can add a zero-initialized camera or view-ID
+residual to each token before padding. The architecture and causal controls are
+documented in [Reference-camera exemplar experiments](../exemplar-camera-pose-experiments.md).
+
+Downstream detection and segmentation transformers then receive the combined
+sequence and can attend to whichever reference tokens best match the target
+image. See the exemplar input to [`ExemplarDetector.forward()`](../../muggled_sam/v3_sam/exemplar_detector_model.py#L92).
 
 For valid views `v = 1 ... V`, the final shape is:
 
@@ -179,4 +193,7 @@ The complete object exemplar is a sequence containing:
 - one sampling summary token per view; and
 - encoded `"visual"` text tokens repeated once per view.
 
-The mask supplies foreground supervision, the image supplies appearance, and concatenating views supplies viewpoint diversity.
+The mask supplies foreground supervision, the image supplies appearance, and
+concatenating views supplies viewpoint diversity. When enabled, structured
+view metadata additionally tells the model which canonical camera orientation
+produced each token without changing token count.

@@ -22,6 +22,7 @@ Generated training and evaluation data follows the repository's [run artifact la
 
 ## Model Extensions
 
+- [Reference-camera exemplar experiments](exemplar-camera-pose-experiments.md): structured per-view tokens, continuous camera embeddings, causal controls, readiness gates, launch matrix, and interpretation policy.
 - [CAD pose-head plan](cad-pose-head-plan.md): target architecture, AABB-frame centroid representation, label-free point-set supervision, training stages, evaluation, and migration roadmap.
 - [Label-free point-set pose supervision](point-set-pose-supervision-plan.md): active geometry-artifact, centroid, loss, compute, evaluation, and acceptance contract that replaces explicit symmetry labels.
 - [CAD pose-head implementation guide](cad-pose-head-implementation.md): the implemented point-set/centroid path, including architecture, dataset validation, training, inference, tests, and legacy v1 compatibility.

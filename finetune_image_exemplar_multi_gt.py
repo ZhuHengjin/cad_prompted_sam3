@@ -31,7 +31,7 @@ from collections import defaultdict, deque
 from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple, Union
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple, Union
 
 import cv2
 import numpy as np
@@ -64,6 +64,12 @@ from muggled_sam.v3_sam.cad_pose.losses import (
 )
 from muggled_sam.v3_sam.cad_pose.matching import match_pose_predictions_one_to_one
 from muggled_sam.v3_sam.cad_pose.symmetry import symmetry_aware_rotation_error
+from muggled_sam.v3_sam.exemplar_view_pose import (
+    EXEMPLAR_VIEW_MODES,
+    ExemplarViewBundle,
+    load_reference_view_rotations,
+    pad_exemplar_view_batch,
+)
 from muggled_sam.v3_sam.cad_pose.dataset import (
     effective_surface_centroid_m,
     instance_mask_rgba,
@@ -137,6 +143,8 @@ class EvalConfig:
     no_object_weight: float = 0.45
     shuffle: bool = False
     max_batches: int = 0
+    exemplar_view_mode: str = "none"
+    exemplar_view_shuffle_seed: int = 0
 
 
 @dataclass(frozen=True)
@@ -891,6 +899,145 @@ def resolve_reference_pair(
     return None
 
 
+def validate_pose_reference_metadata(
+    reference_dir: Path,
+    cad_ids: Sequence[str],
+    catalog: Mapping[str, Any],
+    ref_view_ids: Sequence[str],
+) -> Dict[str, int]:
+    """Require pose exemplars to preserve the active catalog's CAD frame."""
+
+    errors: List[str] = []
+    validated_views = 0
+    for cad_id in sorted(set(cad_ids)):
+        metadata_path = reference_dir / f"{cad_id}_render_transform.json"
+        try:
+            with metadata_path.open(encoding="utf-8") as handle:
+                metadata = json.load(handle)
+        except FileNotFoundError:
+            errors.append(f"{cad_id}: missing {metadata_path.name}")
+            continue
+        except (OSError, json.JSONDecodeError) as error:
+            errors.append(f"{cad_id}: unreadable {metadata_path.name}: {error}")
+            continue
+
+        if not isinstance(metadata, dict):
+            errors.append(f"{cad_id}: transform metadata must be a JSON object")
+            continue
+        geometry = metadata.get("geometry")
+        if not isinstance(geometry, dict):
+            errors.append(f"{cad_id}: transform metadata has no geometry object")
+            continue
+        if metadata.get("object_id") != cad_id:
+            errors.append(
+                f"{cad_id}: metadata object_id is {metadata.get('object_id')!r}"
+            )
+        if geometry.get("orientation_mode") != "canonical":
+            errors.append(
+                f"{cad_id}: orientation mode is {geometry.get('orientation_mode')!r}, "
+                "expected 'canonical'"
+            )
+        if geometry.get("catalog_driven") is not True:
+            errors.append(f"{cad_id}: canonical render is not catalog-driven")
+
+        catalog_object = catalog.get(cad_id)
+        if catalog_object is None:
+            errors.append(f"{cad_id}: absent from the active pose catalog")
+            continue
+        try:
+            source_to_meters = float(geometry["source_to_meters"])
+            canonical_transform = np.asarray(
+                geometry["T_cad_from_source_meters"], dtype=np.float64
+            )
+            presentation_transform = np.asarray(
+                geometry["T_presentation_from_cad"], dtype=np.float64
+            )
+            canonical_dimensions = np.asarray(
+                geometry["canonical_dimensions_m"], dtype=np.float64
+            )
+        except (KeyError, TypeError, ValueError) as error:
+            errors.append(f"{cad_id}: invalid geometry transform fields: {error}")
+            continue
+        if not np.isclose(
+            source_to_meters,
+            float(catalog_object.source_to_meters),
+            atol=1e-12,
+            rtol=0.0,
+        ):
+            errors.append(f"{cad_id}: source-to-metre scale differs from pose catalog")
+        if canonical_transform.shape != (4, 4) or not np.allclose(
+            canonical_transform,
+            catalog_object.T_cad_from_source_meters,
+            atol=1e-10,
+            rtol=0.0,
+        ):
+            errors.append(f"{cad_id}: source-to-CAD transform differs from pose catalog")
+        if presentation_transform.shape != (4, 4) or not np.allclose(
+            presentation_transform, np.eye(4), atol=1e-10, rtol=0.0
+        ):
+            errors.append(f"{cad_id}: canonical render contains a presentation rotation")
+        if canonical_dimensions.shape != (3,) or not np.allclose(
+            canonical_dimensions,
+            catalog_object.base_dimensions_m,
+            atol=1e-6,
+            rtol=1e-5,
+        ):
+            errors.append(f"{cad_id}: rendered canonical dimensions differ from pose catalog")
+
+        views = metadata.get("views")
+        if not isinstance(views, list):
+            errors.append(f"{cad_id}: transform metadata has no reference views")
+            continue
+        views_by_id = {
+            str(view.get("view_id")): view
+            for view in views
+            if isinstance(view, dict) and view.get("view_id") is not None
+        }
+        for ref_id in ref_view_ids:
+            reference_pair = resolve_reference_pair(reference_dir, cad_id, ref_id)
+            if reference_pair is None:
+                errors.append(f"{cad_id}/{ref_id}: missing render/mask pair")
+                continue
+            view = next(
+                (
+                    views_by_id[candidate]
+                    for candidate in reference_view_id_candidates(ref_id)
+                    if candidate in views_by_id
+                ),
+                None,
+            )
+            if view is None:
+                errors.append(f"{cad_id}/{ref_id}: missing view transform metadata")
+                continue
+            image_path, mask_path = reference_pair
+            if view.get("image") != image_path.name or view.get("mask") != mask_path.name:
+                errors.append(f"{cad_id}/{ref_id}: view metadata names different files")
+                continue
+            try:
+                rotation = np.asarray(
+                    view.get("R_refcam_cv_from_cad"), dtype=np.float64
+                )
+            except (TypeError, ValueError):
+                errors.append(f"{cad_id}/{ref_id}: invalid reference-camera rotation")
+                continue
+            if (
+                rotation.shape != (3, 3)
+                or not np.isfinite(rotation).all()
+                or not np.allclose(rotation.T @ rotation, np.eye(3), atol=1e-6, rtol=0.0)
+                or not np.isclose(np.linalg.det(rotation), 1.0, atol=1e-6, rtol=0.0)
+            ):
+                errors.append(f"{cad_id}/{ref_id}: invalid reference-camera rotation")
+                continue
+            validated_views += 1
+
+    if errors:
+        raise ValueError(
+            "Pose reference transform preflight failed; regenerate canonical catalog-driven "
+            f"renders. First issues: {errors[:10]}"
+        )
+    return {"cad_id_count": len(set(cad_ids)), "view_count": validated_views}
+
+
 def freeze_module(module: torch.nn.Module) -> None:
     module.eval()
     for param in module.parameters():
@@ -1445,30 +1592,30 @@ def filter_pose_matches_by_iou(
 
 
 def pad_exemplar_batch(
-    exemplars_list: List[torch.Tensor],
+    exemplars_list: Sequence[Union[torch.Tensor, ExemplarViewBundle]],
     device: torch.device,
+    *,
+    pose_encoder=None,
+    mode: str = "none",
+    shuffle_seed: int = 0,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    if not exemplars_list:
-        raise ValueError("No exemplars provided for batching.")
-    max_n = max(t.shape[1] for t in exemplars_list)
-    feat_dim = exemplars_list[0].shape[2]
-    batch = []
-    padding_masks = []
-    for ex in exemplars_list:
-        ex = ex.to(device)
-        n = ex.shape[1]
-        if n < max_n:
-            pad = torch.zeros((1, max_n - n, feat_dim), device=device, dtype=ex.dtype)
-            ex = torch.cat([ex, pad], dim=1)
-            mask = torch.zeros((max_n,), device=device, dtype=torch.bool)
-            mask[n:] = True
-        else:
-            mask = torch.zeros((max_n,), device=device, dtype=torch.bool)
-        batch.append(ex)
-        padding_masks.append(mask)
-    batch_bnc = torch.cat(batch, dim=0)
-    padding_mask_bn = torch.stack(padding_masks, dim=0)
-    return batch_bnc, padding_mask_bn
+    return pad_exemplar_view_batch(
+        exemplars_list,
+        device=device,
+        pose_encoder=pose_encoder,
+        mode=mode,
+        shuffle_seed=shuffle_seed,
+    )
+
+
+def cache_exemplar(
+    exemplar: Union[torch.Tensor, ExemplarViewBundle],
+) -> Union[torch.Tensor, ExemplarViewBundle]:
+    """Detach exemplar features and move them to the shared CPU cache."""
+
+    if isinstance(exemplar, ExemplarViewBundle):
+        return exemplar.detach_cpu()
+    return exemplar.detach().cpu()
 
 
 def score_to_bgr(score: float) -> Tuple[int, int, int]:
@@ -1717,9 +1864,12 @@ def build_exemplar_tokens_for_object(
     num_points_approx: int,
     device: torch.device,
     upper_object_id: bool = False,
-) -> Optional[torch.Tensor]:
+    include_view_metadata: bool = False,
+) -> Optional[Union[torch.Tensor, ExemplarViewBundle]]:
     lookup_id = object_id.upper() if upper_object_id else object_id
     feats: List[torch.Tensor] = []
+    token_view_indices: List[torch.Tensor] = []
+    used_view_ids: List[str] = []
     for ref_id in ref_view_ids:
         reference_pair = resolve_reference_pair(reference_dir, lookup_id, ref_id)
         if reference_pair is None:
@@ -1746,9 +1896,25 @@ def build_exemplar_tokens_for_object(
             include_coordinate_encodings=False,
         )
         feats.append(exemplar_tokens.detach().cpu())
+        token_view_indices.append(
+            torch.full((exemplar_tokens.shape[1],), len(used_view_ids), dtype=torch.long)
+        )
+        used_view_ids.append(ref_id)
     if not feats:
         return None
     exemplar_ref = torch.cat(feats, dim=1).to(device)
+    if include_view_metadata:
+        rotations = load_reference_view_rotations(
+            reference_dir / f"{lookup_id}_render_transform.json",
+            used_view_ids,
+        )
+        return ExemplarViewBundle(
+            tokens_bnc=exemplar_ref,
+            token_view_indices_n=torch.cat(token_view_indices, dim=0),
+            view_rotations_v33=rotations,
+            view_ids=tuple(used_view_ids),
+            object_id=object_id,
+        )
     return exemplar_ref
 
 
@@ -1877,6 +2043,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max_side_length", type=int, default=1008)
     parser.add_argument("--no_square", action="store_true", help="Disable square resizing in encoder.")
     parser.add_argument("--num_points_approx", type=int, default=25)
+    parser.add_argument(
+        "--exemplar_view_mode",
+        choices=EXEMPLAR_VIEW_MODES,
+        default="none",
+        help=(
+            "Reference-view experiment: exact baseline, camera pose, deterministic camera "
+            "shuffle, zero-camera control, or learned view-ID control."
+        ),
+    )
+    parser.add_argument(
+        "--exemplar_view_shuffle_seed",
+        type=int,
+        default=None,
+        help="Seed for shuffled-camera assignments (default: --seed).",
+    )
     parser.add_argument("--epochs", type=int, default=60)
     parser.add_argument("--batch_size", type=int, default=13)
     parser.add_argument("--lr", type=float, default=1e-4)
@@ -1990,6 +2171,15 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=42,
         help="Random seed for Python, NumPy, and PyTorch.",
+    )
+    parser.add_argument(
+        "--init_path",
+        type=str,
+        default="",
+        help=(
+            "Segmentation-only finetune checkpoint used to initialize detector modules. "
+            "Unlike --resume_path, starts at epoch 1 with fresh optimizer, pose head, and view adapter."
+        ),
     )
     parser.add_argument(
         "--resume_path",
@@ -2145,6 +2335,7 @@ def load_finetune_checkpoint(
     optimizer: Optional[torch.optim.Optimizer],
     device: torch.device,
     load_optimizer: bool = True,
+    exemplar_view_mode: str = "none",
 ) -> Dict[str, object]:
     # Finetune checkpoints are full, trusted training-state files produced by
     # this script (modules, optimizer, arguments, provenance, and NumPy scalar
@@ -2160,11 +2351,36 @@ def load_finetune_checkpoint(
         if key not in checkpoint:
             raise KeyError(f"Checkpoint missing '{key}' state.")
         module.load_state_dict(checkpoint[key])
+    checkpoint_args = checkpoint.get("args") or {}
+    checkpoint_view_mode = str(checkpoint_args.get("exemplar_view_mode", "none"))
+    checkpoint_pose_enabled = bool(checkpoint_args.get("enable_pose", False))
+    if checkpoint_view_mode != exemplar_view_mode and (
+        checkpoint_view_mode != "none" or checkpoint_pose_enabled
+    ):
+        raise ValueError(
+            "Checkpoint exemplar-view mode "
+            f"{checkpoint_view_mode!r} is incompatible with requested mode {exemplar_view_mode!r}"
+        )
+    if "exemplar_view_pose_encoder" in checkpoint:
+        checkpoint_version = int(checkpoint.get("exemplar_view_pose_architecture_version", 1))
+        if checkpoint_version != detmodel.exemplar_view_pose_encoder.architecture_version:
+            raise ValueError(
+                "Exemplar-view adapter checkpoint architecture version "
+                f"{checkpoint_version} is incompatible with model version "
+                f"{detmodel.exemplar_view_pose_encoder.architecture_version}"
+            )
+        expected_config = detmodel.exemplar_view_pose_encoder.architecture_config()
+        checkpoint_config = checkpoint.get("exemplar_view_pose_architecture_config")
+        if checkpoint_config is not None and checkpoint_config != expected_config:
+            raise ValueError("Checkpoint exemplar-view adapter architecture config is incompatible")
+        detmodel.exemplar_view_pose_encoder.load_state_dict(
+            checkpoint["exemplar_view_pose_encoder"]
+        )
+    elif checkpoint_view_mode != "none":
+        raise KeyError("Checkpoint is missing its trained exemplar-view adapter state")
     if "cad_pose_head" in checkpoint:
         checkpoint_version = int(checkpoint.get("cad_pose_head_architecture_version", 1))
         if checkpoint_version != detmodel.cad_pose_head.architecture_version:
-            checkpoint_args = checkpoint.get("args") or {}
-            checkpoint_pose_enabled = bool(checkpoint_args.get("enable_pose", False))
             if checkpoint_pose_enabled or checkpoint.get("pose_config") is not None:
                 raise ValueError(
                     "CAD pose-head checkpoint architecture version "
@@ -2179,6 +2395,35 @@ def load_finetune_checkpoint(
             optimizer.load_state_dict(checkpoint["optimizer"])
         except ValueError as exc:
             warnings.warn(f"Optimizer state is incompatible with the selected training stage; starting fresh: {exc}")
+    return checkpoint
+
+
+def load_detector_initialization_checkpoint(
+    checkpoint_path: Path,
+    detmodel,
+    device: torch.device,
+) -> Dict[str, object]:
+    """Load segmentation modules while deliberately resetting pose experiment state."""
+
+    checkpoint = torch.load(str(checkpoint_path), map_location=device, weights_only=False)
+    checkpoint_args = checkpoint.get("args") or {}
+    if bool(checkpoint_args.get("enable_pose", False)) or checkpoint.get("pose_config") is not None:
+        raise ValueError(
+            "--init_path must be a segmentation-only checkpoint; use --resume_path to "
+            "continue a pose run"
+        )
+    checkpoint_mode = str(checkpoint_args.get("exemplar_view_mode", "none"))
+    if checkpoint_mode != "none":
+        raise ValueError("--init_path checkpoint contains a trained exemplar-view adapter")
+    required = {
+        "image_exemplar_fusion": detmodel.image_exemplar_fusion,
+        "exemplar_detector": detmodel.exemplar_detector,
+        "exemplar_segmentation": detmodel.exemplar_segmentation,
+    }
+    for key, module in required.items():
+        if key not in checkpoint:
+            raise KeyError(f"Initialization checkpoint missing '{key}' state")
+        module.load_state_dict(checkpoint[key])
     return checkpoint
 
 
@@ -2212,6 +2457,13 @@ def build_finetune_checkpoint(
         "exemplar_segmentation": detmodel.exemplar_segmentation.state_dict(),
         "cad_pose_head": detmodel.cad_pose_head.state_dict(),
         "cad_pose_head_architecture_version": detmodel.cad_pose_head.architecture_version,
+        "exemplar_view_pose_encoder": detmodel.exemplar_view_pose_encoder.state_dict(),
+        "exemplar_view_pose_architecture_version": (
+            detmodel.exemplar_view_pose_encoder.architecture_version
+        ),
+        "exemplar_view_pose_architecture_config": (
+            detmodel.exemplar_view_pose_encoder.architecture_config()
+        ),
         "optimizer": optimizer.state_dict(),
         "pose_config": None if pose_config is None else pose_config.__dict__,
         "manifest_sha256": manifest_checksum,
@@ -2340,7 +2592,7 @@ def run_exemplar_eval(
     if config.shuffle:
         random.shuffle(all_entries)
 
-    ref_cache: Dict[str, torch.Tensor] = {}
+    ref_cache: Dict[str, Union[torch.Tensor, ExemplarViewBundle]] = {}
     seg_cache: Dict[str, np.ndarray] = {}
     mapping_cache: Dict[str, Dict[str, List[Tuple[int, ...]]]] = {}
     total_iou_sum = 0.0
@@ -2399,10 +2651,11 @@ def run_exemplar_eval(
                             num_points_approx=config.num_points_approx,
                             device=device,
                             upper_object_id=False,
+                            include_view_metadata=config.exemplar_view_mode != "none",
                         )
                         if exemplar_ref is None:
                             continue
-                        ref_cache[obj_id] = exemplar_ref.detach().cpu()
+                        ref_cache[obj_id] = cache_exemplar(exemplar_ref)
 
                     exemplar_ref = ref_cache[obj_id]
                     prepared.append(
@@ -2438,7 +2691,13 @@ def run_exemplar_eval(
                     encoded_image_features_list = detmodel.image_projection.v3_projection(encoded_img)
 
                     exemplars_list = [prepared[i]["exemplar_ref"] for i in idxs]
-                    exemplar_batch, padding_mask = pad_exemplar_batch(exemplars_list, device=device)
+                    exemplar_batch, padding_mask = pad_exemplar_batch(
+                        exemplars_list,
+                        device=device,
+                        pose_encoder=detmodel.exemplar_view_pose_encoder,
+                        mode=config.exemplar_view_mode,
+                        shuffle_seed=config.exemplar_view_shuffle_seed,
+                    )
 
                     mask_preds, box_preds, det_scores, det_scores_logits, _ = generate_detections_train(
                         detmodel,
@@ -2598,7 +2857,7 @@ def run_cad_pose_eval(
     ref_view_ids = parse_ref_view_ids(args.ref_view_ids)
     frame_entries = unique_frame_entries(entries)
     pose_cache: Dict[Tuple[str, str], object] = {}
-    ref_cache: Dict[str, torch.Tensor] = {}
+    ref_cache: Dict[str, Union[torch.Tensor, ExemplarViewBundle]] = {}
     metric_sums: Dict[str, float] = defaultdict(float)
     metric_counts: Dict[str, int] = defaultdict(int)
     conditional_metric_sums: Dict[str, float] = defaultdict(float)
@@ -2669,10 +2928,11 @@ def run_cad_pose_eval(
                             not args.no_square,
                             args.num_points_approx,
                             device,
+                            include_view_metadata=args.exemplar_view_mode != "none",
                         )
                         if exemplar is None:
                             continue
-                        ref_cache[cad_id] = exemplar.detach().cpu()
+                        ref_cache[cad_id] = cache_exemplar(exemplar)
                     image_tensor = detmodel.image_encoder.prepare_image(
                         image_bgr,
                         max_side_length=args.max_side_length,
@@ -2694,11 +2954,19 @@ def run_cad_pose_eval(
                         device=device,
                         dtype=model_dtype,
                     ).unsqueeze(0)
+                    exemplar_batch, exemplar_padding_mask = pad_exemplar_batch(
+                        [ref_cache[cad_id]],
+                        device=device,
+                        pose_encoder=detmodel.exemplar_view_pose_encoder,
+                        mode=args.exemplar_view_mode,
+                        shuffle_seed=args.exemplar_view_shuffle_seed,
+                    )
                     outputs = generate_detections_train(
                         detmodel,
                         features,
-                        ref_cache[cad_id].to(device),
+                        exemplar_batch,
                         detection_filter_threshold=args.det_filter,
+                        exemplar_padding_mask_bn=exemplar_padding_mask,
                         cad_dimensions_m_b3=dimensions,
                         cad_effective_surface_centroid_m_b3=effective_centroid,
                         adjusted_intrinsics_b33=adjusted_k,
@@ -2917,12 +3185,22 @@ def run_cad_pose_eval(
 def main() -> None:
     print("Starting fine-tuning with SAMv3 exemplar detection modules.")
     args = parse_args()
+    if args.exemplar_view_shuffle_seed is None:
+        args.exemplar_view_shuffle_seed = args.seed
+    if args.exemplar_view_mode != "none" and not args.enable_pose:
+        raise ValueError("Reference-view conditioning experiments require --enable_pose")
+    if args.init_path and args.resume_path:
+        raise ValueError("--init_path and --resume_path are mutually exclusive")
+    args.init_checkpoint_sha256 = ""
     random.seed(args.seed)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(args.seed)
-    print(f"Using random seed {args.seed}")
+    print(
+        f"Using random seed {args.seed}; exemplar_view_mode={args.exemplar_view_mode} "
+        f"shuffle_seed={args.exemplar_view_shuffle_seed}"
+    )
 
     for name in ("pose_train_min_match_iou", "pose_eval_min_match_iou"):
         value = float(getattr(args, name))
@@ -3021,11 +3299,17 @@ def main() -> None:
         unfreeze_module(detmodel.cad_pose_head)
     else:
         freeze_module(detmodel.cad_pose_head)
+    if args.enable_pose and args.exemplar_view_mode != "none":
+        unfreeze_module(detmodel.exemplar_view_pose_encoder)
+    else:
+        freeze_module(detmodel.exemplar_view_pose_encoder)
 
     trainable_params: List[torch.nn.Parameter] = []
     trainable_modules = [detmodel.image_exemplar_fusion, detmodel.exemplar_detector, detmodel.exemplar_segmentation]
     if args.enable_pose:
         trainable_modules.append(detmodel.cad_pose_head)
+    if args.exemplar_view_mode != "none":
+        trainable_modules.append(detmodel.exemplar_view_pose_encoder)
     for module in trainable_modules:
         trainable_params.extend([p for p in module.parameters() if p.requires_grad])
     total_params = sum(p.numel() for p in detmodel.parameters())
@@ -3040,6 +3324,9 @@ def main() -> None:
             if p.requires_grad
         ]
         pose_params = [p for p in detmodel.cad_pose_head.parameters() if p.requires_grad]
+        pose_params.extend(
+            p for p in detmodel.exemplar_view_pose_encoder.parameters() if p.requires_grad
+        )
         optimizer = torch.optim.AdamW(
             [
                 {
@@ -3047,7 +3334,7 @@ def main() -> None:
                     "lr": args.lr * args.joint_shared_lr_scale,
                     "name": "fusion_detector",
                 },
-                {"params": pose_params, "lr": args.lr, "name": "pose_head"},
+                {"params": pose_params, "lr": args.lr, "name": "pose_and_view_adapter"},
             ],
             lr=args.lr,
             weight_decay=args.weight_decay,
@@ -3055,7 +3342,7 @@ def main() -> None:
         print(
             "Joint-lite optimizer: "
             f"fusion/detector_lr={args.lr * args.joint_shared_lr_scale:.3g} "
-            f"pose_head_lr={args.lr:.3g}; segmentation decoder frozen"
+            f"pose_and_view_adapter_lr={args.lr:.3g}; segmentation decoder frozen"
         )
     else:
         optimizer = torch.optim.AdamW(trainable_params, lr=args.lr, weight_decay=args.weight_decay)
@@ -3067,6 +3354,19 @@ def main() -> None:
     if args.resume_in_place and not args.resume_path:
         raise ValueError("--resume_in_place requires --resume_path.")
 
+    if args.init_path:
+        init_path = Path(args.init_path).expanduser().resolve()
+        if not init_path.is_file():
+            raise FileNotFoundError(init_path)
+        load_detector_initialization_checkpoint(init_path, detmodel, device)
+        args.init_path = str(init_path)
+        args.init_checkpoint_sha256 = manifest_sha256(init_path)
+        print(
+            f"Initialized detector modules from {init_path} "
+            f"(sha256={args.init_checkpoint_sha256}); pose head, view adapter, optimizer, "
+            "and epoch counters remain fresh."
+        )
+
     if args.resume_path:
         resume_path = Path(args.resume_path).expanduser().resolve()
         if not resume_path.is_file():
@@ -3077,8 +3377,14 @@ def main() -> None:
             optimizer,
             device=device,
             load_optimizer=not args.no_resume_optimizer,
+            exemplar_view_mode=args.exemplar_view_mode,
         )
         resume_checkpoint = checkpoint
+        checkpoint_args = checkpoint.get("args") or {}
+        args.init_path = str(checkpoint_args.get("init_path", ""))
+        args.init_checkpoint_sha256 = str(
+            checkpoint_args.get("init_checkpoint_sha256", "")
+        )
         validate_resume_manifest_checksum(checkpoint, manifest_checksum)
         ckpt_epoch = int(checkpoint.get("epoch", 0))
         start_epoch = max(1, ckpt_epoch + 1)
@@ -3211,6 +3517,8 @@ def main() -> None:
             no_object_weight=args.no_object_weight,
             shuffle=False,
             max_batches=0,
+            exemplar_view_mode=args.exemplar_view_mode,
+            exemplar_view_shuffle_seed=args.exemplar_view_shuffle_seed,
         )
     elif val_split_csv is not None:
         # Validation uses the same dataset roots and exemplar renders as
@@ -3235,9 +3543,11 @@ def main() -> None:
             no_object_weight=args.no_object_weight,
             shuffle=False,
             max_batches=0,
+            exemplar_view_mode=args.exemplar_view_mode,
+            exemplar_view_shuffle_seed=args.exemplar_view_shuffle_seed,
         )
 
-    ref_cache: Dict[str, torch.Tensor] = {}
+    ref_cache: Dict[str, Union[torch.Tensor, ExemplarViewBundle]] = {}
     ref_image_cache: Dict[str, List[np.ndarray]] = {}
     seg_cache: Dict[str, np.ndarray] = {}
     mapping_cache: Dict[str, Dict[str, List[Tuple[int, ...]]]] = {}
@@ -3283,7 +3593,8 @@ def main() -> None:
         preflight_samples = []
         training_log_dimensions = []
         training_log_depths = []
-        training_cad_ids: set[str] = set()
+        pose_reference_cad_ids: set[str] = set()
+        pose_catalog = None
         for entry in preflight_entries:
             camera_root = Path(entry["inst_path"]).parent
             key = (str(camera_root), entry["frame_id"])
@@ -3291,6 +3602,8 @@ def main() -> None:
             if sample is None:
                 sample = load_perseve_pose_sample(camera_root, entry["frame_id"], validate_pixels=True)
                 pose_cache[key] = sample
+            if pose_catalog is None:
+                pose_catalog = sample.catalog
             preflight_samples.append(sample)
             catalog_checksums.add(sample.catalog_checksum)
             dataset_meta_checksums.add(sample.dataset_meta_checksum)
@@ -3301,9 +3614,11 @@ def main() -> None:
             sampling_parameter_checksums.update(sample.sampling_parameter_checksums)
             schema_checksums.update(sample.schema_checksums.values())
             schema_versions.add(sample.frame.schema_version)
+            pose_reference_cad_ids.update(
+                instance.cad_id for instance in sample.frame.eligible_instances()
+            )
             if entry.get("split", "train") == "train":
                 for instance in sample.frame.eligible_instances():
-                    training_cad_ids.add(instance.cad_id)
                     training_log_dimensions.append(np.log(instance.dimensions_m))
                     catalog_object = sample.catalog[instance.cad_id]
                     effective_centroid = effective_surface_centroid_m(instance, catalog_object)
@@ -3341,20 +3656,16 @@ def main() -> None:
             )
         if not training_log_dimensions or not training_log_depths:
             raise ValueError("Pose training split contains no eligible pose instances")
-        missing_reference_pairs = [
-            (cad_id, ref_id)
-            for cad_id in sorted(training_cad_ids)
-            for ref_id in ref_view_ids
-            if resolve_reference_pair(reference_dir, cad_id, ref_id) is None
-        ]
-        if missing_reference_pairs:
-            raise FileNotFoundError(
-                "Pose reference preflight found missing render/mask pairs: "
-                f"{missing_reference_pairs[:10]}"
-            )
+        reference_summary = validate_pose_reference_metadata(
+            reference_dir,
+            sorted(pose_reference_cad_ids),
+            pose_catalog,
+            ref_view_ids,
+        )
         print(
             "Reference preflight passed: "
-            f"cad_ids={len(training_cad_ids)} views_per_cad={len(ref_view_ids)}"
+            f"cad_ids={reference_summary['cad_id_count']} "
+            f"validated_views={reference_summary['view_count']}"
         )
         dimension_values = np.stack(training_log_dimensions)
         dimension_mean = torch.as_tensor(dimension_values.mean(axis=0), device=device, dtype=dtype)
@@ -3441,6 +3752,8 @@ def main() -> None:
             no_object_weight=args.no_object_weight,
             shuffle=False,
             max_batches=0,
+            exemplar_view_mode=args.exemplar_view_mode,
+            exemplar_view_shuffle_seed=args.exemplar_view_shuffle_seed,
         )
         eval_avg, eval_count, eval_correct, eval_loss = run_exemplar_eval(detmodel, eval_config, device=device)
         append_metric(
@@ -3664,10 +3977,11 @@ def main() -> None:
                         use_square_sizing=not args.no_square,
                         num_points_approx=args.num_points_approx,
                         device=device,
+                        include_view_metadata=args.exemplar_view_mode != "none",
                     )
                     if exemplar_ref is None:
                         continue
-                    ref_cache[obj_id] = exemplar_ref.detach().cpu()
+                    ref_cache[obj_id] = cache_exemplar(exemplar_ref)
 
                 exemplar_ref = ref_cache[obj_id]
                 prepared.append(
@@ -3716,7 +4030,13 @@ def main() -> None:
                     encoded_image_features_list = detmodel.image_projection.v3_projection(encoded_img)
 
                 exemplars_list = [prepared[i]["exemplar_ref"] for i in idxs]
-                exemplar_batch, padding_mask = pad_exemplar_batch(exemplars_list, device=device)
+                exemplar_batch, padding_mask = pad_exemplar_batch(
+                    exemplars_list,
+                    device=device,
+                    pose_encoder=detmodel.exemplar_view_pose_encoder,
+                    mode=args.exemplar_view_mode,
+                    shuffle_seed=args.exemplar_view_shuffle_seed,
+                )
                 pose_kwargs = {}
                 if args.enable_pose:
                     dimensions_batch = torch.stack(
