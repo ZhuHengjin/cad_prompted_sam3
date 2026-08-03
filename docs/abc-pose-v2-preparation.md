@@ -29,7 +29,9 @@ BLENDER=/path/to/blender
 The USD and STL collections serve different purposes. Point-set artifacts are
 derived from the exact composed USD geometry used by the generated pose
 catalog. Reference images are rendered from all original ABC STL meshes by the
-existing Blender renderer.
+Blender renderer. Pose references use the catalog's exact source-to-canonical
+transform; centering and uniform display scaling remain rendering-only
+operations.
 
 ## 1. Preprocess the complete USD point-set collection
 
@@ -126,15 +128,38 @@ reuse symlinks that already resolve to the correct source files.
 
 ## 5. Render all twelve exemplar views
 
-Run the existing renderer against the flat staging directory. Its fixed view
-preset renders all twelve views for every staged STL:
+Run the renderer against the flat staging directory. Its fixed view preset
+renders all twelve views for every staged STL. `canonical` is the pose-safe
+default. Supplying the catalog makes the renderer apply each CAD's exact
+`source_to_meters` and `T_cad_from_source_meters` before uniform display
+normalization:
 
 ```bash
 "$BLENDER" -b -P "$REPO/blender_renderer.py" -- \
   --stl-dir "$STAGED_STL" \
   --output-dir "$REFS" \
+  --object-catalog "$DATASET/objects.json" \
+  --orientation-mode canonical \
   --size 512
 ```
+
+The renderer also writes `<cad_id>_render_transform.json`, recording the
+canonical, presentation, and display transforms plus every reference-camera
+orientation. Existing images are reused with `--no-overwrite` only when this
+metadata matches the requested geometry policy.
+
+Pose-enabled training performs the same check as a fail-fast preflight. It
+requires catalog-driven canonical metadata, verifies the source-to-CAD
+transform and dimensions against the active pose catalog, and confirms that
+every requested image/mask pair has a recorded reference-camera rotation.
+Legacy exemplar directories without sidecars must therefore be regenerated
+before pose training.
+
+For segmentation-only product shots, `--orientation-mode largest-face-up` is
+available as an explicit presentation option. It applies the legacy
+thinnest-axis-to-Z rotation after canonicalization. Do not use that mode as a
+pose reference unless its recorded presentation transform and reference-camera
+orientation are consumed by the model.
 
 For CAD ID `abc123`, the renderer produces padded view IDs and matching masks:
 
@@ -150,14 +175,16 @@ The trainer accepts both padded IDs (`00` through `09`) and their unpadded
 spellings (`0` through `9`), so the original renderer's filenames work with
 the default `--ref_view_ids 0,1,...,11` configuration.
 
-After Blender finishes, validate all 10,000 CAD stems, all twelve view IDs,
-and every image/mask pair:
+After Blender finishes, validate every CAD selected by the active object
+catalog, all twelve view IDs, and every image/mask pair:
 
 ```bash
 uv run python prepare_abc_stl_render_inputs.py \
   "$ABC_STL" \
   "$STAGED_STL" \
-  --render-dir "$REFS"
+  --render-dir "$REFS" \
+  --object-catalog "$DATASET/objects.json" \
+  --require-orientation-mode canonical
 ```
 
 Do not proceed from a partial render directory; this validation exits nonzero

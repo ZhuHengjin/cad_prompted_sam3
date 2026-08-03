@@ -14,12 +14,28 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import json
 import math
 import os
+import sys
 from pathlib import Path
 
 import bpy
 import mathutils
+import numpy as np
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+if str(SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPT_DIR))
+
+from blender_render_geometry import (
+    ORIENTATION_MODES,
+    RenderGeometryTransform,
+    camera_cv_from_world,
+    compute_render_geometry_transform,
+    load_object_catalog,
+    transform_points,
+)
 
 
 # -----------------------------
@@ -88,7 +104,25 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--stl-dir", type=Path, default=DEFAULT_MESH_DIR)
     p.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
     p.add_argument("--size", type=int, default=512)
-    p.add_argument("--overwrite", default=True)
+    p.add_argument(
+        "--orientation-mode",
+        choices=ORIENTATION_MODES,
+        default="canonical",
+        help=(
+            "canonical preserves the CAD axes; largest-face-up adds the legacy "
+            "presentation rotation after canonicalization"
+        ),
+    )
+    p.add_argument(
+        "--object-catalog",
+        type=Path,
+        default=None,
+        help=(
+            "Optional Perseve objects.json. When supplied, every mesh must have a matching "
+            "entry and its exact source-to-canonical transform is applied."
+        ),
+    )
+    p.add_argument("--overwrite", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--num-objects", type=int, default=None)
     return p.parse_args(argv)
 
@@ -290,18 +324,33 @@ def camera_pose_from_angle(angle: float, radius: float = 2.0, elevation_deg: flo
 
 def import_stl(path: Path) -> bpy.types.Object:
     # Blender 4/5 moved STL import to wm.stl_import; keep legacy fallback.
+    imported = False
     if hasattr(bpy.ops.wm, "stl_import"):
-        bpy.ops.wm.stl_import(filepath=str(path))
-    else:
-        if not hasattr(bpy.ops.import_mesh, "stl"):
-            try:
-                bpy.ops.preferences.addon_enable(module="io_mesh_stl")
-            except Exception:
-                pass
-        if hasattr(bpy.ops.import_mesh, "stl"):
-            bpy.ops.import_mesh.stl(filepath=str(path))
-        else:
-            raise RuntimeError("STL import operator not found (wm.stl_import or import_mesh.stl).")
+        try:
+            bpy.ops.wm.stl_import(
+                filepath=str(path),
+                forward_axis="Y",
+                up_axis="Z",
+            )
+            imported = True
+        except (AttributeError, RuntimeError):
+            pass
+    if not imported:
+        try:
+            bpy.ops.preferences.addon_enable(module="io_mesh_stl")
+        except Exception:
+            pass
+        try:
+            bpy.ops.import_mesh.stl(
+                filepath=str(path),
+                axis_forward="Y",
+                axis_up="Z",
+            )
+            imported = True
+        except (AttributeError, RuntimeError) as error:
+            raise RuntimeError(
+                "STL import operator not found (wm.stl_import or import_mesh.stl)."
+            ) from error
     # imported objects are selected
     objs = [o for o in bpy.context.selected_objects if o.type == "MESH"]
     if not objs:
@@ -385,51 +434,71 @@ def ensure_cached_stl(ply_path: Path, cache_dir: Path) -> Path:
     return cache_path
 
 
-def normalize_object(obj: bpy.types.Object) -> None:
-    # Apply transforms to mesh data first
-    bpy.context.view_layer.objects.active = obj
-    bpy.ops.object.transform_apply(location=False, rotation=False, scale=False)
+def normalize_object(
+    obj: bpy.types.Object,
+    *,
+    orientation_mode: str = "canonical",
+    catalog_entry=None,
+) -> RenderGeometryTransform:
+    """Center and uniformly scale a mesh without silently changing its CAD frame."""
 
-    # Center by geometry centroid and scale to max extent = 1
-    # Use evaluated mesh bounds in local space
+    # The importers are configured for identity axis conversion. Do not bake an
+    # unexpected object transform into source vertices because the catalog
+    # transform is defined on the raw STL coordinate frame.
+    import_transform = np.asarray(obj.matrix_world, dtype=np.float64)
+    if not np.allclose(import_transform, np.eye(4), atol=1e-8, rtol=0.0):
+        raise ValueError(
+            "STL importer introduced a nonidentity object transform; refusing to change source axes"
+        )
+
     mesh = obj.data
-    coords = [v.co for v in mesh.vertices]
-    if not coords:
-        return
-    min_v = mathutils.Vector((min(v.x for v in coords), min(v.y for v in coords), min(v.z for v in coords)))
-    max_v = mathutils.Vector((max(v.x for v in coords), max(v.y for v in coords), max(v.z for v in coords)))
-    center = (min_v + max_v) * 0.5
-    extents = mathutils.Vector((
-        max_v.x - min_v.x,
-        max_v.y - min_v.y,
-        max_v.z - min_v.z,
-    ))
-    extent = max(extents.x, extents.y, extents.z)
-    if extent <= 0:
-        extent = 1.0
-
-    # Translate vertices so centroid is at origin
-    for v in mesh.vertices:
-        v.co -= center
-
-    # Orient largest bbox face "up" => align smallest extent axis to +Z.
-    min_axis = min(range(3), key=lambda i: extents[i])
-    if min_axis == 0:
-        rot = mathutils.Matrix.Rotation(math.radians(90.0), 3, "Y")
-    elif min_axis == 1:
-        rot = mathutils.Matrix.Rotation(math.radians(-90.0), 3, "X")
-    else:
-        rot = None
-    if rot is not None:
-        for v in mesh.vertices:
-            v.co = rot @ v.co
-
-    # Scale vertices so max extent becomes 1.0
-    scale = 1.0 / extent
-    for v in mesh.vertices:
-        v.co *= scale
+    coords = np.asarray([tuple(vertex.co) for vertex in mesh.vertices], dtype=np.float64)
+    geometry = compute_render_geometry_transform(
+        coords,
+        orientation_mode=orientation_mode,
+        catalog_entry=catalog_entry,
+    )
+    rendered = transform_points(coords, geometry.T_render_from_source)
+    for vertex, coordinate in zip(mesh.vertices, rendered):
+        vertex.co = mathutils.Vector(tuple(float(value) for value in coordinate))
 
     mesh.update()
+    return geometry
+
+
+def write_render_transform_metadata(path: Path, value: dict) -> None:
+    """Atomically publish one object's render-frame and reference-view metadata."""
+
+    temporary = path.with_name(f".{path.name}.tmp")
+    with temporary.open("w", encoding="utf-8") as stream:
+        json.dump(value, stream, indent=2, sort_keys=True, allow_nan=False)
+        stream.write("\n")
+    os.replace(temporary, path)
+
+
+def _metadata_matches(path: Path, expected_geometry: RenderGeometryTransform) -> bool:
+    try:
+        with path.open(encoding="utf-8") as stream:
+            existing = json.load(stream)
+        geometry = existing["geometry"]
+        return bool(
+            geometry.get("orientation_mode") == expected_geometry.orientation_mode
+            and geometry.get("catalog_driven") == expected_geometry.catalog_driven
+            and math.isclose(
+                float(geometry.get("source_to_meters")),
+                expected_geometry.source_to_meters,
+                rel_tol=0.0,
+                abs_tol=1e-12,
+            )
+            and np.allclose(
+                geometry.get("T_render_from_source"),
+                expected_geometry.T_render_from_source,
+                atol=1e-10,
+                rtol=0.0,
+            )
+        )
+    except (FileNotFoundError, KeyError, TypeError, ValueError, json.JSONDecodeError):
+        return False
 
 
 def assign_material(obj: bpy.types.Object, mat: bpy.types.Material) -> None:
@@ -444,8 +513,14 @@ def set_smooth_shading(obj: bpy.types.Object, smooth: bool = True, autosmooth_an
     bpy.context.view_layer.objects.active = obj
     bpy.ops.object.shade_smooth() if smooth else bpy.ops.object.shade_flat()
 
-    # Blender 5+ uses the operator for angle-based auto smooth.
-    bpy.ops.object.shade_auto_smooth(angle=math.radians(autosmooth_angle_deg))
+    # Blender 5+ uses the operator for angle-based auto smooth. Older releases
+    # expose the same policy through mesh properties.
+    try:
+        bpy.ops.object.shade_auto_smooth(angle=math.radians(autosmooth_angle_deg))
+    except (AttributeError, RuntimeError):
+        if hasattr(obj.data, "use_auto_smooth"):
+            obj.data.use_auto_smooth = True
+            obj.data.auto_smooth_angle = math.radians(autosmooth_angle_deg)
 
 
 def render_to(path: Path) -> None:
@@ -480,9 +555,30 @@ def main() -> int:
     out_dir = args.output_dir.expanduser()
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    catalog_schema_version = None
+    catalog_objects = None
+    catalog_path = None
+    if args.object_catalog is not None:
+        catalog_path = args.object_catalog.expanduser().resolve()
+        catalog_schema_version, catalog_objects = load_object_catalog(catalog_path)
+
     meshes = []
     for pattern in MESH_GLOBS:
         meshes.extend(sorted(mesh_dir.glob(pattern)))
+    if catalog_objects is not None:
+        meshes_by_stem = {mesh_path.stem: mesh_path for mesh_path in meshes}
+        missing_source_ids = sorted(set(catalog_objects) - set(meshes_by_stem))
+        if missing_source_ids:
+            examples = ", ".join(missing_source_ids[:10])
+            remainder = len(missing_source_ids) - 10
+            suffix = f", and {remainder} more" if remainder > 0 else ""
+            raise ValueError(
+                f"Mesh directory has no source file for {len(missing_source_ids)} catalog objects: "
+                f"{examples}{suffix}"
+            )
+        # A pose catalog commonly selects a subset of a larger staged corpus.
+        # Render exactly that catalog subset when canonical transforms are requested.
+        meshes = [meshes_by_stem[cad_id] for cad_id in sorted(catalog_objects)]
     if args.num_objects is not None:
         meshes = meshes[: max(0, args.num_objects)]
     if not meshes:
@@ -527,18 +623,6 @@ def main() -> int:
         stem = mesh_path.stem
         print(f"[info] rendering {mesh_path.name}")
 
-        if not args.overwrite:
-            all_done = True
-            for idx, _ in enumerate(preset_views):
-                suffix = f"{OUTPUT_BASE_SUFFIX}_{idx:02d}"
-                out_path = out_dir / f"{stem}_{suffix}.png"
-                mask_path = out_dir / f"{stem}_{suffix}_mask.png"
-                if not (out_path.exists() and mask_path.exists()):
-                    all_done = False
-                    break
-            if all_done:
-                continue
-
         # Remove previous mesh objects but keep camera/lights
         for obj in list(bpy.data.objects):
             if obj.type == "MESH":
@@ -551,17 +635,34 @@ def main() -> int:
             print(f"[warn] failed to import {mesh_path}: {e}")
             continue
 
-        normalize_object(obj)
+        catalog_entry = None if catalog_objects is None else catalog_objects[stem]
+        geometry = normalize_object(
+            obj,
+            orientation_mode=args.orientation_mode,
+            catalog_entry=catalog_entry,
+        )
         assign_material(obj, mat)
         set_smooth_shading(obj, smooth=True, autosmooth_angle_deg=50.0)
 
+        metadata_path = out_dir / f"{stem}_render_transform.json"
+        existing_pairs = []
+        for idx, _ in enumerate(preset_views):
+            suffix = f"{OUTPUT_BASE_SUFFIX}_{idx:02d}"
+            out_path = out_dir / f"{stem}_{suffix}.png"
+            mask_path = out_dir / f"{stem}_{suffix}_mask.png"
+            if out_path.exists() or mask_path.exists():
+                existing_pairs.append((out_path, mask_path))
+        if not args.overwrite and existing_pairs and not _metadata_matches(metadata_path, geometry):
+            raise ValueError(
+                f"Existing renders for {stem} have missing or incompatible transform metadata; "
+                "use --overwrite or a separate output directory"
+            )
+
+        view_metadata = []
         for idx, (angle, elevation) in enumerate(preset_views):
             suffix = f"{OUTPUT_BASE_SUFFIX}_{idx:02d}"
             out_path = out_dir / f"{stem}_{suffix}.png"
             mask_path = out_dir / f"{stem}_{suffix}_mask.png"
-
-            if out_path.exists() and mask_path.exists() and (not args.overwrite):
-                continue
 
             cam_loc, cam_rot = camera_pose_from_angle(
                 angle,
@@ -571,11 +672,49 @@ def main() -> int:
             cam.location = cam_loc
             cam.rotation_euler = cam_rot
 
+            T_refcam_cv_from_render = camera_cv_from_world(
+                np.asarray(tuple(cam_loc), dtype=np.float64),
+                np.asarray(cam_rot.to_matrix(), dtype=np.float64),
+            )
+            view_metadata.append(
+                {
+                    "view_id": f"{idx:02d}",
+                    "azimuth_rad": float(angle),
+                    "elevation_deg": float(elevation),
+                    "image": out_path.name,
+                    "mask": mask_path.name,
+                    "T_refcam_cv_from_render": T_refcam_cv_from_render.tolist(),
+                    "R_refcam_cv_from_cad": (
+                        T_refcam_cv_from_render[:3, :3]
+                        @ geometry.T_presentation_from_cad[:3, :3]
+                    ).tolist(),
+                }
+            )
+
+            if out_path.exists() and mask_path.exists() and (not args.overwrite):
+                continue
+
             render_to(out_path)
             make_mask_from_alpha(out_path, mask_path)
 
             print(f"[info] saved {out_path.name}")
             print(f"[info] saved {mask_path.name}")
+
+        write_render_transform_metadata(
+            metadata_path,
+            {
+                "schema": "cad_prompted_sam3.exemplar_render",
+                "schema_version": "1.0.0",
+                "object_id": stem,
+                "source_mesh": str(mesh_path.resolve()),
+                "object_catalog": None if catalog_path is None else str(catalog_path),
+                "object_catalog_schema_version": catalog_schema_version,
+                "geometry": geometry.as_json(),
+                "camera_frame": "opencv_x_right_y_down_z_forward",
+                "views": view_metadata,
+            },
+        )
+        print(f"[info] saved {metadata_path.name}")
 
     print(f"[done] Rendered {len(meshes)} {MESH_LABEL} meshes to {out_dir}")
     return 0

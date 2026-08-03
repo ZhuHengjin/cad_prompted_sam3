@@ -19,6 +19,7 @@ from typing import Sequence
 
 VIEW_IDS = tuple(range(12))
 OUTPUT_BASE_SUFFIX = "stl_base"
+TRANSFORM_METADATA_SUFFIX = "render_transform.json"
 MAX_REPORTED_RENDER_ISSUES = 20
 
 
@@ -33,7 +34,8 @@ class RenderValidationError(PreparationError):
         self.report = report
         super().__init__(
             f"Render validation found {report['incomplete_pair_count']} incomplete "
-            f"image/mask pairs across {report['incomplete_object_count']} objects"
+            f"image/mask pairs across {report['incomplete_object_count']} objects and "
+            f"{report['transform_metadata_issue_count']} transform-metadata issues"
         )
 
 
@@ -52,7 +54,22 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--render-dir",
         type=Path,
-        help="After staging, validate all 12 image/mask render pairs for every STL.",
+        help="After staging, validate all 12 image/mask render pairs for each selected STL.",
+    )
+    parser.add_argument(
+        "--object-catalog",
+        type=Path,
+        default=None,
+        help="Limit render validation to the CAD IDs selected by a Perseve objects.json.",
+    )
+    parser.add_argument(
+        "--require-orientation-mode",
+        choices=("canonical", "largest-face-up"),
+        default=None,
+        help=(
+            "Require each rendered object to have transform metadata declaring this "
+            "orientation mode. Intended to prevent pose runs from accepting presentation renders."
+        ),
     )
     return parser.parse_args(argv)
 
@@ -187,7 +204,12 @@ def _render_pair_candidates(render_dir: Path, stem: str, view_id: int) -> list[t
     return candidates
 
 
-def validate_render_directory(meshes: Sequence[Path], render_dir: Path) -> dict:
+def validate_render_directory(
+    meshes: Sequence[Path],
+    render_dir: Path,
+    *,
+    required_orientation_mode: str | None = None,
+) -> dict:
     """Require one complete padded or unpadded image/mask pair for every view."""
 
     render_dir = render_dir.expanduser().resolve(strict=False)
@@ -197,6 +219,8 @@ def validate_render_directory(meshes: Sequence[Path], render_dir: Path) -> dict:
     incomplete_pair_count = 0
     incomplete_objects: set[str] = set()
     issue_examples: list[dict] = []
+    transform_metadata_issue_count = 0
+    transform_metadata_issue_examples: list[dict] = []
     for mesh_path in meshes:
         stem = mesh_path.stem
         for view_id in VIEW_IDS:
@@ -223,6 +247,35 @@ def validate_render_directory(meshes: Sequence[Path], render_dir: Path) -> dict:
                     }
                 )
 
+        if required_orientation_mode is not None:
+            metadata_path = render_dir / f"{stem}_{TRANSFORM_METADATA_SUFFIX}"
+            metadata_issue = None
+            try:
+                with metadata_path.open(encoding="utf-8") as stream:
+                    metadata = json.load(stream)
+                actual_mode = metadata.get("geometry", {}).get("orientation_mode")
+                catalog_driven = metadata.get("geometry", {}).get("catalog_driven")
+                if actual_mode != required_orientation_mode:
+                    metadata_issue = (
+                        f"orientation mode is {actual_mode!r}, expected {required_orientation_mode!r}"
+                    )
+                elif required_orientation_mode == "canonical" and catalog_driven is not True:
+                    metadata_issue = "canonical pose render is not catalog-driven"
+            except FileNotFoundError:
+                metadata_issue = "transform metadata is missing"
+            except (OSError, json.JSONDecodeError, AttributeError):
+                metadata_issue = "transform metadata is unreadable"
+            if metadata_issue is not None:
+                transform_metadata_issue_count += 1
+                if len(transform_metadata_issue_examples) < MAX_REPORTED_RENDER_ISSUES:
+                    transform_metadata_issue_examples.append(
+                        {
+                            "object_id": stem,
+                            "metadata": metadata_path.name,
+                            "issue": metadata_issue,
+                        }
+                    )
+
     report = {
         "render_dir": str(render_dir),
         "object_count": len(meshes),
@@ -232,16 +285,57 @@ def validate_render_directory(meshes: Sequence[Path], render_dir: Path) -> dict:
         "incomplete_pair_count": incomplete_pair_count,
         "incomplete_object_count": len(incomplete_objects),
         "issue_examples": issue_examples,
+        "required_orientation_mode": required_orientation_mode,
+        "transform_metadata_issue_count": transform_metadata_issue_count,
+        "transform_metadata_issue_examples": transform_metadata_issue_examples,
     }
-    if incomplete_pair_count:
+    if incomplete_pair_count or transform_metadata_issue_count:
         raise RenderValidationError(report)
     return report
 
 
+def select_catalog_meshes(meshes: Sequence[Path], catalog_path: Path) -> list[Path]:
+    """Select exactly the source meshes named by a Perseve object catalog."""
+
+    catalog_path = catalog_path.expanduser().resolve()
+    try:
+        with catalog_path.open(encoding="utf-8") as stream:
+            catalog = json.load(stream)
+    except (OSError, json.JSONDecodeError) as error:
+        raise PreparationError(f"Unable to read object catalog {catalog_path}: {error}") from error
+    objects = catalog.get("objects") if isinstance(catalog, dict) else None
+    if not isinstance(objects, dict):
+        raise PreparationError(f"Object catalog has no object mapping: {catalog_path}")
+
+    meshes_by_stem = {mesh.stem: mesh for mesh in meshes}
+    missing_ids = sorted(set(objects) - set(meshes_by_stem))
+    if missing_ids:
+        raise PreparationError(
+            f"Staged corpus is missing {len(missing_ids)} catalog meshes: {missing_ids[:10]}"
+        )
+    return [meshes_by_stem[cad_id] for cad_id in sorted(objects)]
+
+
 def run(args: argparse.Namespace) -> dict:
+    if args.require_orientation_mode is not None and args.render_dir is None:
+        raise PreparationError("--require-orientation-mode requires --render-dir")
+    if args.object_catalog is not None and args.render_dir is None:
+        raise PreparationError("--object-catalog requires --render-dir")
     meshes, summary = prepare_symlink_directory(args.source_dir, args.staging_dir)
+    validation_meshes = (
+        select_catalog_meshes(meshes, args.object_catalog)
+        if args.object_catalog is not None
+        else meshes
+    )
+    summary["render_selection_count"] = len(validation_meshes)
     summary["render_validation"] = (
-        validate_render_directory(meshes, args.render_dir) if args.render_dir is not None else None
+        validate_render_directory(
+            validation_meshes,
+            args.render_dir,
+            required_orientation_mode=args.require_orientation_mode,
+        )
+        if args.render_dir is not None
+        else None
     )
     return {"status": "ok", **summary}
 

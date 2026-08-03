@@ -14,6 +14,7 @@ from prepare_abc_stl_render_inputs import (
     RenderValidationError,
     main,
     prepare_symlink_directory,
+    select_catalog_meshes,
     validate_render_directory,
 )
 
@@ -176,6 +177,72 @@ class PrepareAbcStlRenderInputsTests(unittest.TestCase):
             padded = report["issue_examples"][0]["candidates"][0]
             self.assertTrue(padded["image_exists"])
             self.assertFalse(padded["mask_exists"])
+
+    def test_pose_render_validation_requires_catalog_driven_canonical_metadata(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            mesh = root / "part.stl"
+            mesh.write_bytes(b"solid")
+            render_dir = root / "renders"
+            render_dir.mkdir()
+            for view_id in range(12):
+                base = render_dir / f"part_stl_base_{view_id:02d}"
+                base.with_suffix(".png").write_bytes(b"image")
+                base.with_name(f"{base.name}_mask.png").write_bytes(b"mask")
+
+            metadata_path = render_dir / "part_render_transform.json"
+            metadata_path.write_text(
+                json.dumps(
+                    {
+                        "geometry": {
+                            "orientation_mode": "canonical",
+                            "catalog_driven": True,
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            report = validate_render_directory(
+                [mesh], render_dir, required_orientation_mode="canonical"
+            )
+            self.assertEqual(report["transform_metadata_issue_count"], 0)
+
+            metadata_path.write_text(
+                json.dumps(
+                    {
+                        "geometry": {
+                            "orientation_mode": "largest-face-up",
+                            "catalog_driven": True,
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with self.assertRaises(RenderValidationError) as caught:
+                validate_render_directory(
+                    [mesh], render_dir, required_orientation_mode="canonical"
+                )
+            self.assertEqual(caught.exception.report["transform_metadata_issue_count"], 1)
+            self.assertIn(
+                "expected 'canonical'",
+                caught.exception.report["transform_metadata_issue_examples"][0]["issue"],
+            )
+
+    def test_catalog_selection_limits_validation_to_pose_objects(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            meshes = [root / "cad-a.stl", root / "cad-b.stl"]
+            for mesh in meshes:
+                mesh.write_bytes(b"solid")
+            catalog_path = root / "objects.json"
+            catalog_path.write_text(
+                json.dumps({"objects": {"cad-b": {}}}),
+                encoding="utf-8",
+            )
+
+            selected = select_catalog_meshes(meshes, catalog_path)
+
+            self.assertEqual(selected, [root / "cad-b.stl"])
 
     def test_cli_prints_json_summary(self):
         with tempfile.TemporaryDirectory() as temp_dir:
