@@ -756,6 +756,8 @@ class SAMV3DetectorModel(nn.Module):
                     cad_effective_surface_centroid_m_b3,
                     camera_intrinsics_b33,
                     image_size_wh,
+                    encoded_exemplars_bnc,
+                    exemplar_padding_mask_bn,
                 )
                 pose_predictions = pose_predictions.with_translation(camera_intrinsics_b33, image_size_wh)
                 return blk_masks, blk_box, blk_score, blk_pres, pose_predictions
@@ -791,6 +793,8 @@ class SAMV3DetectorModel(nn.Module):
                     cad_effective_surface_centroid_m_b3,
                     camera_intrinsics_b33,
                     image_size_wh,
+                    encoded_exemplars_bnc,
+                    exemplar_padding_mask_bn,
                 )
                 pose_predictions = pose_predictions.with_translation(camera_intrinsics_b33, image_size_wh)
 

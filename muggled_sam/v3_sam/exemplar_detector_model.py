@@ -5,6 +5,8 @@
 # ---------------------------------------------------------------------------------------------------------------------
 # %% Imports
 
+from typing import NamedTuple
+
 import torch
 import torch.nn as nn
 
@@ -24,6 +26,19 @@ from torch import Tensor
 
 # ---------------------------------------------------------------------------------------------------------------------
 # %% Classes
+
+
+class ExemplarDetectorLayerOutput(NamedTuple):
+    """Normalized query tokens and refined boxes after one detector layer.
+
+    ``layer_index`` is zero-based, matching ``SAMV3ExemplarDetector.fusion_layers``.
+    Candidate order is stable across layers, so final-layer mask assignments can
+    be reused for pose supervision at an earlier layer.
+    """
+
+    layer_index: int
+    detection_tokens_bnc: Tensor
+    boxes_xy1xy2_bn22: Tensor
 
 
 class SAMV3ExemplarDetector(nn.Module):
@@ -94,7 +109,12 @@ class SAMV3ExemplarDetector(nn.Module):
         image_tokens_bchw: Tensor,
         exemplar_tokens_bnc: Tensor,
         exemplar_mask_bn: Tensor | None = None,
-    ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
+        *,
+        intermediate_layer_indices: tuple[int, ...] | None = None,
+    ) -> (
+        tuple[Tensor, Tensor, Tensor, Tensor, Tensor]
+        | tuple[Tensor, Tensor, Tensor, Tensor, Tensor, tuple[ExemplarDetectorLayerOutput, ...]]
+    ):
         """
         Predicts bounding box detections along with a per-detection confidence score
         and a single 'presence' score (indicates if exemplars are present in image).
@@ -107,6 +127,20 @@ class SAMV3ExemplarDetector(nn.Module):
             -> detection_scores_logits_bn holds raw per-detection logits (pre-sigmoid, pre-presence scaling)
             -> presence_score holds a 0-to-1 score for whether at least 1 object is present in image
         """
+
+        # Intermediate outputs are an opt-in training feature. Keeping the
+        # default return contract unchanged avoids disturbing inference and
+        # compiled segmentation call sites.
+        requested_intermediate_indices = tuple(intermediate_layer_indices or ())
+        if len(set(requested_intermediate_indices)) != len(requested_intermediate_indices):
+            raise ValueError("intermediate_layer_indices must not contain duplicates")
+        num_layers = len(self.fusion_layers)
+        if any(index < 0 or index >= num_layers for index in requested_intermediate_indices):
+            raise ValueError(
+                f"intermediate_layer_indices must be in [0, {num_layers - 1}]"
+            )
+        requested_intermediate_set = set(requested_intermediate_indices)
+        intermediate_outputs_by_index: dict[int, ExemplarDetectorLayerOutput] = {}
 
         # For clarity
         img_b, _, img_h, img_w = image_tokens_bchw.shape
@@ -124,7 +158,7 @@ class SAMV3ExemplarDetector(nn.Module):
         # Iteratively encode query & box predictions
         detection_tokens_bnc = self.detection_tokens.repeat(img_b, 1, 1)
         presence_token_b1c = self.presence_token.repeat(img_b, 1, 1)
-        for fusion_layer in self.fusion_layers:
+        for layer_index, fusion_layer in enumerate(self.fusion_layers):
 
             # Compute position encoding for queries, follows odd ordering (yxwh) of original code
             # see: https://github.com/facebookresearch/sam3/blob/5eb25fb54b70ec0cb16f949289053be091e16705/sam3/model/model_misc.py#L271
@@ -151,6 +185,15 @@ class SAMV3ExemplarDetector(nn.Module):
             box_pred_cxcywh_bn4 = anc_boxes_bn4.sigmoid()
             box_pred_xyxy_bn4 = self._box_cxcywh_to_xyxy(box_pred_cxcywh_bn4)
 
+            if layer_index in requested_intermediate_set:
+                intermediate_outputs_by_index[layer_index] = ExemplarDetectorLayerOutput(
+                    layer_index=layer_index,
+                    detection_tokens_bnc=self.out_norm_detections(detection_tokens_bnc),
+                    boxes_xy1xy2_bn22=box_pred_xyxy_bn4.view(
+                        img_b, num_detections, 2, 2
+                    ),
+                )
+
         # Gather outputs
         out_detection_tokens_bnc = self.out_norm_detections(detection_tokens_bnc)
         out_presence_logits_b1 = self.mlp_presence_score(presence_token_b1c)
@@ -163,13 +206,20 @@ class SAMV3ExemplarDetector(nn.Module):
         out_det_scores_logits_bn = out_det_logits_bn
         out_presence_scores = out_presence_score_b1.squeeze(-1)
 
-        return (
+        outputs = (
             out_detection_tokens_bnc,
             out_box_xy1xy2_bn22,
             out_det_scores_bn,
             out_det_scores_logits_bn,
             out_presence_scores,
         )
+        if not requested_intermediate_indices:
+            return outputs
+        intermediate_outputs = tuple(
+            intermediate_outputs_by_index[index]
+            for index in requested_intermediate_indices
+        )
+        return (*outputs, intermediate_outputs)
 
     # .................................................................................................................
 

@@ -442,7 +442,7 @@ Implemented in this repository:
    full-placement loss;
 5. geometric pose-quality targets, point-set evaluation, and calibration;
 6. point-artifact and sampling-pipeline checkpoint provenance;
-7. pose-head architecture version 3; and
+7. pose-head architecture version 4, with explicit migration from promptless v3; and
 8. unit coverage for artifact determinism, schema behavior, centroid
    round-trips, symmetry-equivalent set matching, gradients, and v2 loading.
 

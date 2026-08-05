@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import warnings
 from pathlib import Path
 
 import cv2
@@ -73,11 +74,20 @@ def main() -> None:
     detector = base_model.make_detector_model().to(device)
     checkpoint = torch.load(args.pose_checkpoint, map_location=device, weights_only=False)
     checkpoint_version = int(checkpoint.get("cad_pose_head_architecture_version", 1))
-    if checkpoint_version != detector.cad_pose_head.architecture_version:
-        raise ValueError(
-            "CAD pose-head checkpoint architecture version "
-            f"{checkpoint_version} is incompatible with model version "
-            f"{detector.cad_pose_head.architecture_version}"
+    checkpoint_config = checkpoint.get("cad_pose_head_architecture_config")
+    if (
+        checkpoint_version == detector.cad_pose_head.architecture_version
+        and checkpoint_config is not None
+        and checkpoint_config != detector.cad_pose_head.architecture_config()
+    ):
+        raise ValueError("Checkpoint CAD pose-head architecture config is incompatible")
+    migrated = detector.cad_pose_head.load_checkpoint_state_dict(
+        checkpoint["cad_pose_head"],
+        checkpoint_version,
+    )
+    if migrated:
+        warnings.warn(
+            "Loaded promptless CAD pose head v3 into v4; CAD prompting remains disabled."
         )
     # The pose checkpoint contains only the modules fine-tuned for CAD-conditioned
     # detection and pose estimation; retain the remaining upstream SAM3 weights.
@@ -85,9 +95,12 @@ def main() -> None:
         ("image_exemplar_fusion", detector.image_exemplar_fusion),
         ("exemplar_detector", detector.exemplar_detector),
         ("exemplar_segmentation", detector.exemplar_segmentation),
-        ("cad_pose_head", detector.cad_pose_head),
     ):
         module.load_state_dict(checkpoint[key])
+    checkpoint_args = checkpoint.get("args") or {}
+    detector.cad_pose_head.set_cad_prompt_enabled(
+        bool(checkpoint_args.get("enable_cad_prompt", False))
+    )
     args.exemplar_view_mode = load_exemplar_view_adapter_for_inference(
         detector, checkpoint, args.exemplar_view_mode
     )

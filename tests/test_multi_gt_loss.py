@@ -7,16 +7,22 @@ optional PyTorch/OpenCV training stack is unavailable.
 """
 
 import unittest
+from types import SimpleNamespace
+from unittest.mock import patch
 
 try:
     import torch
 
     from finetune_image_exemplar_multi_gt import (
+        AuxiliaryPosePredictions,
+        compute_auxiliary_pose_loss,
         compute_multi_gt_detection_loss,
         compute_multi_gt_detection_losses,
         filter_pose_matches_by_iou,
         match_predictions_to_gts_greedy_k,
+        parse_pose_aux_layer_indices,
     )
+    from muggled_sam.v3_sam.cad_pose.losses import CADPoseLossConfig
     from loss_fns import compute_bbox_l1_loss_from_matches, compute_matched_mask_losses, compute_presence_loss_logits
 
     TRAINING_DEPS_AVAILABLE = True
@@ -26,6 +32,44 @@ except ModuleNotFoundError:
 
 @unittest.skipUnless(TRAINING_DEPS_AVAILABLE, "torch/cv2 training dependencies are not installed")
 class MultiGtLossEquivalenceTests(unittest.TestCase):
+    def test_pose_aux_layers_use_one_based_configuration(self):
+        self.assertEqual(parse_pose_aux_layer_indices("3,4,5", 6), (2, 3, 4))
+        with self.assertRaisesRegex(ValueError, "primary output"):
+            parse_pose_aux_layer_indices("6", 6)
+
+    def test_auxiliary_pose_loss_is_mean_with_quality_disabled(self):
+        predictions = AuxiliaryPosePredictions(
+            layers=(3, 4, 5),
+            predictions=(object(), object(), object()),
+        )
+        calls = []
+
+        def fake_pose_loss(prediction, targets, matches, config, **kwargs):
+            calls.append((prediction, targets, matches, config, kwargs))
+            return SimpleNamespace(total=torch.tensor(float(len(calls))))
+
+        matches = [(0, 7)]
+        with patch(
+            "finetune_image_exemplar_multi_gt.compute_cad_pose_losses",
+            side_effect=fake_pose_loss,
+        ):
+            mean_loss = compute_auxiliary_pose_loss(
+                predictions,
+                [object()],
+                matches,
+                CADPoseLossConfig(quality_weight=1.0),
+                batch_index=2,
+            )
+
+        torch.testing.assert_close(mean_loss, torch.tensor(2.0))
+        torch.testing.assert_close(0.5 * mean_loss, torch.tensor(1.0))
+        self.assertEqual(len(calls), 3)
+        for _, _, actual_matches, config, kwargs in calls:
+            self.assertIs(actual_matches, matches)
+            self.assertEqual(config.quality_weight, 0.0)
+            self.assertFalse(kwargs["compute_expensive_metrics"])
+            self.assertEqual(kwargs["batch_index"], 2)
+
     def test_refactored_training_loss_matches_previous_expression(self):
         torch.manual_seed(7)
         logits = torch.randn(4, 8, 8)

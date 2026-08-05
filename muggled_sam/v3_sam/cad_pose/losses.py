@@ -96,6 +96,7 @@ def point_set_pose_errors(
     *,
     chunk_size: int = 512,
     full_pose_grad: bool = False,
+    compute_full_pose: bool = True,
 ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
     """Return normalized rotation/full-set errors and centroid error.
 
@@ -129,24 +130,29 @@ def point_set_pose_errors(
     rotated_query = rotate_points(query, rotation_pred)
     rotated_dense = rotate_points(dense, rotation_target)
     rotation_distances = nearest_neighbor_distances(rotated_query, rotated_dense, chunk_size=chunk_size) / diagonal
-    full_query = rotated_query + centroid_pred
-    full_target = rotated_dense + centroid_target
-    if not full_pose_grad:
-        full_query = full_query.detach()
-        full_target = full_target.detach()
-    full_distances = (
-        nearest_neighbor_distances(
-            full_query,
-            full_target,
-            chunk_size=chunk_size,
+    if compute_full_pose:
+        full_query = rotated_query + centroid_pred
+        full_target = rotated_dense + centroid_target
+        if not full_pose_grad:
+            full_query = full_query.detach()
+            full_target = full_target.detach()
+        full_distances = (
+            nearest_neighbor_distances(
+                full_query,
+                full_target,
+                chunk_size=chunk_size,
+            )
+            / diagonal
         )
-        / diagonal
-    )
+        full_set_error = full_distances.mean()
+    else:
+        full_distances = rotation_distances.new_empty((0,))
+        full_set_error = rotation_distances.new_tensor(float("nan"))
     centroid_error_m = torch.linalg.vector_norm(centroid_pred - centroid_target)
     centroid_error_norm = centroid_error_m / diagonal
     return (
         rotation_distances.mean(),
-        full_distances.mean(),
+        full_set_error,
         centroid_error_norm,
         centroid_error_m,
         rotation_distances,
@@ -161,6 +167,7 @@ def compute_cad_pose_losses(
     config: CADPoseLossConfig,
     *,
     batch_index: int = 0,
+    compute_expensive_metrics: bool = True,
 ) -> CADPoseLosses | None:
     """Compute losses for one image's one-to-one pose matches."""
 
@@ -201,6 +208,11 @@ def compute_cad_pose_losses(
             if predictions.centroid_m_bn3 is None:
                 raise ValueError("Point-set losses require back-projected surface centroids")
             centroid_pred = predictions.centroid_m_bn3[batch_index, prediction_index]
+            compute_full_pose = (
+                compute_expensive_metrics
+                or config.full_pose_weight != 0
+                or config.quality_weight != 0
+            )
             (
                 rotation_set_error,
                 full_set_error,
@@ -214,6 +226,7 @@ def compute_cad_pose_losses(
                 target,
                 chunk_size=config.point_distance_chunk_size,
                 full_pose_grad=config.full_pose_weight != 0,
+                compute_full_pose=compute_full_pose,
             )
             # Smooth-L1 retains a stable gradient near exact matches while the
             # raw normalized distances remain available for quality/metrics.
@@ -224,26 +237,28 @@ def compute_cad_pose_losses(
                     beta=config.point_loss_beta,
                 )
             )
-            full_pose_losses.append(
-                F.smooth_l1_loss(
-                    full_distances,
-                    torch.zeros_like(full_distances),
-                    beta=config.point_loss_beta,
+            if compute_full_pose:
+                full_pose_losses.append(
+                    F.smooth_l1_loss(
+                        full_distances,
+                        torch.zeros_like(full_distances),
+                        beta=config.point_loss_beta,
+                    )
                 )
-            )
-            point_set_errors.append(full_set_error)
+                point_set_errors.append(full_set_error)
             centroid_errors.append(centroid_error_m)
-            quality_target = torch.sigmoid(
-                (config.centroid_tolerance - centroid_error_norm) / config.centroid_soft_width
-            ) * torch.sigmoid(
-                (config.point_set_tolerance - full_set_error) / config.point_set_soft_width
-            )
-            quality_losses.append(
-                F.binary_cross_entropy_with_logits(
-                    predictions.pose_score_logits_bn[batch_index, prediction_index],
-                    quality_target.detach(),
+            if compute_expensive_metrics or config.quality_weight != 0:
+                quality_target = torch.sigmoid(
+                    (config.centroid_tolerance - centroid_error_norm) / config.centroid_soft_width
+                ) * torch.sigmoid(
+                    (config.point_set_tolerance - full_set_error) / config.point_set_soft_width
                 )
-            )
+                quality_losses.append(
+                    F.binary_cross_entropy_with_logits(
+                        predictions.pose_score_logits_bn[batch_index, prediction_index],
+                        quality_target.detach(),
+                    )
+                )
             rotation_error = rotation_pred.new_tensor(float("nan"))
         elif target.rotation_eligible:
             rotation_error = symmetry_aware_rotation_error(
@@ -261,7 +276,11 @@ def compute_cad_pose_losses(
 
         translation_error = torch.linalg.vector_norm(translation_pred - target.translation_m.to(translation_pred))
         translation_errors.append(translation_error)
-        if target.rotation_eligible and not target.point_set_eligible:
+        if (
+            target.rotation_eligible
+            and not target.point_set_eligible
+            and (compute_expensive_metrics or config.quality_weight != 0)
+        ):
             rotation_errors.append(rotation_error)
             if config.normalize_translation_error:
                 diagonal = torch.linalg.vector_norm(target.dimensions_m.to(translation_error)).clamp_min(1e-8)

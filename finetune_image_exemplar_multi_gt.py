@@ -62,6 +62,7 @@ from muggled_sam.v3_sam.cad_pose.losses import (
     compute_cad_pose_losses,
     point_set_pose_errors,
 )
+from muggled_sam.v3_sam.cad_pose.types import CADPosePredictions, CADPoseTarget
 from muggled_sam.v3_sam.cad_pose.matching import match_pose_predictions_one_to_one
 from muggled_sam.v3_sam.cad_pose.symmetry import symmetry_aware_rotation_error
 from muggled_sam.v3_sam.exemplar_view_pose import (
@@ -97,6 +98,7 @@ METRIC_FIELDS = (
     "pose_rotation_loss",
     "pose_full_set_loss",
     "pose_quality_loss",
+    "pose_aux_loss",
     "mean_surface_distance_norm",
     "p95_surface_distance_norm",
     "centroid_error_cm",
@@ -120,6 +122,26 @@ METRIC_FIELDS = (
     "pose_total_matches",
     "samples",
 )
+
+
+@dataclass(frozen=True)
+class AuxiliaryPosePredictions:
+    """Pose predictions from opt-in intermediate detector supervision."""
+
+    # Layer numbers are one-based in logs/configuration for consistency with
+    # the six-layer detector description used by training documentation.
+    layers: tuple[int, ...]
+    predictions: tuple[CADPosePredictions, ...]
+
+    def __post_init__(self) -> None:
+        if len(self.layers) != len(self.predictions):
+            raise ValueError("Auxiliary pose layers and predictions must have equal length")
+
+    def index_candidates(self, index: torch.Tensor) -> "AuxiliaryPosePredictions":
+        return AuxiliaryPosePredictions(
+            self.layers,
+            tuple(prediction.index_candidates(index) for prediction in self.predictions),
+        )
 
 
 @dataclass(frozen=True)
@@ -871,6 +893,27 @@ def parse_ref_view_ids(value: str) -> List[str]:
     return ids
 
 
+def parse_pose_aux_layer_indices(value: str, num_layers: int) -> tuple[int, ...]:
+    """Parse one-based auxiliary layers and return zero-based detector indices."""
+
+    try:
+        layers = tuple(int(part.strip()) for part in value.split(",") if part.strip())
+    except ValueError as exc:
+        raise ValueError("--pose_aux_layers must be a comma-separated integer list") from exc
+    if not layers:
+        raise ValueError("--pose_aux_layers must contain at least one layer")
+    if len(set(layers)) != len(layers):
+        raise ValueError("--pose_aux_layers must not contain duplicates")
+    # The final detector layer already receives the primary loss. Auxiliary
+    # supervision is intentionally restricted to earlier query states.
+    if any(layer < 1 or layer >= num_layers for layer in layers):
+        raise ValueError(
+            f"--pose_aux_layers must be between 1 and {num_layers - 1}; "
+            f"layer {num_layers} is the primary output"
+        )
+    return tuple(layer - 1 for layer in layers)
+
+
 def reference_view_id_candidates(ref_id: str) -> List[str]:
     """Return compatible padded and unpadded spellings for a numeric view ID."""
 
@@ -1061,7 +1104,10 @@ def generate_detections_train(
     adjusted_intrinsics_b33: Optional[torch.Tensor] = None,
     model_image_size_wh: Optional[Tuple[int, int]] = None,
     return_pose: bool = False,
+    pose_aux_layer_indices: tuple[int, ...] = (),
 ):
+    if pose_aux_layer_indices and not return_pose:
+        raise ValueError("Intermediate pose outputs require return_pose=True")
     lowres_imgenc_bchw, hiresx2_imgenc_bchw, hiresx4_imgenc_bchw = encoded_image_features_list
     no_exemplars = encoded_exemplars_bnc.shape[1] == 0
     if no_exemplars:
@@ -1085,18 +1131,44 @@ def generate_detections_train(
             cad_effective_surface_centroid_m_b3,
             adjusted_intrinsics_b33,
             model_image_size_wh,
+            encoded_exemplars_bnc,
+            exemplar_padding_mask_bn,
         )
         pose_predictions = pose_predictions.with_translation(adjusted_intrinsics_b33, model_image_size_wh)
-        return blk_masks, blk_box, blk_score, blk_score_logits, blk_pres, pose_predictions
+        outputs = (blk_masks, blk_box, blk_score, blk_score_logits, blk_pres, pose_predictions)
+        if pose_aux_layer_indices:
+            return (*outputs, AuxiliaryPosePredictions((), ()))
+        return outputs
 
     fused_imgexm_tokens_bchw = detmodel.image_exemplar_fusion(
         lowres_imgenc_bchw,
         encoded_exemplars_bnc,
         exemplar_padding_mask_bn,
     )
-    enc_det_tokens_bnc, boxes_xy1xy2_bn22, det_scores_bn, det_scores_logits_bn, pres_scores = detmodel.exemplar_detector(
-        fused_imgexm_tokens_bchw, encoded_exemplars_bnc, exemplar_padding_mask_bn
+    detector_outputs = detmodel.exemplar_detector(
+        fused_imgexm_tokens_bchw,
+        encoded_exemplars_bnc,
+        exemplar_padding_mask_bn,
+        intermediate_layer_indices=pose_aux_layer_indices or None,
     )
+    if pose_aux_layer_indices:
+        (
+            enc_det_tokens_bnc,
+            boxes_xy1xy2_bn22,
+            det_scores_bn,
+            det_scores_logits_bn,
+            pres_scores,
+            intermediate_detector_outputs,
+        ) = detector_outputs
+    else:
+        (
+            enc_det_tokens_bnc,
+            boxes_xy1xy2_bn22,
+            det_scores_bn,
+            det_scores_logits_bn,
+            pres_scores,
+        ) = detector_outputs
+        intermediate_detector_outputs = ()
 
     pose_predictions = None
     # Handle pose prediction for detected candidates.
@@ -1114,8 +1186,27 @@ def generate_detections_train(
             cad_effective_surface_centroid_m_b3,
             adjusted_intrinsics_b33,
             model_image_size_wh,
+            encoded_exemplars_bnc,
+            exemplar_padding_mask_bn,
         )
         pose_predictions = pose_predictions.with_translation(adjusted_intrinsics_b33, model_image_size_wh)
+
+    auxiliary_pose_predictions = AuxiliaryPosePredictions(
+        layers=tuple(output.layer_index + 1 for output in intermediate_detector_outputs),
+        predictions=tuple(
+            detmodel.cad_pose_head(
+                output.detection_tokens_bnc,
+                output.boxes_xy1xy2_bn22,
+                cad_dimensions_m_b3,
+                cad_effective_surface_centroid_m_b3,
+                adjusted_intrinsics_b33,
+                model_image_size_wh,
+                encoded_exemplars_bnc,
+                exemplar_padding_mask_bn,
+            ).with_translation(adjusted_intrinsics_b33, model_image_size_wh)
+            for output in intermediate_detector_outputs
+        ),
+    )
 
     if detection_filter_threshold > 1e-3:
         if det_scores_bn.shape[0] != 1:
@@ -1127,6 +1218,8 @@ def generate_detections_train(
         det_scores_logits_bn = det_scores_logits_bn[:, ok_filter]
         if pose_predictions is not None:
             pose_predictions = pose_predictions.index_candidates(ok_filter)
+        if auxiliary_pose_predictions.predictions:
+            auxiliary_pose_predictions = auxiliary_pose_predictions.index_candidates(ok_filter)
 
     mask_preds_bnhw, _ = detmodel.exemplar_segmentation(
         enc_det_tokens_bnc,
@@ -1137,7 +1230,12 @@ def generate_detections_train(
         exemplar_padding_mask_bn,
     )
     outputs = (mask_preds_bnhw, boxes_xy1xy2_bn22, det_scores_bn, det_scores_logits_bn, pres_scores)
-    return (*outputs, pose_predictions) if return_pose else outputs
+    if not return_pose:
+        return outputs
+    pose_outputs = (*outputs, pose_predictions)
+    if pose_aux_layer_indices:
+        return (*pose_outputs, auxiliary_pose_predictions)
+    return pose_outputs
 
 
 def encode_detection_image_no_infer(
@@ -1589,6 +1687,42 @@ def filter_pose_matches_by_iou(
         if float(iou_gt_prediction[gt_index, prediction_index].detach()) >= min_iou:
             filtered.append((gt_index, prediction_index))
     return filtered
+
+
+def compute_auxiliary_pose_loss(
+    predictions: AuxiliaryPosePredictions,
+    pose_targets: Sequence[CADPoseTarget],
+    pose_matches: Sequence[Tuple[int, int]],
+    pose_config: CADPoseLossConfig,
+    *,
+    batch_index: int,
+) -> Optional[torch.Tensor]:
+    """Average geometric pose loss across intermediate layers.
+
+    Candidate assignments come from the final masks and are reused unchanged.
+    Pose-quality supervision and its expensive full-placement target are omitted
+    from auxiliary layers; the caller applies the configured total aux weight.
+    """
+
+    auxiliary_config = replace(pose_config, quality_weight=0.0)
+    layer_totals: List[torch.Tensor] = []
+    for layer, layer_predictions in zip(predictions.layers, predictions.predictions):
+        layer_losses = compute_cad_pose_losses(
+            layer_predictions,
+            pose_targets,
+            pose_matches,
+            auxiliary_config,
+            batch_index=batch_index,
+            compute_expensive_metrics=False,
+        )
+        if layer_losses is None:
+            continue
+        if not torch.isfinite(layer_losses.total):
+            raise FloatingPointError(
+                f"Non-finite auxiliary CAD pose loss at detector layer {layer}"
+            )
+        layer_totals.append(layer_losses.total)
+    return torch.stack(layer_totals).mean() if layer_totals else None
 
 
 def pad_exemplar_batch(
@@ -2100,6 +2234,40 @@ def parse_args() -> argparse.Namespace:
         help="Fusion/detector LR multiplier relative to --lr in pose_stage=joint_lite.",
     )
     parser.add_argument(
+        "--enable_cad_prompt",
+        action="store_true",
+        help=(
+            "Apply pose-only cross-attention from detector queries to the padded CAD "
+            "exemplar tokens; segmentation continues to consume the original queries."
+        ),
+    )
+    parser.add_argument(
+        "--pose_prompt_lr_scale",
+        type=float,
+        default=1.0,
+        help="CAD prompt-adapter LR multiplier relative to --lr.",
+    )
+    parser.add_argument(
+        "--pose_deep_supervision",
+        action="store_true",
+        help=(
+            "Apply the shared pose head to selected intermediate detector layers using "
+            "the final mask assignment. Inference remains final-layer only."
+        ),
+    )
+    parser.add_argument(
+        "--pose_aux_layers",
+        type=str,
+        default="3,4,5",
+        help="One-based detector layers receiving auxiliary pose supervision.",
+    )
+    parser.add_argument(
+        "--pose_aux_loss_weight",
+        type=float,
+        default=0.5,
+        help="Total weight on the mean auxiliary pose loss.",
+    )
+    parser.add_argument(
         "--joint_bbox_weight",
         type=float,
         default=0.25,
@@ -2155,6 +2323,12 @@ def parse_args() -> argparse.Namespace:
         help="IoU threshold for mask NMS used in metrics/debug (<=0 disables NMS).",
     )
     parser.add_argument("--grad_accum", type=int, default=12)
+    parser.add_argument(
+        "--grad_clip_norm",
+        type=float,
+        default=0.0,
+        help="Clip the global gradient norm before optimizer steps; <=0 disables clipping.",
+    )
     parser.add_argument("--log_every", type=int, default=4)
     parser.add_argument("--save_every", type=int, default=1)
     parser.add_argument(
@@ -2329,19 +2503,15 @@ def append_pose_metric_rows(
     )
 
 
-def load_finetune_checkpoint(
-    checkpoint_path: Path,
+def restore_finetune_checkpoint(
+    checkpoint: Dict[str, object],
     detmodel,
     optimizer: Optional[torch.optim.Optimizer],
-    device: torch.device,
     load_optimizer: bool = True,
     exemplar_view_mode: str = "none",
 ) -> Dict[str, object]:
-    # Finetune checkpoints are full, trusted training-state files produced by
-    # this script (modules, optimizer, arguments, provenance, and NumPy scalar
-    # configuration values), not tensor-only weight bundles. PyTorch 2.6+
-    # defaults to weights_only=True, which rejects that intentional metadata.
-    checkpoint = torch.load(str(checkpoint_path), map_location=device, weights_only=False)
+    """Restore a trusted, already-loaded fine-tuning checkpoint."""
+
     required = {
         "image_exemplar_fusion": detmodel.image_exemplar_fusion,
         "exemplar_detector": detmodel.exemplar_detector,
@@ -2380,22 +2550,65 @@ def load_finetune_checkpoint(
         raise KeyError("Checkpoint is missing its trained exemplar-view adapter state")
     if "cad_pose_head" in checkpoint:
         checkpoint_version = int(checkpoint.get("cad_pose_head_architecture_version", 1))
-        if checkpoint_version != detmodel.cad_pose_head.architecture_version:
-            if checkpoint_pose_enabled or checkpoint.get("pose_config") is not None:
-                raise ValueError(
-                    "CAD pose-head checkpoint architecture version "
-                    f"{checkpoint_version} is incompatible with model version "
-                    f"{detmodel.cad_pose_head.architecture_version}; retrain the pose head"
+        supported_versions = {
+            detmodel.cad_pose_head.architecture_version,
+            detmodel.cad_pose_head.legacy_promptless_architecture_version,
+        }
+        if checkpoint_version in supported_versions:
+            checkpoint_config = checkpoint.get("cad_pose_head_architecture_config")
+            if (
+                checkpoint_version == detmodel.cad_pose_head.architecture_version
+                and checkpoint_config is not None
+                and checkpoint_config != detmodel.cad_pose_head.architecture_config()
+            ):
+                raise ValueError("Checkpoint CAD pose-head architecture config is incompatible")
+            migrated = detmodel.cad_pose_head.load_checkpoint_state_dict(
+                checkpoint["cad_pose_head"],
+                checkpoint_version,
+            )
+            if migrated:
+                warnings.warn(
+                    "Migrated promptless CAD pose head v3 to v4; the new pose-only "
+                    "CAD prompt adapter starts from fresh initialization."
                 )
-            warnings.warn("Ignoring an incompatible untrained pose head from a segmentation checkpoint")
+        elif checkpoint_pose_enabled or checkpoint.get("pose_config") is not None:
+            raise ValueError(
+                "CAD pose-head checkpoint architecture version "
+                f"{checkpoint_version} is incompatible with model version "
+                f"{detmodel.cad_pose_head.architecture_version}; retrain the pose head"
+            )
         else:
-            detmodel.cad_pose_head.load_state_dict(checkpoint["cad_pose_head"])
+            warnings.warn("Ignoring an incompatible untrained pose head from a segmentation checkpoint")
     if optimizer is not None and load_optimizer and "optimizer" in checkpoint:
         try:
             optimizer.load_state_dict(checkpoint["optimizer"])
         except ValueError as exc:
             warnings.warn(f"Optimizer state is incompatible with the selected training stage; starting fresh: {exc}")
     return checkpoint
+
+
+def load_finetune_checkpoint(
+    checkpoint_path: Path,
+    detmodel,
+    optimizer: Optional[torch.optim.Optimizer],
+    device: torch.device,
+    load_optimizer: bool = True,
+    exemplar_view_mode: str = "none",
+) -> Dict[str, object]:
+    """Load and restore a trusted fine-tuning checkpoint from disk."""
+
+    # Fine-tuning checkpoints are full, trusted training-state files produced
+    # by this script (modules, optimizer, arguments, provenance, and NumPy
+    # scalar configuration values), not tensor-only weight bundles. PyTorch
+    # 2.6+ defaults to weights_only=True, which rejects that metadata.
+    checkpoint = torch.load(str(checkpoint_path), map_location=device, weights_only=False)
+    return restore_finetune_checkpoint(
+        checkpoint,
+        detmodel,
+        optimizer,
+        load_optimizer=load_optimizer,
+        exemplar_view_mode=exemplar_view_mode,
+    )
 
 
 def load_detector_initialization_checkpoint(
@@ -2457,6 +2670,7 @@ def build_finetune_checkpoint(
         "exemplar_segmentation": detmodel.exemplar_segmentation.state_dict(),
         "cad_pose_head": detmodel.cad_pose_head.state_dict(),
         "cad_pose_head_architecture_version": detmodel.cad_pose_head.architecture_version,
+        "cad_pose_head_architecture_config": detmodel.cad_pose_head.architecture_config(),
         "exemplar_view_pose_encoder": detmodel.exemplar_view_pose_encoder.state_dict(),
         "exemplar_view_pose_architecture_version": (
             detmodel.exemplar_view_pose_encoder.architecture_version
@@ -3208,6 +3422,9 @@ def main() -> None:
             raise ValueError(f"--{name} must be in [0, 1], got {value}")
     for name in (
         "joint_shared_lr_scale",
+        "pose_prompt_lr_scale",
+        "pose_aux_loss_weight",
+        "grad_clip_norm",
         "joint_bbox_weight",
         "joint_objectness_weight",
         "joint_mask_weight",
@@ -3217,6 +3434,10 @@ def main() -> None:
             raise ValueError(f"--{name} must be nonnegative, got {value}")
     if args.pose_stage == "joint_lite" and not args.enable_pose:
         raise ValueError("--pose_stage joint_lite requires --enable_pose")
+    if args.enable_cad_prompt and not args.enable_pose:
+        raise ValueError("--enable_cad_prompt requires --enable_pose")
+    if args.pose_deep_supervision and not args.enable_pose:
+        raise ValueError("--pose_deep_supervision requires --enable_pose")
 
     manifest_path = Path(args.dataset_manifest).expanduser().resolve() if args.dataset_manifest else None
     data_root = Path(args.data_root).expanduser().resolve() if args.data_root else None
@@ -3271,6 +3492,14 @@ def main() -> None:
     base_model.to(device=device, dtype=dtype)
     detmodel = base_model.make_detector_model()
     detmodel.to(device=device, dtype=dtype)
+    pose_aux_layer_indices = (
+        parse_pose_aux_layer_indices(
+            args.pose_aux_layers,
+            len(detmodel.exemplar_detector.fusion_layers),
+        )
+        if args.pose_deep_supervision
+        else ()
+    )
 
     freeze_module(detmodel.text_encoder)
     if args.enable_pose:
@@ -3297,6 +3526,8 @@ def main() -> None:
         unfreeze_module(detmodel.exemplar_segmentation)
     if args.enable_pose:
         unfreeze_module(detmodel.cad_pose_head)
+        if not args.enable_cad_prompt:
+            freeze_module(detmodel.cad_pose_head.cad_prompt_adapter)
     else:
         freeze_module(detmodel.cad_pose_head)
     if args.enable_pose and args.exemplar_view_mode != "none":
@@ -3316,33 +3547,63 @@ def main() -> None:
     trainable_params_count = sum(p.numel() for p in detmodel.parameters() if p.requires_grad)
     print(f"Parameter counts: total={total_params:,} trainable={trainable_params_count:,}")
 
-    if args.enable_pose and args.pose_stage == "joint_lite":
+    if args.enable_pose:
         shared_params = [
             p
-            for module in (detmodel.image_exemplar_fusion, detmodel.exemplar_detector)
+            for module in (
+                detmodel.image_exemplar_fusion,
+                detmodel.exemplar_detector,
+                detmodel.exemplar_segmentation,
+            )
             for p in module.parameters()
             if p.requires_grad
         ]
-        pose_params = [p for p in detmodel.cad_pose_head.parameters() if p.requires_grad]
+        prompt_params = [
+            p for p in detmodel.cad_pose_head.cad_prompt_adapter.parameters()
+            if p.requires_grad
+        ]
+        prompt_param_ids = {id(parameter) for parameter in prompt_params}
+        pose_params = [
+            p for p in detmodel.cad_pose_head.parameters()
+            if p.requires_grad and id(p) not in prompt_param_ids
+        ]
         pose_params.extend(
             p for p in detmodel.exemplar_view_pose_encoder.parameters() if p.requires_grad
         )
-        optimizer = torch.optim.AdamW(
-            [
+        shared_lr = (
+            args.lr * args.joint_shared_lr_scale
+            if args.pose_stage == "joint_lite"
+            else args.lr
+        )
+        optimizer_groups = []
+        if shared_params:
+            optimizer_groups.append(
+                {"params": shared_params, "lr": shared_lr, "name": "shared_detection"}
+            )
+        if pose_params:
+            optimizer_groups.append(
+                {"params": pose_params, "lr": args.lr, "name": "pose_and_view"}
+            )
+        if prompt_params:
+            optimizer_groups.append(
                 {
-                    "params": shared_params,
-                    "lr": args.lr * args.joint_shared_lr_scale,
-                    "name": "fusion_detector",
-                },
-                {"params": pose_params, "lr": args.lr, "name": "pose_and_view_adapter"},
-            ],
+                    "params": prompt_params,
+                    "lr": args.lr * args.pose_prompt_lr_scale,
+                    "name": "cad_prompt_adapter",
+                }
+            )
+        optimizer = torch.optim.AdamW(
+            optimizer_groups,
             lr=args.lr,
             weight_decay=args.weight_decay,
         )
         print(
-            "Joint-lite optimizer: "
-            f"fusion/detector_lr={args.lr * args.joint_shared_lr_scale:.3g} "
-            f"pose_and_view_adapter_lr={args.lr:.3g}; segmentation decoder frozen"
+            "Pose optimizer: "
+            + ", ".join(
+                f"{group['name']}_lr={float(group['lr']):.3g}"
+                for group in optimizer_groups
+            )
+            + f"; segmentation_decoder={'trainable' if any(p.requires_grad for p in detmodel.exemplar_segmentation.parameters()) else 'frozen'}"
         )
     else:
         optimizer = torch.optim.AdamW(trainable_params, lr=args.lr, weight_decay=args.weight_decay)
@@ -3393,6 +3654,13 @@ def main() -> None:
         print(
             f"Resuming from {resume_path} (epoch={ckpt_epoch}, global_step={global_step}, batch_step={batch_step}). "
             f"Starting at epoch {start_epoch}."
+        )
+    detmodel.cad_pose_head.set_cad_prompt_enabled(args.enable_cad_prompt)
+    if args.enable_pose:
+        print(
+            f"Pose features: cad_prompt={args.enable_cad_prompt}, "
+            f"deep_supervision_layers={tuple(index + 1 for index in pose_aux_layer_indices) or 'none'}, "
+            f"aux_weight={args.pose_aux_loss_weight if pose_aux_layer_indices else 0.0:g}"
         )
     if args.resume_in_place and args.resume_path:
         run_dir = str(resolve_run_dir_from_checkpoint(Path(args.resume_path)))
@@ -4018,6 +4286,7 @@ def main() -> None:
             batch_losses: List[torch.Tensor] = []
             batch_top_ious: List[float] = []
             batch_pose_components: List[object] = []
+            batch_pose_aux_losses: List[torch.Tensor] = []
             batch_detection_components: List[MultiGTDetectionLosses] = []
             batch_pose_match_ious: List[float] = []
             batch_pose_eligible_targets = 0
@@ -4085,13 +4354,27 @@ def main() -> None:
                     exemplar_batch,
                     detection_filter_threshold=args.det_filter,
                     exemplar_padding_mask_bn=padding_mask,
+                    pose_aux_layer_indices=pose_aux_layer_indices,
                     **pose_kwargs,
                 )
                 if args.enable_pose:
-                    mask_preds, box_preds, det_scores, det_scores_logits, _, pose_predictions = detection_outputs
+                    if pose_aux_layer_indices:
+                        (
+                            mask_preds,
+                            box_preds,
+                            det_scores,
+                            det_scores_logits,
+                            _,
+                            pose_predictions,
+                            auxiliary_pose_predictions,
+                        ) = detection_outputs
+                    else:
+                        mask_preds, box_preds, det_scores, det_scores_logits, _, pose_predictions = detection_outputs
+                        auxiliary_pose_predictions = AuxiliaryPosePredictions((), ())
                 else:
                     mask_preds, box_preds, det_scores, det_scores_logits, _ = detection_outputs
                     pose_predictions = None
+                    auxiliary_pose_predictions = AuxiliaryPosePredictions((), ())
                 if mask_preds.shape[1] == 0:
                     continue
 
@@ -4186,6 +4469,17 @@ def main() -> None:
                                 raise FloatingPointError("Non-finite CAD pose loss")
                             loss = loss + pose_losses.total
                             batch_pose_components.append(pose_losses)
+                            if auxiliary_pose_predictions.predictions:
+                                auxiliary_mean = compute_auxiliary_pose_loss(
+                                    auxiliary_pose_predictions,
+                                    pose_targets,
+                                    pose_matches,
+                                    pose_config,
+                                    batch_index=local_idx,
+                                )
+                                if auxiliary_mean is not None:
+                                    loss = loss + args.pose_aux_loss_weight * auxiliary_mean
+                                    batch_pose_aux_losses.append(auxiliary_mean)
                     # Head-only training can have no accepted pose match after
                     # IoU gating. Its frozen detection anchor then has no
                     # trainable graph, so omit that image from backward.
@@ -4256,6 +4550,16 @@ def main() -> None:
             batch_step += 1
             global_step += 1
             if global_step % args.grad_accum == 0:
+                if args.grad_clip_norm > 0:
+                    torch.nn.utils.clip_grad_norm_(
+                        [
+                            parameter
+                            for group in optimizer.param_groups
+                            for parameter in group["params"]
+                            if parameter.grad is not None
+                        ],
+                        args.grad_clip_norm,
+                    )
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
 
@@ -4303,6 +4607,10 @@ def main() -> None:
                 pose_quality_loss=(
                     float(np.mean([value.quality.detach().float().item() for value in batch_pose_components]))
                     if batch_pose_components else ""
+                ),
+                pose_aux_loss=(
+                    float(np.mean([value.detach().float().item() for value in batch_pose_aux_losses]))
+                    if batch_pose_aux_losses else ""
                 ),
                 rotation_error_deg=(
                     float(
@@ -4371,6 +4679,10 @@ def main() -> None:
                         f" pose_matches={batch_pose_accepted_matches}/{batch_pose_total_matches} "
                         f"accepted_iou={float(np.mean(batch_pose_match_ious)):.3f}"
                         if batch_pose_match_ious else ""
+                    )
+                    + (
+                        f" pose_aux={float(np.mean([value.detach().float().item() for value in batch_pose_aux_losses])):.4f}"
+                        if batch_pose_aux_losses else ""
                     )
                 )
                 save_path = str(checkpoints_dir / "finetune.pth")

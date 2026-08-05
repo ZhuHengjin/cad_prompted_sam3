@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
+
 import torch
 import torch.nn as nn
 from torch import Tensor
@@ -15,13 +17,81 @@ class _PredictionBranch(nn.Sequential):
         super().__init__(nn.Linear(hidden_dim, hidden_dim), nn.GELU(), nn.Linear(hidden_dim, output_dim))
 
 
+class CADPromptCrossAttention(nn.Module):
+    """Pose-only residual attention from detection queries to CAD prompt tokens."""
+
+    def __init__(
+        self,
+        token_dim: int,
+        num_heads: int = 8,
+        initial_gate: float = 0.1,
+    ) -> None:
+        super().__init__()
+        if token_dim % num_heads != 0:
+            raise ValueError("token_dim must be divisible by num_heads")
+        if initial_gate < 0:
+            raise ValueError("initial_gate must be nonnegative")
+        self.query_norm = nn.LayerNorm(token_dim)
+        self.prompt_norm = nn.LayerNorm(token_dim)
+        self.cross_attention = nn.MultiheadAttention(
+            token_dim,
+            num_heads,
+            dropout=0.0,
+            batch_first=True,
+        )
+        self.gate = nn.Parameter(torch.tensor(float(initial_gate)))
+
+    def forward(
+        self,
+        detection_tokens_bnc: Tensor,
+        cad_prompt_tokens_bkc: Tensor | None,
+        cad_prompt_padding_mask_bk: Tensor | None = None,
+    ) -> Tensor:
+        """Return pose-adapted queries without mutating the detector tokens."""
+
+        if cad_prompt_tokens_bkc is None or cad_prompt_tokens_bkc.shape[1] == 0:
+            return detection_tokens_bnc
+        if cad_prompt_tokens_bkc.ndim != 3:
+            raise ValueError("cad_prompt_tokens_bkc must have shape BxKxC")
+        batch, _, token_dim = detection_tokens_bnc.shape
+        if cad_prompt_tokens_bkc.shape[0] != batch:
+            raise ValueError("CAD prompt and detection tokens must share the batch dimension")
+        if cad_prompt_tokens_bkc.shape[2] != token_dim:
+            raise ValueError("CAD prompt and detection tokens must share the token dimension")
+        if cad_prompt_padding_mask_bk is not None:
+            expected_mask_shape = cad_prompt_tokens_bkc.shape[:2]
+            if cad_prompt_padding_mask_bk.shape != expected_mask_shape:
+                raise ValueError(
+                    "cad_prompt_padding_mask_bk must match the CAD prompt token dimensions"
+                )
+            cad_prompt_padding_mask_bk = cad_prompt_padding_mask_bk.to(
+                device=detection_tokens_bnc.device,
+                dtype=torch.bool,
+            )
+            if torch.any(cad_prompt_padding_mask_bk.all(dim=1)):
+                raise ValueError("Every batch item must contain at least one unpadded CAD prompt token")
+
+        cad_prompt_tokens_bkc = cad_prompt_tokens_bkc.to(detection_tokens_bnc)
+        prompt = self.prompt_norm(cad_prompt_tokens_bkc)
+        residual, _ = self.cross_attention(
+            self.query_norm(detection_tokens_bnc),
+            prompt,
+            prompt,
+            key_padding_mask=cad_prompt_padding_mask_bk,
+            need_weights=False,
+        )
+        return detection_tokens_bnc + self.gate.to(residual) * residual
+
+
 class SAMV3CADPoseHead(nn.Module):
     """Predict surface-centroid projection/depth, 6-D rotation, and pose quality."""
 
-    architecture_version = 3
+    architecture_version = 4
+    legacy_promptless_architecture_version = 3
     dimension_log_mean: Tensor
     dimension_log_std: Tensor
     pose_score_temperature: Tensor
+    cad_prompt_enabled: Tensor
 
     def __init__(
         self,
@@ -30,12 +100,26 @@ class SAMV3CADPoseHead(nn.Module):
         dimension_log_mean: tuple[float, float, float] = (0.0, 0.0, 0.0),
         dimension_log_std: tuple[float, float, float] = (1.0, 1.0, 1.0),
         pose_score_temperature: float = 1.0,
+        cad_prompt_num_heads: int = 8,
+        cad_prompt_initial_gate: float = 0.1,
     ) -> None:
         super().__init__()
         if any(std <= 0 for std in dimension_log_std):
             raise ValueError("Dimension log standard deviations must be positive")
         if pose_score_temperature <= 0:
             raise ValueError("Pose-score calibration temperature must be positive")
+        self.token_dim = int(token_dim)
+        self.hidden_dim = int(hidden_dim)
+        self.cad_prompt_num_heads = int(cad_prompt_num_heads)
+        self.cad_prompt_initial_gate = float(cad_prompt_initial_gate)
+        self.cad_prompt_adapter = CADPromptCrossAttention(
+            token_dim,
+            num_heads=cad_prompt_num_heads,
+            initial_gate=cad_prompt_initial_gate,
+        )
+        # Prompting is explicit so loading an older pose checkpoint cannot
+        # silently activate a freshly initialized adapter at inference.
+        self.register_buffer("cad_prompt_enabled", torch.tensor(False, dtype=torch.bool))
         # The shared pose representation is scale invariant: it sees the
         # detection token, normalized box center/extent, and CAD aspect ratios.
         # Absolute metric size and camera calibration are reserved for depth.
@@ -66,6 +150,52 @@ class SAMV3CADPoseHead(nn.Module):
         self.register_buffer("dimension_log_std", torch.tensor(dimension_log_std, dtype=torch.float32))
         self.register_buffer("pose_score_temperature", torch.tensor(float(pose_score_temperature), dtype=torch.float32))
 
+    def architecture_config(self) -> dict[str, int | float]:
+        return {
+            "token_dim": self.token_dim,
+            "hidden_dim": self.hidden_dim,
+            "cad_prompt_num_heads": self.cad_prompt_num_heads,
+            "cad_prompt_initial_gate": self.cad_prompt_initial_gate,
+        }
+
+    def set_cad_prompt_enabled(self, enabled: bool) -> None:
+        self.cad_prompt_enabled.fill_(bool(enabled))
+
+    def load_checkpoint_state_dict(
+        self,
+        state_dict: Mapping[str, Tensor],
+        architecture_version: int,
+    ) -> bool:
+        """Load a native checkpoint or migrate the promptless v3 pose head.
+
+        Returns ``True`` when a v3 checkpoint was migrated. Only the newly
+        introduced CAD-prompt state may be absent during that migration.
+        """
+
+        if architecture_version == self.architecture_version:
+            self.load_state_dict(state_dict)
+            return False
+        if architecture_version != self.legacy_promptless_architecture_version:
+            raise ValueError(
+                "CAD pose-head checkpoint architecture version "
+                f"{architecture_version} is incompatible with model version "
+                f"{self.architecture_version}"
+            )
+
+        incompatible = self.load_state_dict(state_dict, strict=False)
+        allowed_missing = {"cad_prompt_enabled"}
+        allowed_missing.update(
+            f"cad_prompt_adapter.{key}"
+            for key in self.cad_prompt_adapter.state_dict()
+        )
+        if set(incompatible.missing_keys) != allowed_missing or incompatible.unexpected_keys:
+            raise ValueError(
+                "Pose-head v3 migration found incompatible state keys: "
+                f"missing={incompatible.missing_keys}, unexpected={incompatible.unexpected_keys}"
+            )
+        self.set_cad_prompt_enabled(False)
+        return True
+
     def set_dimension_statistics(self, mean: Tensor, std: Tensor) -> None:
         if mean.numel() != 3 or std.numel() != 3 or torch.any(std <= 0):
             raise ValueError("Dimension log statistics must contain three values with positive std")
@@ -86,6 +216,7 @@ class SAMV3CADPoseHead(nn.Module):
         camera_intrinsics_b33: Tensor,
         image_size_wh: tuple[int, int],
         cad_geometry_tokens_bkc: Tensor | None = None,
+        cad_geometry_padding_mask_bk: Tensor | None = None,
     ) -> CADPosePredictions:
         """Predict a pose for each detection candidate in a batch.
 
@@ -94,7 +225,6 @@ class SAMV3CADPoseHead(nn.Module):
         effective metric dimensions and normalized camera intrinsics condition
         depth only.
         """
-        del cad_geometry_tokens_bkc  # Reserved by the baseline interface.
         # Validate the leading batch/candidate dimensions before combining inputs.
         if detection_tokens_bnc.ndim != 3:
             raise ValueError("detection_tokens_bnc must have shape BxNxC")
@@ -122,6 +252,14 @@ class SAMV3CADPoseHead(nn.Module):
         )
         camera_intrinsics_b33 = camera_intrinsics_b33.to(detection_tokens_bnc)
 
+        pose_tokens_bnc = detection_tokens_bnc
+        if bool(self.cad_prompt_enabled):
+            pose_tokens_bnc = self.cad_prompt_adapter(
+                detection_tokens_bnc,
+                cad_geometry_tokens_bkc,
+                cad_geometry_padding_mask_bk,
+            )
+
         # Flatten the two box corners, then express the box as center and extent.
         boxes = boxes_xy1xy2_bn22.reshape(batch, candidates, 4)
         xy1, xy2 = boxes[..., :2], boxes[..., 2:]
@@ -138,7 +276,7 @@ class SAMV3CADPoseHead(nn.Module):
         ) / self.dimension_log_std.to(cad_dimensions_m_b3).clamp_min(1e-6)
         shape_features = shape_features.unsqueeze(1).expand(-1, candidates, -1)
         dimension_features = dimension_features.unsqueeze(1).expand(-1, candidates, -1)
-        shared = self.shared(torch.cat((detection_tokens_bnc, box_features, shape_features), dim=-1))
+        shared = self.shared(torch.cat((pose_tokens_bnc, box_features, shape_features), dim=-1))
 
         # Predict center correction in box-relative units. This keeps center
         # refinement equivariant to apparent object size and image resolution.

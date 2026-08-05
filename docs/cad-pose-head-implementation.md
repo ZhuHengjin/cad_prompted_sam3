@@ -84,7 +84,15 @@ confidence and pose confidence remain separate quantities.
 - the uniformly scaled CAD surface centroid with shape `B x 3`;
 - resize-adjusted camera intrinsics with shape `B x 3 x 3`;
 - the model input image size `(width, height)`;
-- an optional reserved CAD-geometry-token argument.
+- optional CAD exemplar/prompt tokens and their padding mask.
+
+When CAD prompting is enabled, a pre-normalized multi-head cross-attention
+adapter uses the detector candidates as queries and the CAD exemplar tokens as
+keys/values. Its output is a gated residual used only by the pose trunk. The
+segmentation decoder continues to receive the original detector tokens. The
+adapter gate starts at `0.1`; prompt enablement and adapter weights are stored
+in pose-head v4 checkpoints. Promptless v3 checkpoints migrate explicitly with
+the new adapter disabled until requested by the run configuration.
 
 Boxes are converted to normalized `(center_x, center_y, width, height)`. Log CAD
 dimensions are decomposed into scale-free aspect ratios and absolute log dimensions.
@@ -100,9 +108,8 @@ rotation branches.
 
 The surface centroid is fixed CAD metadata used after head prediction to
 convert centroid pose to the public AABB pose; it is not a learned feature or a
-network conditioning signal. The current baseline reserves the geometry-token
-input for future use but does not consume it. Network conditioning is through
-the exact metric CAD dimensions required by the dataset contract.
+network conditioning signal. Metric CAD dimensions retain their existing
+role, while the optional prompt attention supplies direct rendered-CAD evidence.
 
 ### Network outputs
 
@@ -461,6 +468,22 @@ Joint-lite adaptation adds:
 --no_resume_optimizer
 ```
 
+Pose-only CAD prompting and detector-layer deep supervision add:
+
+```text
+--enable_cad_prompt
+--pose_prompt_lr_scale
+--pose_deep_supervision
+--pose_aux_layers
+--pose_aux_loss_weight
+--grad_clip_norm
+```
+
+The default deep-supervision recipe uses layers 3–5 as auxiliaries and the
+ordinary layer-6 pose prediction as primary. All layers reuse final-mask
+assignment indices. Auxiliary losses are averaged, receive total weight `0.5`,
+and exclude pose-quality loss. Only layer 6 is used at inference.
+
 The following options are retained only for schema-v1/checkpoint
 compatibility:
 
@@ -525,7 +548,9 @@ parameters; otherwise the script warns and starts a new optimizer. Older
 segmentation checkpoints without `cad_pose_head` remain valid and initialize a
 new pose head; an incompatible untrained pose-head entry in a segmentation-only
 checkpoint is ignored. Architecture version 3 identifies the surface-centroid
-interface; trained pose heads from versions 1 or 2 must be retrained.
+interface without direct CAD prompting. Architecture version 4 adds the
+pose-only prompt adapter and migrates trained v3 state explicitly; trained pose
+heads from versions 1 or 2 must be retrained.
 
 The final validation calibration is saved as `checkpoints/finetune_calibrated.pth` so inference
 and test evaluation use the fitted pose-score temperature.

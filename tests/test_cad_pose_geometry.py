@@ -127,6 +127,70 @@ class CADPoseGeometryTests(unittest.TestCase):
         )
         torch.testing.assert_close(recovered_centroid, reconstructed.centroid_m_bn3)
 
+    def test_pose_only_cad_prompt_is_explicit_masked_and_differentiable(self):
+        torch.manual_seed(5)
+        head = SAMV3CADPoseHead(token_dim=8, hidden_dim=16)
+        tokens = torch.randn(1, 2, 8, requires_grad=True)
+        original_tokens = tokens.detach().clone()
+        boxes = torch.tensor([[[[0.1, 0.2], [0.4, 0.6]], [[0.2, 0.3], [0.5, 0.7]]]])
+        dimensions = torch.tensor([[0.01, 0.02, 0.03]])
+        centroid = torch.tensor([[0.001, -0.002, 0.003]])
+        intrinsics = torch.tensor([[[500.0, 0, 320.0], [0, 500.0, 240.0], [0, 0, 1.0]]])
+        prompt = torch.randn(1, 3, 8)
+        padding_mask = torch.tensor([[False, False, True]])
+
+        disabled = head(
+            tokens, boxes, dimensions, centroid, intrinsics, (640, 480), prompt, padding_mask
+        )
+        baseline = head(tokens, boxes, dimensions, centroid, intrinsics, (640, 480))
+        torch.testing.assert_close(disabled.log_depth_bn, baseline.log_depth_bn)
+
+        head.set_cad_prompt_enabled(True)
+        prompted = head(
+            tokens, boxes, dimensions, centroid, intrinsics, (640, 480), prompt, padding_mask
+        )
+        changed_padding = prompt.clone()
+        changed_padding[:, 2] = 1e4
+        prompted_with_changed_padding = head(
+            tokens,
+            boxes,
+            dimensions,
+            centroid,
+            intrinsics,
+            (640, 480),
+            changed_padding,
+            padding_mask,
+        )
+        torch.testing.assert_close(
+            prompted.log_depth_bn,
+            prompted_with_changed_padding.log_depth_bn,
+        )
+        self.assertFalse(torch.allclose(prompted.log_depth_bn, baseline.log_depth_bn))
+        self.assertTrue(torch.equal(tokens.detach(), original_tokens))
+
+        prompted.log_depth_bn.sum().backward()
+        attention_gradient = head.cad_prompt_adapter.cross_attention.in_proj_weight.grad
+        self.assertIsNotNone(attention_gradient)
+        self.assertGreater(float(attention_gradient.abs().sum()), 0.0)
+
+    def test_pose_head_migrates_promptless_v3_state(self):
+        torch.manual_seed(6)
+        source = SAMV3CADPoseHead(token_dim=8, hidden_dim=16)
+        legacy_state = {
+            key: value.clone()
+            for key, value in source.state_dict().items()
+            if key != "cad_prompt_enabled" and not key.startswith("cad_prompt_adapter.")
+        }
+        target = SAMV3CADPoseHead(token_dim=8, hidden_dim=16)
+        prompt_gate_before = target.cad_prompt_adapter.gate.detach().clone()
+
+        migrated = target.load_checkpoint_state_dict(legacy_state, 3)
+
+        self.assertTrue(migrated)
+        self.assertFalse(bool(target.cad_prompt_enabled))
+        torch.testing.assert_close(target.shared[0].weight, source.shared[0].weight)
+        torch.testing.assert_close(target.cad_prompt_adapter.gate, prompt_gate_before)
+
     def test_discrete_and_continuous_symmetries(self):
         identity = torch.eye(3)
         half_turn_z = torch.tensor([[-1.0, 0, 0], [0, -1.0, 0], [0, 0, 1.0]])
