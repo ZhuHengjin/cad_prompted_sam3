@@ -32,10 +32,49 @@ With base learning rate `--lr`, joint-lite configures:
 | Detector and candidate-token path | trainable | `lr * joint_shared_lr_scale` |
 | Segmentation decoder | frozen | — |
 | CAD pose head | trainable | `lr` |
+| Pose-only CAD prompt adapter | optional/trainable | `lr * pose_prompt_lr_scale` |
 
 The frozen segmentation decoder remains in the differentiable forward path.
 Mask loss can therefore anchor fusion and detector inputs without updating
 decoder parameters.
+
+## Combined CAD-prompt and deep-supervision run
+
+The combined Phase 1/2 run enables direct pose-only attention to the padded CAD
+exemplar tokens and supervises detector layers 3–5 in addition to the standard
+layer-6 prediction. The final mask assignment and candidate indices are reused
+for every auxiliary layer. Layer-6 pose loss retains weight `1.0`; the mean of
+layers 3–5 receives total weight `0.5`. Auxiliary pose quality is disabled, and
+only layer 6 runs at inference.
+
+The stronger optimizer recipe is:
+
+| Parameter group | Learning rate |
+| --- | ---: |
+| Fusion and detector | `3e-5` |
+| Existing pose head and reference-view encoder | `5e-5` |
+| New CAD prompt adapter | `1e-4` |
+
+This is expressed as `--lr 5e-5`, `--joint_shared_lr_scale 0.6`, and
+`--pose_prompt_lr_scale 2.0`. The segmentation decoder and image encoder remain
+frozen. Gradient clipping at norm `1.0` bounds the larger combined update.
+
+The repository launch script contains the resolved camera-checkpoint and ABC-v2
+defaults used for this run:
+
+```bash
+scripts/run_cad_pose_deep_prompt_tonight.sh
+```
+
+It continues the epoch-60 checkpoint through epoch 68 by default, producing
+eight training epochs with validation between epochs and after the final epoch.
+This is intended as a trend-detection run; extend from the best checkpoint only
+if pose geometry and IoU-qualified coverage are moving in the right direction.
+
+Override `DEVICE`, `FINAL_EPOCH`, `START_CHECKPOINT`, `DATA_ROOT`, `MODEL_PATH`,
+or `OUTPUT_DIR` through environment variables when needed. The script starts a
+fresh optimizer with `--no_resume_optimizer`; pose-head v3 is migrated to v4 and
+the new prompt adapter is initialized at the start of the run.
 
 ## Pose matching
 
@@ -163,3 +202,67 @@ a material coverage or segmentation-IoU regression. If coverage improves while
 conditional pose stays flat, localization was likely the bottleneck. If both
 remain flat, explicit CAD geometry features or reference-view pose conditioning
 are stronger next experiments.
+
+## Few-scene qualitative pose check
+
+Render the selected epoch-66 checkpoint on three lightweight validation scenes:
+
+```bash
+.venv/bin/python scripts/visualize_cad_pose_predictions.py
+```
+
+The default frames are `0017`, `0029`, and `0036` (eight eligible instances in
+total). Every matched instance gets its own directory containing separate PNGs:
+
+```text
+00_rgb.png
+01_mask_gt.png
+02_mask_pred.png
+03_dimensions_gt.png
+04_dimensions_pred.png
+05_orientation_gt.png
+06_orientation_pred.png
+07_surface_gt.png
+08_surface_pred.png
+09_mask_error.png
+10_exemplar_01.png ... 13_exemplar_04.png
+14_overview.png
+```
+
+The mask images are colored overlays on otherwise clean RGB images. Dimension
+views contain only the projected CAD box, orientation views contain only XYZ
+axes, and surface views contain only a deterministic subset of projected CAD
+surface points. The surface pair is included because it exposes irregular-shape
+and symmetry behavior that the dimension box cannot. `09_mask_error.png` shows
+true positives in green, false positives in magenta, and false negatives in
+orange. Four small reference exemplar renders are included for prompt context.
+`14_overview.png` combines everything into one large diagnostic sheet: GT and
+prediction views occupy the two large columns, while clean RGB, mask error,
+metrics, and the four smaller exemplars occupy a narrow context column.
+Per-match mask IoU, detection/pose scores, symmetry-safe point-set error,
+centroid error, translation error, and depth error are stored in the local
+`metrics.json` and run-level `summary.json` without obscuring the images.
+
+The output defaults to:
+
+```text
+runs/cad_pose_deep_prompt_joint_lite/run_20260805_020155/
+  pose_visualizations_epoch_066_separate/
+```
+
+Use explicit frames or a different checkpoint without changing the evaluator:
+
+```bash
+.venv/bin/python scripts/visualize_cad_pose_predictions.py \
+  --checkpoint runs/cad_pose_deep_prompt_joint_lite/run_20260805_020155/checkpoints/finetune.pth \
+  --frame 0017 \
+  --frame 0036
+```
+
+The command reads the checkpoint's model, manifest, dataset, reference-view,
+resize, CAD-prompt, and NMS settings and verifies the manifest checksum before
+inference. It uses the same mask NMS and one-to-one assignment as validation.
+Unmatched ground-truth instances and matches below the validation IoU threshold
+are retained and labeled instead of being silently omitted. Raw XYZ axes can
+look different for symmetry-equivalent poses, so prefer the projected point-set
+alignment and point-set metrics when judging symmetric CAD objects.
