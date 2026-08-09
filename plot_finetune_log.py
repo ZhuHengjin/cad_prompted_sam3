@@ -27,6 +27,7 @@ import matplotlib
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+from matplotlib.ticker import MultipleLocator
 
 
 REQUIRED_COLUMNS = {
@@ -49,6 +50,7 @@ OPTIONAL_METRIC_COLUMNS = (
     "pose_rotation_loss",
     "pose_full_set_loss",
     "pose_quality_loss",
+    "pose_aux_loss",
     "mean_surface_distance_norm",
     "p95_surface_distance_norm",
     "centroid_error_cm",
@@ -218,6 +220,19 @@ def finish_axis(axis, title: str, ylabel: str, xlabel: str) -> None:
         )
 
 
+def zoom_rate_axis(axis, plotted_values: list[float], *, minimum_span: float = 0.05) -> None:
+    """Tightly frame finite rate values while retaining a little visual margin."""
+
+    finite = [value for value in plotted_values if math.isfinite(value)]
+    if not finite:
+        return
+    low, high = min(finite), max(finite)
+    span = max(high - low, minimum_span)
+    margin = span * 0.12
+    midpoint = (low + high) / 2.0
+    axis.set_ylim(max(0.0, midpoint - span / 2.0 - margin), min(1.0, midpoint + span / 2.0 + margin))
+
+
 def plot_curves(
     batch_rows: list[MetricRow],
     epoch_rows: list[MetricRow],
@@ -226,7 +241,7 @@ def plot_curves(
     *,
     smooth_window: int = 25,
 ) -> None:
-    """Write a detailed eight-panel detection and point-set pose dashboard."""
+    """Write a detailed loss, detection, and point-set pose dashboard."""
 
     detection_evaluations = [
         row for row in evaluation_rows if str(row.get("phase")) in EVALUATION_PHASES
@@ -240,79 +255,112 @@ def plot_curves(
         if is_pose_evaluation_phase(str(row.get("phase")))
         and str(row.get("phase")) not in POSE_EVALUATION_PHASES
     ]
-    fig, axes = plt.subplots(4, 2, figsize=(16, 18), constrained_layout=True)
+    fig = plt.figure(figsize=(16, 20), constrained_layout=True)
+    grid = fig.add_gridspec(4, 2)
+    loss_axis = fig.add_subplot(grid[0, 0])
+    center_axis = fig.add_subplot(grid[0, 1])
+    pose_components_axis = fig.add_subplot(grid[1, 0])
+    rotation_loss_axis = fig.add_subplot(grid[1, 1])
+    translation_axis = fig.add_subplot(grid[2, 0])
+    placement_axis = fig.add_subplot(grid[2, 1])
+    detection_axis = fig.add_subplot(grid[3, 0])
+    pose_grid = grid[3, 1].subgridspec(2, 1, height_ratios=(1.0, 2.0), hspace=0.06)
+    pose_coverage_axis = fig.add_subplot(pose_grid[0])
+    pose_quality_axis = fig.add_subplot(pose_grid[1], sharex=pose_coverage_axis)
     fig.suptitle("SAM3 Point-Set Pose Fine-tuning Metrics", fontsize=16)
 
-    # Per-step total loss.
-    plot_batch_metric(
-        axes[0, 0], batch_rows, "loss", "total loss", "#2563eb", smooth_window, show_raw=True
-    )
-    finish_axis(axes[0, 0], f"Total Training Loss (moving average={smooth_window})", "loss", "global step")
+    # Epoch totals provide the directly comparable train/validation overview.
+    train_epochs, train_loss = values(epoch_rows, "avg_loss")
+    if train_loss:
+        loss_axis.plot(train_epochs, train_loss, "o-", color="#2563eb", linewidth=2, label="training loss")
+    eval_epochs, eval_loss = values(detection_evaluations, "loss")
+    if eval_loss:
+        loss_axis.plot(eval_epochs, eval_loss, "o-", color="#dc2626", linewidth=2, label="validation loss")
+    finish_axis(loss_axis, "Total Training vs Validation Loss", "loss", "epoch")
 
-    # Every trainable/logged pose component. Symlog keeps the tiny center loss visible.
+    # Center loss is much smaller than the other pose terms and needs its own scale.
+    plot_batch_metric(
+        center_axis,
+        batch_rows,
+        "pose_center_loss",
+        "center loss",
+        "#0891b2",
+        smooth_window,
+        show_raw=True,
+    )
+    finish_axis(
+        center_axis,
+        f"Pose Center Loss (moving average={smooth_window})",
+        "loss",
+        "global step",
+    )
+
+    # The remaining trainable/logged pose components have broadly comparable scales.
     for key, label, color in (
-        ("pose_center_loss", "center loss", "#0891b2"),
         ("pose_depth_loss", "depth loss", "#2563eb"),
-        ("pose_rotation_loss", "point-set rotation loss", "#dc2626"),
         ("pose_full_set_loss", "full-set loss (logged)", "#9333ea"),
         ("pose_quality_loss", "quality loss", "#ea580c"),
+        ("pose_aux_loss", "auxiliary pose loss", "#16a34a"),
     ):
-        plot_batch_metric(axes[0, 1], batch_rows, key, label, color, smooth_window)
-    axes[0, 1].set_yscale("symlog", linthresh=1e-4)
-    finish_axis(axes[0, 1], "Pose Loss Components", "loss (symlog)", "global step")
+        plot_batch_metric(pose_components_axis, batch_rows, key, label, color, smooth_window)
+    finish_axis(pose_components_axis, "Pose Loss Components (Other)", "loss", "global step")
+    pose_components_axis.set_ylim(0.0, 1.0)
+    pose_components_axis.yaxis.set_major_locator(MultipleLocator(0.1))
+    pose_components_axis.yaxis.set_minor_locator(MultipleLocator(0.05))
+    pose_components_axis.grid(which="minor", axis="y", alpha=0.12)
+
+    # Rotation loss gets a dedicated, automatically scaled axis so small trends remain visible.
+    plot_batch_metric(
+        rotation_loss_axis,
+        batch_rows,
+        "pose_rotation_loss",
+        "point-set rotation loss",
+        "#dc2626",
+        smooth_window,
+        show_raw=False,
+    )
+    finish_axis(
+        rotation_loss_axis,
+        f"Point-Set Rotation Loss (moving average={smooth_window})",
+        "loss",
+        "global step",
+    )
+    rotation_loss_axis.margins(y=0.12)
 
     # Translation is reconstructed from center and depth, so it is an error metric rather than a direct loss.
     for key, label, color in (
         ("centroid_error_cm", "surface-centroid error", "#7c3aed"),
         ("translation_error_cm", "CAD-origin translation error", "#dc2626"),
     ):
-        plot_batch_metric(axes[1, 0], batch_rows, key, label, color, smooth_window, show_raw=True)
-    finish_axis(axes[1, 0], "3D Translation Metrics", "error (cm)", "global step")
+        plot_batch_metric(translation_axis, batch_rows, key, label, color, smooth_window, show_raw=True)
+    finish_axis(translation_axis, "3D Translation Metrics", "error (cm)", "global step")
 
     plot_batch_metric(
-        axes[1, 1],
+        placement_axis,
         batch_rows,
         "mean_surface_distance_norm",
         "train mean surface distance",
-        "#9333ea",
+        "#2563eb",
         smooth_window,
         show_raw=True,
     )
     for key, label, color in (
         ("mean_surface_distance_norm", "validation mean", "#dc2626"),
-        ("p95_surface_distance_norm", "validation p95", "#ea580c"),
+        ("p95_surface_distance_norm", "validation p95", "#16a34a"),
     ):
         xs, ys = values(pose_evaluations, key, x_key="global_step")
         if ys:
-            axes[1, 1].plot(xs, ys, "o-", color=color, linewidth=1.8, label=label)
+            placement_axis.plot(xs, ys, "o-", color=color, linewidth=1.8, label=label)
     for key, label, color in (
-        ("mean_surface_distance_norm", "validation mean (IoU-filtered)", "#7f1d1d"),
-        ("p95_surface_distance_norm", "validation p95 (IoU-filtered)", "#9a3412"),
+        ("mean_surface_distance_norm", "validation mean (IoU-filtered)", "#9333ea"),
+        ("p95_surface_distance_norm", "validation p95 (IoU-filtered)", "#ea580c"),
     ):
         xs, ys = values(conditional_pose_evaluations, key, x_key="global_step")
         if ys:
-            axes[1, 1].plot(xs, ys, "o--", color=color, linewidth=1.5, label=label)
-    finish_axis(axes[1, 1], "Point-Set Placement Error", "normalized surface distance", "global step")
+            placement_axis.plot(xs, ys, "o--", color=color, linewidth=1.5, label=label)
+    finish_axis(placement_axis, "Point-Set Placement Error", "normalized surface distance", "global step")
 
-    plot_batch_metric(
-        axes[2, 0], batch_rows, "avg_iou", "train IoU", "#16a34a", smooth_window, show_raw=True
-    )
-    finish_axis(axes[2, 0], "Detector IoU", "IoU", "global step")
-    axes[2, 0].set_ylim(0.0, 1.0)
-
-    train_epochs, train_loss = values(epoch_rows, "avg_loss")
-    if train_loss:
-        axes[2, 1].plot(train_epochs, train_loss, "o-", color="#2563eb", linewidth=2, label="train avg loss")
-    eval_epochs, eval_loss = values(detection_evaluations, "loss")
-    if eval_loss:
-        axes[2, 1].plot(eval_epochs, eval_loss, "o-", color="#dc2626", linewidth=2, label="validation loss")
-    finish_axis(
-        axes[2, 1],
-        "Train Total vs Detector Validation Loss",
-        "loss (different objectives in pose stages)",
-        "epoch",
-    )
-
+    detection_values: list[float] = []
     for rows, key, label, color in (
         (epoch_rows, "avg_iou", "train IoU", "#16a34a"),
         (detection_evaluations, "avg_iou", "validation IoU", "#ea580c"),
@@ -320,10 +368,12 @@ def plot_curves(
     ):
         xs, ys = values(rows, key)
         if ys:
-            axes[3, 0].plot(xs, ys, "o-", color=color, linewidth=1.8, label=label)
-    finish_axis(axes[3, 0], "Epoch Detection Quality", "rate", "epoch")
-    axes[3, 0].set_ylim(0.0, 1.0)
+            detection_axis.plot(xs, ys, "o-", color=color, linewidth=1.8, label=label)
+            detection_values.extend(ys)
+    finish_axis(detection_axis, "Epoch Detection Quality", "rate", "epoch")
+    zoom_rate_axis(detection_axis, detection_values)
 
+    pose_quality_values: list[float] = []
     for key, label, color in (
         ("pose_success_rate", "pose success", "#16a34a"),
         ("accuracy_5deg_5cm", "5deg / 5cm", "#2563eb"),
@@ -333,17 +383,48 @@ def plot_curves(
     ):
         xs, ys = values(pose_evaluations, key)
         if ys:
-            axes[3, 1].plot(xs, ys, "o-", color=color, linewidth=1.8, label=label)
+            pose_quality_axis.plot(xs, ys, "o-", color=color, linewidth=1.8, label=label)
+            pose_quality_values.extend(ys)
     for key, label, color in (
         ("pose_success_rate", "pose success (IoU-filtered)", "#14532d"),
         ("pose_end_to_end_success_rate", "end-to-end pose success", "#0f766e"),
-        ("pose_match_coverage", "pose match coverage", "#475569"),
     ):
         xs, ys = values(conditional_pose_evaluations, key)
         if ys:
-            axes[3, 1].plot(xs, ys, "o--", color=color, linewidth=1.5, label=label)
-    finish_axis(axes[3, 1], "Validation Pose Success and Calibration", "rate / score", "epoch")
-    axes[3, 1].set_ylim(0.0, 1.0)
+            pose_quality_axis.plot(xs, ys, "o--", color=color, linewidth=1.5, label=label)
+            pose_quality_values.extend(ys)
+    coverage_xs, coverage_ys = values(conditional_pose_evaluations, "pose_match_coverage")
+    if coverage_ys:
+        pose_coverage_axis.plot(
+            coverage_xs,
+            coverage_ys,
+            "o--",
+            color="#475569",
+            linewidth=1.7,
+            label="pose match coverage",
+        )
+
+    pose_coverage_axis.set_title("Validation Pose Success and Calibration")
+    pose_coverage_axis.set_ylabel("coverage")
+    pose_quality_axis.set_ylabel("rate / score")
+    pose_quality_axis.set_xlabel("epoch")
+    pose_coverage_axis.grid(alpha=0.25)
+    pose_quality_axis.grid(alpha=0.25)
+    zoom_rate_axis(pose_coverage_axis, coverage_ys)
+    zoom_rate_axis(pose_quality_axis, pose_quality_values)
+    pose_coverage_axis.spines["bottom"].set_visible(False)
+    pose_quality_axis.spines["top"].set_visible(False)
+    pose_coverage_axis.tick_params(axis="x", which="both", bottom=False, labelbottom=False)
+    break_size = 0.008
+    break_kwargs = dict(color="k", clip_on=False, linewidth=1.0)
+    pose_coverage_axis.plot((-break_size, +break_size), (-break_size, +break_size), transform=pose_coverage_axis.transAxes, **break_kwargs)
+    pose_coverage_axis.plot((1 - break_size, 1 + break_size), (-break_size, +break_size), transform=pose_coverage_axis.transAxes, **break_kwargs)
+    pose_quality_axis.plot((-break_size, +break_size), (1 - break_size, 1 + break_size), transform=pose_quality_axis.transAxes, **break_kwargs)
+    pose_quality_axis.plot((1 - break_size, 1 + break_size), (1 - break_size, 1 + break_size), transform=pose_quality_axis.transAxes, **break_kwargs)
+    handles_upper, labels_upper = pose_coverage_axis.get_legend_handles_labels()
+    handles_lower, labels_lower = pose_quality_axis.get_legend_handles_labels()
+    if handles_upper or handles_lower:
+        pose_quality_axis.legend(handles_lower + handles_upper, labels_lower + labels_upper, fontsize=8, loc="best")
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(output_path, dpi=180)

@@ -10,10 +10,22 @@ from plot_finetune_log import (
     REQUIRED_COLUMNS,
     parse_metrics_csv,
     plot_curves,
+    zoom_rate_axis,
 )
 
 
 class FineTunePlotTests(unittest.TestCase):
+    def test_rate_axis_zooms_without_forcing_zero(self):
+        import matplotlib.pyplot as plt
+
+        figure, axis = plt.subplots()
+        zoom_rate_axis(axis, [0.80, 0.85, 0.90])
+        low, high = axis.get_ylim()
+        plt.close(figure)
+
+        self.assertGreater(low, 0.0)
+        self.assertLessEqual(high, 1.0)
+
     def test_pose_metrics_are_parsed_and_rendered(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
