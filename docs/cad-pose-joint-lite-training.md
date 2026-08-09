@@ -20,6 +20,20 @@ The checkpoint stores its completed epoch. `--epochs` is the final epoch number,
 not the number of additional epochs. Set it above the stored checkpoint epoch;
 their difference is the number of new epochs that will run.
 
+When adapting a pose-trained checkpoint to a different dataset or split
+manifest, use `--transfer_path` instead. It restores the detector, pose head,
+and matching reference-view adapter but starts a new run at epoch 1 with a
+fresh optimizer, step counters, manifest provenance, and dataset-derived pose
+statistics. The requested `--exemplar_view_mode` must match the checkpoint.
+`--epochs` is the number of epochs in this new run.
+
+For an explicit memorization diagnostic, `--validate_on_train` evaluates the
+same manifest rows used for training, but without training-time color
+augmentation. Pair it with a small all-train manifest and
+`--validate_before_training` to measure the baseline and per-epoch training-set
+fit. This mode is diagnostic only; its validation metrics do not estimate
+generalization.
+
 ## Trainable modules
 
 With base learning rate `--lr`, joint-lite configures:

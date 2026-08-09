@@ -2126,6 +2126,14 @@ def parse_args() -> argparse.Namespace:
         help="Record validation and conditional pose baselines before the first resumed training epoch.",
     )
     parser.add_argument(
+        "--validate_on_train",
+        action="store_true",
+        help=(
+            "Evaluate the unaugmented training rows after each epoch instead of the validation split. "
+            "Intended for explicit memorization/overfit diagnostics."
+        ),
+    )
+    parser.add_argument(
         "--split_dir",
         type=str,
         default="",
@@ -2360,6 +2368,15 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default="",
         help="Path to a trusted local finetune checkpoint (.pth) to resume from.",
+    )
+    parser.add_argument(
+        "--transfer_path",
+        type=str,
+        default="",
+        help=(
+            "Pose finetune checkpoint used to initialize all trained model modules for a new run. "
+            "Unlike --resume_path, permits a new manifest and resets optimizer, epoch, and step state."
+        ),
     )
     parser.add_argument(
         "--no_resume_optimizer",
@@ -3403,9 +3420,13 @@ def main() -> None:
         args.exemplar_view_shuffle_seed = args.seed
     if args.exemplar_view_mode != "none" and not args.enable_pose:
         raise ValueError("Reference-view conditioning experiments require --enable_pose")
-    if args.init_path and args.resume_path:
-        raise ValueError("--init_path and --resume_path are mutually exclusive")
+    checkpoint_sources = [args.init_path, args.resume_path, args.transfer_path]
+    if sum(bool(path) for path in checkpoint_sources) > 1:
+        raise ValueError("--init_path, --resume_path, and --transfer_path are mutually exclusive")
+    if args.transfer_path and not args.enable_pose:
+        raise ValueError("--transfer_path requires --enable_pose")
     args.init_checkpoint_sha256 = ""
+    args.transfer_checkpoint_sha256 = ""
     random.seed(args.seed)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
@@ -3628,6 +3649,34 @@ def main() -> None:
             "and epoch counters remain fresh."
         )
 
+    if args.transfer_path:
+        transfer_path = Path(args.transfer_path).expanduser().resolve()
+        if not transfer_path.is_file():
+            raise FileNotFoundError(transfer_path)
+        checkpoint = load_finetune_checkpoint(
+            transfer_path,
+            detmodel,
+            optimizer=None,
+            device=device,
+            load_optimizer=False,
+            exemplar_view_mode=args.exemplar_view_mode,
+        )
+        checkpoint_args = checkpoint.get("args") or {}
+        if not bool(checkpoint_args.get("enable_pose", False)):
+            raise ValueError("--transfer_path must contain a pose-trained checkpoint")
+        args.transfer_path = str(transfer_path)
+        args.transfer_checkpoint_sha256 = manifest_sha256(transfer_path)
+        args.init_path = str(checkpoint_args.get("init_path", ""))
+        args.init_checkpoint_sha256 = str(
+            checkpoint_args.get("init_checkpoint_sha256", "")
+        )
+        print(
+            f"Transferred trained modules from {transfer_path} "
+            f"(source_epoch={int(checkpoint.get('epoch', 0))}, "
+            f"sha256={args.transfer_checkpoint_sha256}); optimizer, epoch, step, "
+            "manifest, and pose statistics start fresh."
+        )
+
     if args.resume_path:
         resume_path = Path(args.resume_path).expanduser().resolve()
         if not resume_path.is_file():
@@ -3763,7 +3812,13 @@ def main() -> None:
     validation_config: Optional[EvalConfig] = None
     validation_pose_entries: List[Dict[str, str]] = []
     if manifest_rows:
-        validation_rows = [row for row in manifest_rows if row.split == "validation"]
+        validation_split = "train" if args.validate_on_train else "validation"
+        validation_rows = [row for row in manifest_rows if row.split == validation_split]
+        if args.validate_on_train:
+            print(
+                f"Overfit diagnostic: evaluating {len(validation_rows)} unaugmented "
+                "training captures after each epoch."
+            )
         validation_entries = entries_from_manifest_rows(validation_rows, data_root, object_level=True)
         validation_pose_entries = entries_from_manifest_rows(validation_rows, data_root, object_level=False)
         validation_config = EvalConfig(

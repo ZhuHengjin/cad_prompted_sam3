@@ -79,10 +79,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--checkpoint", type=Path, default=DEFAULT_CHECKPOINT)
     parser.add_argument("--model-path", type=Path, default=None)
     parser.add_argument("--manifest", type=Path, default=None)
+    parser.add_argument(
+        "--allow-eval-manifest-mismatch",
+        action="store_true",
+        help=(
+            "Allow an explicitly supplied evaluation manifest whose checksum differs from "
+            "the checkpoint's training manifest. Intended for held-out evaluation only."
+        ),
+    )
     parser.add_argument("--data-root", type=Path, default=None)
     parser.add_argument("--reference-dir", type=Path, default=None)
     parser.add_argument("--output-dir", type=Path, default=None)
-    parser.add_argument("--split", choices=("validation", "test"), default="validation")
+    parser.add_argument(
+        "--split", choices=("train", "validation", "test"), default="validation"
+    )
     parser.add_argument(
         "--frame",
         action="append",
@@ -131,7 +141,11 @@ def main() -> None:
     for required_path in (model_path, manifest_path, data_root, reference_dir):
         if not required_path.exists():
             raise FileNotFoundError(required_path)
-    _verify_manifest(checkpoint, manifest_path)
+    _verify_manifest(
+        checkpoint,
+        manifest_path,
+        allow_mismatch=args.allow_eval_manifest_mismatch,
+    )
 
     rows, _ = load_manifest(manifest_path, data_root, validate_files=True)
     selected_rows = _select_scene_rows(
@@ -1069,12 +1083,23 @@ def _resolve_path(cli_value: Path | None, checkpoint_value: object, label: str) 
     return path.resolve()
 
 
-def _verify_manifest(checkpoint: Mapping[str, object], manifest_path: Path) -> None:
+def _verify_manifest(
+    checkpoint: Mapping[str, object],
+    manifest_path: Path,
+    *,
+    allow_mismatch: bool = False,
+) -> None:
     expected = checkpoint.get("manifest_sha256")
     if not expected:
         return
     actual = manifest_sha256(manifest_path)
     if actual != expected:
+        if allow_mismatch:
+            print(
+                "warning: evaluating against a manifest outside checkpoint provenance "
+                f"({actual} != {expected})"
+            )
+            return
         raise ValueError(
             f"Manifest checksum does not match checkpoint provenance: {actual} != {expected}"
         )

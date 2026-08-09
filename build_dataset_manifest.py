@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import random
 import re
 from collections import Counter
 from pathlib import Path
@@ -208,6 +209,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--ratios", type=parse_ratios, default=(0.8, 0.1, 0.1))
     parser.add_argument(
+        "--max-samples",
+        type=int,
+        default=0,
+        help=(
+            "Deterministically sample at most this many manifest rows after discovery; "
+            "0 keeps every row."
+        ),
+    )
+    parser.add_argument(
         "--pose-dataset",
         action="append",
         type=parse_pose_dataset_spec,
@@ -239,6 +249,13 @@ def main() -> None:
         rows = build_pose_rows(data_root, args.pose_dataset, args.ratios, args.seed)
     else:
         rows = build_rows(data_root, args.wrist_dataset, args.side_dataset, args.ratios, args.seed)
+    if args.max_samples < 0:
+        raise ValueError("--max-samples must be nonnegative")
+    if args.max_samples and args.max_samples < len(rows):
+        rows = sorted(
+            random.Random(args.seed).sample(rows, args.max_samples),
+            key=lambda row: (row.dataset_id, row.group_id, row.camera_dir, row.frame_id),
+        )
     write_manifest(output, rows)
     _, summary = load_manifest(output, data_root, validate_files=True)
     split_counts = Counter(row.split for row in rows)

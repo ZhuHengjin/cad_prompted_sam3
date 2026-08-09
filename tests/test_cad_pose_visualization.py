@@ -10,6 +10,7 @@ import numpy as np
 
 from scripts.visualize_cad_pose_predictions import (
     _spread_reference_view_ids,
+    _verify_manifest,
     _write_visualizations,
 )
 from muggled_sam.v3_sam.cad_pose.visualization import (
@@ -47,6 +48,15 @@ class CADPoseVisualizationTests(unittest.TestCase):
     def test_four_display_exemplars_are_spread_across_configured_views(self):
         selected = _spread_reference_view_ids([str(index) for index in range(12)], 4)
         self.assertEqual(selected, ["0", "4", "7", "11"])
+
+    def test_external_eval_manifest_requires_explicit_opt_in(self):
+        with TemporaryDirectory() as directory:
+            manifest = Path(directory) / "manifest.csv"
+            manifest.write_text("different manifest\n")
+            checkpoint = {"manifest_sha256": "not-the-actual-checksum"}
+            with self.assertRaisesRegex(ValueError, "Manifest checksum"):
+                _verify_manifest(checkpoint, manifest)
+            _verify_manifest(checkpoint, manifest, allow_mismatch=True)
 
     def test_box_is_origin_centered_and_invalid_camera_points_are_skipped(self):
         corners = canonical_box_corners(np.asarray([2.0, 4.0, 6.0]))
