@@ -15,6 +15,7 @@ Generated training and evaluation data follows the repository's [run artifact la
 - [Fine-tuning notes](fine-tune-note.md): current LEGO SAM3 continuation command, paths, logging, plotting, and checkpoint-selection workflow.
 - [Fine-tuning split behavior](finetune-split-behavior.md): versioned manifest construction and train/validation/test behavior for `finetune_image_exemplar_multi_gt.py`.
 - [Current training loss](current-training-loss.md): the multi-GT mask, box, and presence objective used by `finetune_image_exemplar_multi_gt.py`.
+- [Ground-truth loss validation](ground-truth-loss-validation.md): GT-as-prediction checks for pose, mask, box, presence, and the Perseve-v2 target/back-projection path.
 
 ## Explanations
 

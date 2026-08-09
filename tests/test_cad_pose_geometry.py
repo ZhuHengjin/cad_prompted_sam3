@@ -2,6 +2,7 @@
 
 import math
 import unittest
+from dataclasses import replace
 
 try:
     import torch
@@ -9,6 +10,7 @@ try:
     from muggled_sam.v3_sam.cad_pose.geometry import (
         adjust_intrinsics_for_resize_and_pad,
         aabb_translation_from_surface_centroid,
+        matrix_to_rotation_6d,
         normalize_intrinsics,
         project_points,
         reconstruct_translation,
@@ -292,6 +294,126 @@ class CADPoseGeometryTests(unittest.TestCase):
         self.assertIsNotNone(angle.grad)
         self.assertTrue(torch.isfinite(angle.grad))
         self.assertGreater(abs(float(angle.grad)), 1e-8)
+
+    def test_ground_truth_pose_predictions_reach_expected_loss_minimum(self):
+        centroid = torch.tensor([0.25, -0.4, 1.2])
+        points = torch.tensor(
+            [[0.0, 0, 0], [1.0, 0, 0], [0, 2.0, 0], [-0.5, 0.25, 0.75]]
+        )
+        target = CADPoseTarget(
+            center_uv_norm=torch.tensor([0.35, 0.6]),
+            log_depth=centroid[2].log(),
+            rotation_matrix=torch.eye(3),
+            translation_m=torch.tensor([0.0, 0.0, 1.0]),
+            dimensions_m=torch.tensor([2.0, 4.0, 1.0]),
+            centroid_m=centroid,
+            point_query_m=points[:3],
+            point_target_m=points,
+            point_set_eligible=True,
+        )
+        config = CADPoseLossConfig(full_pose_weight=1.0)
+        quality_target = torch.sigmoid(
+            torch.tensor(config.centroid_tolerance / config.centroid_soft_width)
+        ) * torch.sigmoid(
+            torch.tensor(config.point_set_tolerance / config.point_set_soft_width)
+        )
+        quality_logit = torch.logit(quality_target)
+        predictions = CADPosePredictions(
+            center_residual_bn2=torch.zeros(1, 1, 2),
+            center_uv_norm_bn2=target.center_uv_norm.reshape(1, 1, 2),
+            log_depth_bn=target.log_depth.reshape(1, 1),
+            rotation_6d_bn6=matrix_to_rotation_6d(target.rotation_matrix).reshape(1, 1, 6),
+            rotation_matrix_bn33=target.rotation_matrix.reshape(1, 1, 3, 3),
+            pose_score_logits_bn=quality_logit.reshape(1, 1),
+            pose_score_bn=quality_target.reshape(1, 1),
+            translation_m_bn3=target.translation_m.reshape(1, 1, 3),
+            centroid_m_bn3=centroid.reshape(1, 1, 3),
+        )
+
+        losses = compute_cad_pose_losses(predictions, [target], [(0, 0)], config)
+
+        self.assertIsNotNone(losses)
+        assert losses is not None
+        torch.testing.assert_close(losses.center, torch.zeros_like(losses.center))
+        torch.testing.assert_close(losses.depth, torch.zeros_like(losses.depth))
+        torch.testing.assert_close(losses.rotation, torch.zeros_like(losses.rotation))
+        torch.testing.assert_close(losses.full_pose, torch.zeros_like(losses.full_pose))
+        torch.testing.assert_close(
+            losses.mean_translation_error_m,
+            torch.zeros_like(losses.mean_translation_error_m),
+        )
+        torch.testing.assert_close(
+            losses.mean_point_set_error_norm,
+            torch.zeros_like(losses.mean_point_set_error_norm),
+        )
+        torch.testing.assert_close(
+            losses.mean_centroid_error_m,
+            torch.zeros_like(losses.mean_centroid_error_m),
+        )
+        expected_quality = torch.nn.functional.binary_cross_entropy_with_logits(
+            quality_logit,
+            quality_target,
+        )
+        torch.testing.assert_close(losses.quality, expected_quality)
+        torch.testing.assert_close(losses.total, expected_quality)
+
+        shifted_predictions = replace(
+            predictions,
+            center_uv_norm_bn2=predictions.center_uv_norm_bn2
+            + torch.tensor([[[0.1, 0.0]]]),
+        )
+        shifted_losses = compute_cad_pose_losses(
+            shifted_predictions,
+            [target],
+            [(0, 0)],
+            config,
+        )
+        self.assertIsNotNone(shifted_losses)
+        assert shifted_losses is not None
+        self.assertGreater(float(shifted_losses.center), 0.0)
+        torch.testing.assert_close(shifted_losses.depth, losses.depth)
+        torch.testing.assert_close(shifted_losses.rotation, losses.rotation)
+        torch.testing.assert_close(shifted_losses.full_pose, losses.full_pose)
+        self.assertGreater(float(shifted_losses.total), float(losses.total))
+
+        wrong_depth_losses = compute_cad_pose_losses(
+            replace(predictions, log_depth_bn=predictions.log_depth_bn + 0.2),
+            [target],
+            [(0, 0)],
+            config,
+        )
+        self.assertIsNotNone(wrong_depth_losses)
+        assert wrong_depth_losses is not None
+        self.assertGreater(float(wrong_depth_losses.depth), 0.0)
+        torch.testing.assert_close(wrong_depth_losses.center, losses.center)
+        torch.testing.assert_close(wrong_depth_losses.rotation, losses.rotation)
+        self.assertGreater(float(wrong_depth_losses.total), float(losses.total))
+
+        angle = torch.tensor(0.2)
+        wrong_rotation = torch.tensor(
+            [
+                [torch.cos(angle), -torch.sin(angle), 0.0],
+                [torch.sin(angle), torch.cos(angle), 0.0],
+                [0.0, 0.0, 1.0],
+            ]
+        )
+        wrong_rotation_losses = compute_cad_pose_losses(
+            replace(
+                predictions,
+                rotation_6d_bn6=matrix_to_rotation_6d(wrong_rotation).reshape(1, 1, 6),
+                rotation_matrix_bn33=wrong_rotation.reshape(1, 1, 3, 3),
+            ),
+            [target],
+            [(0, 0)],
+            config,
+        )
+        self.assertIsNotNone(wrong_rotation_losses)
+        assert wrong_rotation_losses is not None
+        self.assertGreater(float(wrong_rotation_losses.rotation), 0.0)
+        self.assertGreater(float(wrong_rotation_losses.full_pose), 0.0)
+        torch.testing.assert_close(wrong_rotation_losses.center, losses.center)
+        torch.testing.assert_close(wrong_rotation_losses.depth, losses.depth)
+        self.assertGreater(float(wrong_rotation_losses.total), float(losses.total))
 
     def test_full_pose_point_set_error_backpropagates_to_centroid(self):
         target_centroid = torch.tensor([0.25, -0.4, 1.2])

@@ -131,6 +131,105 @@ class MultiGtLossEquivalenceTests(unittest.TestCase):
         expected = 0.10 * losses.mask + 0.25 * losses.bbox + 0.25 * losses.objectness
         torch.testing.assert_close(actual, expected)
 
+    def test_ground_truth_detection_predictions_minimize_joint_loss(self):
+        target_a = torch.zeros(8, 10)
+        target_a[1:4, 2:5] = 1.0
+        target_b = torch.zeros(8, 10)
+        target_b[4:7, 6:9] = 1.0
+        targets = [target_a, target_b]
+        perfect_logits = torch.stack(
+            (
+                torch.where(target_a > 0.5, 20.0, -20.0),
+                torch.where(target_b > 0.5, 20.0, -20.0),
+                torch.full_like(target_a, -20.0),
+            )
+        )
+        perfect_boxes = torch.tensor(
+            [
+                [[2 / 9, 1 / 7], [4 / 9, 3 / 7]],
+                [[6 / 9, 4 / 7], [8 / 9, 6 / 7]],
+                [[0.0, 0.0], [0.0, 0.0]],
+            ]
+        )
+        perfect_scores = torch.tensor([20.0, 20.0, -20.0])
+
+        losses = compute_multi_gt_detection_losses(
+            perfect_logits,
+            perfect_boxes,
+            perfect_scores,
+            targets,
+            bce_weight=2.0,
+            dice_weight=2.0,
+            score_weight=0.3,
+            no_object_weight=0.45,
+            max_per_gt=1,
+        )
+
+        self.assertIsNotNone(losses)
+        assert losses is not None
+        self.assertLess(float(losses.mask), 1e-6)
+        torch.testing.assert_close(losses.bbox, torch.zeros_like(losses.bbox))
+        self.assertLess(float(losses.objectness), 1e-6)
+        self.assertLess(
+            float(losses.total(mask_weight=2.0, bbox_weight=1.0, objectness_weight=1.0)),
+            3e-6,
+        )
+
+        wrong_mask_logits = perfect_logits.clone()
+        wrong_mask_logits[0, 2, 3] = -20.0
+        wrong_mask_losses = compute_multi_gt_detection_losses(
+            wrong_mask_logits,
+            perfect_boxes,
+            perfect_scores,
+            targets,
+            bce_weight=2.0,
+            dice_weight=2.0,
+            score_weight=0.3,
+            no_object_weight=0.45,
+            max_per_gt=1,
+        )
+        self.assertIsNotNone(wrong_mask_losses)
+        assert wrong_mask_losses is not None
+        self.assertGreater(float(wrong_mask_losses.mask), float(losses.mask))
+        torch.testing.assert_close(wrong_mask_losses.bbox, losses.bbox)
+
+        wrong_boxes = perfect_boxes.clone()
+        wrong_boxes[0, 0, 0] += 0.1
+        wrong_box_losses = compute_multi_gt_detection_losses(
+            perfect_logits,
+            wrong_boxes,
+            perfect_scores,
+            targets,
+            bce_weight=2.0,
+            dice_weight=2.0,
+            score_weight=0.3,
+            no_object_weight=0.45,
+            max_per_gt=1,
+        )
+        self.assertIsNotNone(wrong_box_losses)
+        assert wrong_box_losses is not None
+        self.assertGreater(float(wrong_box_losses.bbox), float(losses.bbox))
+        torch.testing.assert_close(wrong_box_losses.mask, losses.mask)
+
+        wrong_scores = perfect_scores.clone()
+        wrong_scores[0] = -20.0
+        wrong_score_losses = compute_multi_gt_detection_losses(
+            perfect_logits,
+            perfect_boxes,
+            wrong_scores,
+            targets,
+            bce_weight=2.0,
+            dice_weight=2.0,
+            score_weight=0.3,
+            no_object_weight=0.45,
+            max_per_gt=1,
+        )
+        self.assertIsNotNone(wrong_score_losses)
+        assert wrong_score_losses is not None
+        self.assertGreater(float(wrong_score_losses.objectness), float(losses.objectness))
+        torch.testing.assert_close(wrong_score_losses.mask, losses.mask)
+        torch.testing.assert_close(wrong_score_losses.bbox, losses.bbox)
+
     def test_pose_match_iou_filter_keeps_only_qualified_assignments(self):
         iou = torch.tensor(
             [

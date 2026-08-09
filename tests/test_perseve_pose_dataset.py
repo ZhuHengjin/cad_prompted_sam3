@@ -13,7 +13,10 @@ try:
     import torch
 
     from muggled_sam.v3_sam.cad_pose.dataset import load_perseve_pose_sample, make_pose_target
+    from muggled_sam.v3_sam.cad_pose.geometry import matrix_to_rotation_6d
+    from muggled_sam.v3_sam.cad_pose.losses import CADPoseLossConfig, compute_cad_pose_losses
     from muggled_sam.v3_sam.cad_pose.point_sets import sha256_file
+    from muggled_sam.v3_sam.cad_pose.types import CADPosePredictions
 
     DEPS_AVAILABLE = True
 except ModuleNotFoundError:
@@ -196,6 +199,39 @@ class PersevePoseDatasetTests(unittest.TestCase):
             self.assertTrue(target.point_set_eligible)
             torch.testing.assert_close(target.centroid_m, torch.tensor([0.02, 0.0, 1.0]))
             self.assertEqual(tuple(target.point_query_m.shape), (2, 3))
+
+            intrinsics = torch.tensor(sample.frame.intrinsics, dtype=torch.float32)
+            predictions = CADPosePredictions(
+                center_residual_bn2=torch.zeros(1, 1, 2),
+                center_uv_norm_bn2=target.center_uv_norm.reshape(1, 1, 2),
+                log_depth_bn=target.log_depth.reshape(1, 1),
+                rotation_6d_bn6=matrix_to_rotation_6d(target.rotation_matrix).reshape(1, 1, 6),
+                rotation_matrix_bn33=target.rotation_matrix.reshape(1, 1, 3, 3),
+                pose_score_logits_bn=torch.zeros(1, 1),
+                pose_score_bn=torch.full((1, 1), 0.5),
+                cad_effective_surface_centroid_m_b3=target.effective_surface_centroid_m.reshape(1, 3),
+            ).with_translation(
+                intrinsics.unsqueeze(0),
+                sample.frame.image_size_wh,
+            )
+            losses = compute_cad_pose_losses(
+                predictions,
+                [target],
+                [(0, 0)],
+                CADPoseLossConfig(quality_weight=0.0),
+                compute_expensive_metrics=False,
+            )
+
+            self.assertIsNotNone(losses)
+            assert losses is not None
+            torch.testing.assert_close(losses.center, torch.zeros_like(losses.center))
+            torch.testing.assert_close(losses.depth, torch.zeros_like(losses.depth))
+            torch.testing.assert_close(losses.rotation, torch.zeros_like(losses.rotation))
+            torch.testing.assert_close(
+                losses.mean_translation_error_m,
+                torch.zeros_like(losses.mean_translation_error_m),
+            )
+            torch.testing.assert_close(losses.total, torch.zeros_like(losses.total))
 
 
 if __name__ == "__main__":
